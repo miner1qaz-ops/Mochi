@@ -1,0 +1,18 @@
+[workspace]
+members = [
+  "programs/mochi_v2_vault"
+]
+
+[provider]
+cluster = "devnet"
+wallet = "./keys/passkey.json"
+
+[programs.localnet]
+mochi_v2_vault = "Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx"
+
+[programs.devnet]
+mochi_v2_vault = "Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx"
+
+[scripts]
+lint = "cargo fmt"
+test = "cargo test"

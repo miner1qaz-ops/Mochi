@@ -1,0 +1,13 @@
+fastapi==0.111.0
+uvicorn[standard]==0.30.0
+requests==2.32.3
+pydantic==2.8.2
+pydantic-settings==2.3.4
+sqlmodel==0.0.21
+solana==0.30.2
+anchorpy==0.18.0
+solders==0.18.1
+python-dotenv==1.0.1
+numpy==2.1.2
+borsh-construct==0.1.0
+cryptography==46.0.3

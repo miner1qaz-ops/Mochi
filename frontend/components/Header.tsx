@@ -1,0 +1,36 @@
+'use client';
+
+import Link from 'next/link';
+import { WalletMultiButton } from '@solana/wallet-adapter-react-ui';
+import { usePathname } from 'next/navigation';
+
+const links = [
+  { href: '/', label: 'Home' },
+  { href: '/gacha', label: 'Gacha' },
+  { href: '/marketplace', label: 'Marketplace' },
+  { href: '/profile', label: 'Profile' },
+  { href: '/admin', label: 'Admin' }
+];
+
+export function Header() {
+  const pathname = usePathname();
+  return (
+    <header className="sticky top-0 z-30 backdrop-blur bg-[#05070f]/70 border-b border-white/5">
+      <div className="max-w-6xl mx-auto flex items-center justify-between py-4 px-6">
+        <Link href="/" className="text-xl font-semibold tracking-tight">Mochi v2</Link>
+        <nav className="flex gap-4 text-sm">
+          {links.map((link) => (
+            <Link
+              key={link.href}
+              href={link.href}
+              className={`px-3 py-1 rounded-full transition ${pathname === link.href ? 'bg-white/10' : 'hover:bg-white/5'}`}
+            >
+              {link.label}
+            </Link>
+          ))}
+        </nav>
+        <WalletMultiButton className="!bg-sakura !text-ink !font-semibold" />
+      </div>
+    </header>
+  );
+}

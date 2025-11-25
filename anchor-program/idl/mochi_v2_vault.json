@@ -1,0 +1,1887 @@
+{
+  "address": "Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx",
+  "metadata": {
+    "name": "mochi_v2_vault",
+    "version": "0.1.0",
+    "spec": "0.1.0"
+  },
+  "instructions": [
+    {
+      "name": "admin_migrate_asset",
+      "discriminator": [
+        98,
+        169,
+        110,
+        12,
+        202,
+        4,
+        205,
+        221
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true
+        },
+        {
+          "name": "vault_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "card_record",
+          "writable": true
+        },
+        {
+          "name": "destination"
+        },
+        {
+          "name": "core_asset",
+          "writable": true
+        },
+        {
+          "name": "vault_authority",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "mpl_core_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "cancel_listing",
+      "discriminator": [
+        41,
+        183,
+        50,
+        232,
+        230,
+        233,
+        157,
+        70
+      ],
+      "accounts": [
+        {
+          "name": "seller",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "vault_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "card_record",
+          "writable": true
+        },
+        {
+          "name": "core_asset"
+        },
+        {
+          "name": "listing",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  105,
+                  115,
+                  116,
+                  105,
+                  110,
+                  103
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              },
+              {
+                "kind": "account",
+                "path": "card_record.core_asset",
+                "account": "CardRecord"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_authority",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program"
+        },
+        {
+          "name": "mpl_core_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "claim_pack",
+      "discriminator": [
+        141,
+        5,
+        7,
+        100,
+        178,
+        73,
+        205,
+        191
+      ],
+      "accounts": [
+        {
+          "name": "user",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "vault_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "pack_session",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  97,
+                  99,
+                  107,
+                  95,
+                  115,
+                  101,
+                  115,
+                  115,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              },
+              {
+                "kind": "account",
+                "path": "user"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_authority",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_treasury",
+          "writable": true
+        },
+        {
+          "name": "user_currency_token",
+          "writable": true,
+          "optional": true
+        },
+        {
+          "name": "vault_currency_token",
+          "writable": true,
+          "optional": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "system_program"
+        },
+        {
+          "name": "mpl_core_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "deposit_card",
+      "discriminator": [
+        221,
+        131,
+        111,
+        52,
+        236,
+        215,
+        120,
+        228
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "vault_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "core_asset"
+        },
+        {
+          "name": "card_record",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  97,
+                  114,
+                  100,
+                  95,
+                  114,
+                  101,
+                  99,
+                  111,
+                  114,
+                  100
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              },
+              {
+                "kind": "account",
+                "path": "core_asset"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_authority",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "template_id",
+          "type": "u32"
+        },
+        {
+          "name": "rarity",
+          "type": {
+            "defined": {
+              "name": "Rarity"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "deprecate_card",
+      "discriminator": [
+        114,
+        152,
+        133,
+        136,
+        59,
+        62,
+        83,
+        78
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true
+        },
+        {
+          "name": "vault_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "card_record",
+          "writable": true
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "expire_session",
+      "discriminator": [
+        102,
+        173,
+        129,
+        188,
+        181,
+        251,
+        173,
+        72
+      ],
+      "accounts": [
+        {
+          "name": "user",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "vault_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "pack_session",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  97,
+                  99,
+                  107,
+                  95,
+                  115,
+                  101,
+                  115,
+                  115,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              },
+              {
+                "kind": "account",
+                "path": "user"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_authority",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_treasury",
+          "writable": true
+        },
+        {
+          "name": "user_currency_token",
+          "writable": true,
+          "optional": true
+        },
+        {
+          "name": "vault_currency_token",
+          "writable": true,
+          "optional": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "system_program"
+        },
+        {
+          "name": "mpl_core_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "fill_listing",
+      "discriminator": [
+        207,
+        127,
+        12,
+        109,
+        233,
+        168,
+        239,
+        173
+      ],
+      "accounts": [
+        {
+          "name": "buyer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "seller",
+          "writable": true
+        },
+        {
+          "name": "vault_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "card_record",
+          "writable": true
+        },
+        {
+          "name": "core_asset",
+          "writable": true
+        },
+        {
+          "name": "listing",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  105,
+                  115,
+                  116,
+                  105,
+                  110,
+                  103
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              },
+              {
+                "kind": "account",
+                "path": "card_record.core_asset",
+                "account": "CardRecord"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_authority",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_treasury",
+          "writable": true
+        },
+        {
+          "name": "system_program"
+        },
+        {
+          "name": "mpl_core_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "initialize_vault",
+      "discriminator": [
+        48,
+        191,
+        163,
+        44,
+        71,
+        129,
+        63,
+        164
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "vault_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_authority",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "pack_price_sol",
+          "type": "u64"
+        },
+        {
+          "name": "pack_price_usdc",
+          "type": "u64"
+        },
+        {
+          "name": "buyback_bps",
+          "type": "u16"
+        },
+        {
+          "name": "claim_window_seconds",
+          "type": "i64"
+        },
+        {
+          "name": "marketplace_fee_bps",
+          "type": "u16"
+        },
+        {
+          "name": "core_collection",
+          "type": {
+            "option": "pubkey"
+          }
+        },
+        {
+          "name": "usdc_mint",
+          "type": {
+            "option": "pubkey"
+          }
+        }
+      ]
+    },
+    {
+      "name": "list_card",
+      "discriminator": [
+        113,
+        226,
+        80,
+        193,
+        197,
+        19,
+        75,
+        161
+      ],
+      "accounts": [
+        {
+          "name": "seller",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "vault_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "card_record",
+          "writable": true
+        },
+        {
+          "name": "core_asset"
+        },
+        {
+          "name": "listing",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  105,
+                  115,
+                  116,
+                  105,
+                  110,
+                  103
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              },
+              {
+                "kind": "account",
+                "path": "card_record.core_asset",
+                "account": "CardRecord"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_authority",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program"
+        },
+        {
+          "name": "mpl_core_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "price_lamports",
+          "type": "u64"
+        },
+        {
+          "name": "currency_mint",
+          "type": {
+            "option": "pubkey"
+          }
+        }
+      ]
+    },
+    {
+      "name": "open_pack_start",
+      "discriminator": [
+        135,
+        142,
+        27,
+        168,
+        111,
+        41,
+        16,
+        47
+      ],
+      "accounts": [
+        {
+          "name": "user",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "vault_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "pack_session",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  97,
+                  99,
+                  107,
+                  95,
+                  115,
+                  101,
+                  115,
+                  115,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              },
+              {
+                "kind": "account",
+                "path": "user"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_authority",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_treasury",
+          "docs": [
+            "Treasury to receive SOL fees"
+          ],
+          "writable": true
+        },
+        {
+          "name": "user_currency_token",
+          "docs": [
+            "Optional token accounts for USDC path"
+          ],
+          "writable": true,
+          "optional": true
+        },
+        {
+          "name": "vault_currency_token",
+          "writable": true,
+          "optional": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "system_program"
+        },
+        {
+          "name": "mpl_core_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "currency",
+          "type": {
+            "defined": {
+              "name": "Currency"
+            }
+          }
+        },
+        {
+          "name": "client_seed_hash",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        },
+        {
+          "name": "rarity_prices",
+          "type": {
+            "vec": "u64"
+          }
+        }
+      ]
+    },
+    {
+      "name": "redeem_burn",
+      "discriminator": [
+        42,
+        74,
+        20,
+        232,
+        24,
+        156,
+        180,
+        61
+      ],
+      "accounts": [
+        {
+          "name": "user",
+          "signer": true
+        },
+        {
+          "name": "vault_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "card_record",
+          "writable": true
+        },
+        {
+          "name": "core_asset",
+          "writable": true
+        },
+        {
+          "name": "vault_authority",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "mpl_core_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "sellback_pack",
+      "discriminator": [
+        234,
+        180,
+        107,
+        150,
+        187,
+        215,
+        58,
+        68
+      ],
+      "accounts": [
+        {
+          "name": "user",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "vault_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "pack_session",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  97,
+                  99,
+                  107,
+                  95,
+                  115,
+                  101,
+                  115,
+                  115,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              },
+              {
+                "kind": "account",
+                "path": "user"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_authority",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_treasury",
+          "writable": true
+        },
+        {
+          "name": "user_currency_token",
+          "writable": true,
+          "optional": true
+        },
+        {
+          "name": "vault_currency_token",
+          "writable": true,
+          "optional": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "system_program"
+        },
+        {
+          "name": "mpl_core_program"
+        }
+      ],
+      "args": []
+    }
+  ],
+  "accounts": [
+    {
+      "name": "CardRecord",
+      "discriminator": [
+        251,
+        16,
+        238,
+        248,
+        145,
+        213,
+        126,
+        170
+      ]
+    },
+    {
+      "name": "Listing",
+      "discriminator": [
+        218,
+        32,
+        50,
+        73,
+        43,
+        134,
+        26,
+        58
+      ]
+    },
+    {
+      "name": "PackSession",
+      "discriminator": [
+        80,
+        94,
+        75,
+        2,
+        168,
+        201,
+        129,
+        44
+      ]
+    },
+    {
+      "name": "VaultState",
+      "discriminator": [
+        228,
+        196,
+        82,
+        165,
+        98,
+        210,
+        235,
+        152
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "code": 6000,
+      "name": "Unauthorized",
+      "msg": "Unauthorized"
+    },
+    {
+      "code": 6001,
+      "name": "InvalidPrice",
+      "msg": "Invalid price"
+    },
+    {
+      "code": 6002,
+      "name": "InsufficientFunds",
+      "msg": "Insufficient funds"
+    },
+    {
+      "code": 6003,
+      "name": "InvalidCardCount",
+      "msg": "Invalid card count"
+    },
+    {
+      "code": 6004,
+      "name": "CardNotAvailable",
+      "msg": "Card not available"
+    },
+    {
+      "code": 6005,
+      "name": "VaultMismatch",
+      "msg": "Vault mismatch"
+    },
+    {
+      "code": 6006,
+      "name": "SessionExists",
+      "msg": "Session already exists"
+    },
+    {
+      "code": 6007,
+      "name": "InvalidSessionState",
+      "msg": "Invalid session state"
+    },
+    {
+      "code": 6008,
+      "name": "SessionExpired",
+      "msg": "Session expired"
+    },
+    {
+      "code": 6009,
+      "name": "SessionNotExpired",
+      "msg": "Session not expired"
+    },
+    {
+      "code": 6010,
+      "name": "CardNotReserved",
+      "msg": "Card not reserved"
+    },
+    {
+      "code": 6011,
+      "name": "InvalidListingState",
+      "msg": "Listing invalid state"
+    },
+    {
+      "code": 6012,
+      "name": "AssetMismatch",
+      "msg": "Asset mismatch"
+    },
+    {
+      "code": 6013,
+      "name": "MathOverflow",
+      "msg": "Math overflow"
+    },
+    {
+      "code": 6014,
+      "name": "MissingTokenAccount",
+      "msg": "Missing token account"
+    },
+    {
+      "code": 6015,
+      "name": "MintMismatch",
+      "msg": "Mint mismatch"
+    },
+    {
+      "code": 6016,
+      "name": "CoreCpiError",
+      "msg": "Core CPI error"
+    }
+  ],
+  "types": [
+    {
+      "name": "CardRecord",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault_state",
+            "type": "pubkey"
+          },
+          {
+            "name": "core_asset",
+            "type": "pubkey"
+          },
+          {
+            "name": "template_id",
+            "type": "u32"
+          },
+          {
+            "name": "rarity",
+            "type": {
+              "defined": {
+                "name": "Rarity"
+              }
+            }
+          },
+          {
+            "name": "status",
+            "type": {
+              "defined": {
+                "name": "CardStatus"
+              }
+            }
+          },
+          {
+            "name": "owner",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "CardStatus",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Available"
+          },
+          {
+            "name": "Reserved"
+          },
+          {
+            "name": "UserOwned"
+          },
+          {
+            "name": "RedeemPending"
+          },
+          {
+            "name": "Burned"
+          },
+          {
+            "name": "Deprecated"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Currency",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Sol"
+          },
+          {
+            "name": "Token"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Listing",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault_state",
+            "type": "pubkey"
+          },
+          {
+            "name": "seller",
+            "type": "pubkey"
+          },
+          {
+            "name": "core_asset",
+            "type": "pubkey"
+          },
+          {
+            "name": "price_lamports",
+            "type": "u64"
+          },
+          {
+            "name": "currency_mint",
+            "type": {
+              "option": "pubkey"
+            }
+          },
+          {
+            "name": "status",
+            "type": {
+              "defined": {
+                "name": "ListingStatus"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ListingStatus",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Active"
+          },
+          {
+            "name": "Filled"
+          },
+          {
+            "name": "Cancelled"
+          },
+          {
+            "name": "Burned"
+          },
+          {
+            "name": "Deprecated"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PackSession",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "user",
+            "type": "pubkey"
+          },
+          {
+            "name": "currency",
+            "type": {
+              "defined": {
+                "name": "Currency"
+              }
+            }
+          },
+          {
+            "name": "paid_amount",
+            "type": "u64"
+          },
+          {
+            "name": "created_at",
+            "type": "i64"
+          },
+          {
+            "name": "expires_at",
+            "type": "i64"
+          },
+          {
+            "name": "card_record_keys",
+            "type": {
+              "array": [
+                "pubkey",
+                11
+              ]
+            }
+          },
+          {
+            "name": "state",
+            "type": {
+              "defined": {
+                "name": "PackState"
+              }
+            }
+          },
+          {
+            "name": "client_seed_hash",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "rarity_prices",
+            "type": {
+              "vec": "u64"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "PackState",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Uninitialized"
+          },
+          {
+            "name": "PendingDecision"
+          },
+          {
+            "name": "Accepted"
+          },
+          {
+            "name": "Rejected"
+          },
+          {
+            "name": "Expired"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Rarity",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Common"
+          },
+          {
+            "name": "Uncommon"
+          },
+          {
+            "name": "Rare"
+          },
+          {
+            "name": "DoubleRare"
+          },
+          {
+            "name": "UltraRare"
+          },
+          {
+            "name": "IllustrationRare"
+          },
+          {
+            "name": "SpecialIllustrationRare"
+          },
+          {
+            "name": "MegaHyperRare"
+          },
+          {
+            "name": "Energy"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultState",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "admin",
+            "type": "pubkey"
+          },
+          {
+            "name": "vault_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "pack_price_sol",
+            "type": "u64"
+          },
+          {
+            "name": "pack_price_usdc",
+            "type": "u64"
+          },
+          {
+            "name": "buyback_bps",
+            "type": "u16"
+          },
+          {
+            "name": "claim_window_seconds",
+            "type": "i64"
+          },
+          {
+            "name": "marketplace_fee_bps",
+            "type": "u16"
+          },
+          {
+            "name": "core_collection",
+            "type": {
+              "option": "pubkey"
+            }
+          },
+          {
+            "name": "usdc_mint",
+            "type": {
+              "option": "pubkey"
+            }
+          },
+          {
+            "name": "vault_authority_bump",
+            "type": "u8"
+          },
+          {
+            "name": "padding",
+            "type": {
+              "array": [
+                "u8",
+                7
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

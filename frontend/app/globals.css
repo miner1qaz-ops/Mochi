@@ -1,0 +1,31 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --gradient: radial-gradient(circle at 10% 20%, rgba(33, 212, 253, 0.12), transparent 30%),
+    radial-gradient(circle at 80% 0%, rgba(245, 82, 185, 0.15), transparent 35%),
+    radial-gradient(circle at 50% 80%, rgba(246, 211, 101, 0.12), transparent 30%);
+  background-color: #05070f;
+  color: #e9ecf5;
+  min-height: 100vh;
+}
+
+body {
+  font-family: "Space Grotesk", ui-sans-serif, system-ui;
+  background-image: var(--gradient);
+  background-repeat: no-repeat;
+  background-size: cover;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.card-blur {
+  background: rgba(13, 16, 33, 0.75);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  backdrop-filter: blur(8px);
+  box-shadow: var(--shadow, 0 20px 60px rgba(0,0,0,0.45));
+}
