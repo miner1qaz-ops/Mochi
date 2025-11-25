@@ -34,6 +34,7 @@ pip-wheel-metadata/
 # Rust/Anchor
 target/
 .anchor/
+anchor-program/keys/
 
 # Databases / artifacts
 *.db
