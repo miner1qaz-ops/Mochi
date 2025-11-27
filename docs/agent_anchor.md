@@ -55,6 +55,8 @@ Program ID (devnet): `Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx`
   - PendingDecision + not expired; pays out buyback, resets CardRecords, session Rejected.
 - `expire_session()`
   - Anyone; if expired PendingDecision, resets CardRecords, state=Expired.
+- `admin_force_expire()`
+  - Admin-only; bypasses the one-hour wait and forcibly resets Reserved CardRecords + marks the PackSession Expired (used by the backend “force clear sessions” action).
 - `list_card(price_lamports, currency_mint)`
   - Moves card into vault escrow, creates Listing Active.
 - `cancel_listing()`
@@ -78,3 +80,10 @@ Program ID (devnet): `Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx`
 
 ## Sizes
 Stored in structs via `SIZE` constants for PDA allocation.
+
+## Devnet seeding (Core mint + deposit)
+- Script: `scripts/mint_and_deposit.ts` (Umi `createV1` + Anchor `deposit_card`).
+- Inputs: `CORE_TEMPLATE_CSV` (defaults to `../nft_pipeline/data/mega-evolutions.csv`) and `CORE_METADATA_BASE` (defaults to `https://mochims.fun/nft/metadata/mega-evolutions/<token_id>.json`).
+- Run: `CORE_TEMPLATE_OFFSET=0 CORE_TEMPLATE_LIMIT=40 TS_NODE_TRANSPILE_ONLY=1 npx ts-node -P tsconfig.scripts.json scripts/mint_and_deposit.ts` (set `SOLANA_RPC` if not devnet). Use the offset/limit envs to batch when minting large sets.
+- Result: Core assets are minted straight into the vault PDA (`FKALjGXodzs1RhSGYKL72xnnQjB35nK9e6dtZ9fTLj3g`) and each gets a CardRecord (`card_record` PDA).
+- Current devnet vault PDAs: `vault_state = ChDquu2qJZ2yHuFzMNcSpHjDf7mwGN2x9KpNQ8ocE53d`, `vault_authority = FKALjGXodzs1RhSGYKL72xnnQjB35nK9e6dtZ9fTLj3g`.

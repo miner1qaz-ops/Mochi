@@ -5,6 +5,7 @@ Path: `backend/main.py`
 - `SOLANA_RPC`, `SOLANA_DEVNET_RPC` (devnet default)
 - `HELIUS_RPC_URL` (DAS endpoint)
 - `ADMIN_ADDRESS`, `PLATFORM_WALLET`, `CORE_COLLECTION_ADDRESS`
+- `ADMIN_KEYPAIR_PATH` (server-side signer used for force-expire; default `/root/mochi/anchor-program/keys/passkey.json`)
 - `TREASURY_WALLET` (fallback to `PLATFORM_WALLET`)
 - `USDC_MINT` (optional; required for token currency flows)
 - `SERVER_SEED` (provably-fair secret)
@@ -26,14 +27,20 @@ Path: `backend/main.py`
 - `POST /program/claim/build` → builds claim instruction, marks MintRecords user_owned; returns `tx_b64` + `tx_v0_b64` + `recent_blockhash`. Optional token accounts accepted.
 - `POST /program/sellback/build` → builds sellback instruction, resets MintRecords to available; returns `tx_b64` + `tx_v0_b64` + `recent_blockhash`. Optional token accounts accepted.
 - `GET /profile/{wallet}` → Helius `getAssetsByOwner` with optional collection filter.
-- Marketplace: `GET /marketplace/listings`, `POST /marketplace/list/build`, `POST /marketplace/fill/build`, `POST /marketplace/cancel/build` (tx placeholders).
-- Admin: `GET /admin/inventory/rarity`, `GET /admin/sessions`, `POST /admin/session/settle`.
+- Marketplace: `GET /marketplace/listings`, `POST /marketplace/list/build`, `POST /marketplace/fill/build`, `POST /marketplace/cancel/build`.
+- Admin: `GET /admin/inventory/rarity`, `GET /admin/inventory/assets`, `GET /admin/sessions`, `POST /admin/session/settle`, `POST /admin/inventory/refresh` (Helius sync that repopulates MintRecords + statuses), `POST /admin/sessions/force_expire` (signs and sends the on-chain `admin_force_expire` instruction to return all reserved cards to the vault PDA and mark SessionMirrors expired).
+- Diagnostics/repair: `GET /admin/inventory/reserved` (MintRecords whose status != available), `GET /admin/sessions/diagnostic` (per-session view showing whether the pack_session PDA exists plus each card’s current status/owner), and `POST /admin/inventory/unreserve` (sets every non-available MintRecord back to `available` and marks pending/settled SessionMirrors as expired).
 - `GET /pricing/rarity` → returns static rarity -> lamports mapping.
 
-## Scripts
-- `scripts/import_card_templates.py` – load CSV to DB.
-- `scripts/mint_core_from_csv.py` – create placeholder MintRecords; replace with real Metaplex Core mint flow later.
-- `scripts/deposit_core_assets.py` – anchorpy skeleton to call `deposit_card` per MintRecord.
+## Scripts / pipelines
+- `scripts/import_card_templates.py` – ingests the template CSV into the configured DB. It now accepts either `template_id` or `token_id` columns; when running from repo root set `DATABASE_URL=sqlite:///backend/mochi.db` so the sqlite path resolves correctly.
+- `nft_pipeline/` (peer repo) – converts the Mega Evolution CSV into hosted PNG/JSON pairs under `nft/img|metadata/<collection>/<token_id>`, uploads to `/var/www/mochi-assets/nft`, and produces a manifest consumed by the minter/update scripts.
+- `scripts/mint_and_deposit.ts` – canonical MPL Core minter + `deposit_card` caller. Reads `CORE_TEMPLATE_CSV` (defaults to `../nft_pipeline/data/mega-evolutions.csv`), points to `CORE_METADATA_BASE` (defaults to `https://mochims.fun/nft/metadata/mega-evolutions`), and supports `CORE_TEMPLATE_OFFSET` / `CORE_TEMPLATE_LIMIT` envs for batching. Requires `npx ts-node -P tsconfig.scripts.json`.
+- Legacy helpers (`mint_core_from_csv.py`, `deposit_core_assets.py`) remain for reference but the TS script above + nft_pipeline flow is what we actually use now.
+
+## Notes
+- `admin/inventory/refresh` paginates Helius `getAssetsByOwner` 100/page until depleted and stamps each MintRecord with rarity/template data by looking up `CardTemplate`. If multiple Core assets exist for the same template (intentional doubles) you’ll see >1 MintRecord per template_id.
+- Inventory counts shown in the admin UI are purely what Helius reports for the vault PDA, so they’ll match whatever is actually sitting in custody.
 
 ## TODOs / extensions
 - SPL/USDC path and price feeds remain TODO; RPC validations added for CardRecord and Listing seller discovery.

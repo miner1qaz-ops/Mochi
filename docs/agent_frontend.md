@@ -16,10 +16,11 @@ Path: `frontend/`
 ## Routes
 - `/` – Hero, RWA diagram, live feed mock.
 - `/gacha` – Client seed input, preview RNG (calls `/program/open/preview`), build pack, 11-card reveal UI, claim/sellback buttons, 1h countdown.
+  - Front-end now surfaces backend error strings (e.g., “Active pack session already exists”) beside the Buy Pack controls, shows explicit “Awaiting wallet signature → Submitting transaction” states so Phantom prompts are expected, and displays the active session id/countdown whenever a pack is pending.
 - `/marketplace` – Grid of listings from backend with hover animation; buy/cancel buttons (placeholder actions).
   - Buy/cancel wired to backend builders and wallet signing; list form available (asset + price lamports).
 - `/profile` – Redirects to connected wallet; `/profile/[address]` fetches holdings via backend profile endpoint.
-- `/admin` – Renders only if wallet matches `NEXT_PUBLIC_ADMIN_ADDRESS`; shows inventory counts + session mirrors.
+- `/admin` – Devnet-friendly dashboard (wallet gate temporarily disabled) showing inventory counts, searchable asset list, session mirrors, buttons that call `/admin/inventory/refresh` / `/admin/inventory/assets` to sync with Helius, plus a “Force expire all” control that hits `/admin/sessions/force_expire`. New diagnostics blocks pull `/admin/sessions/diagnostic` and `/admin/inventory/reserved` so you can see which cards/sessions are stuck before clearing them.
 - Provably-fair panel on `/gacha` displays `server_seed_hash`, `server_nonce`, `entropy_proof` from backend responses.
 - Provably-fair dashboard cards show server_seed_hash, server_nonce, client_seed, entropy_proof, and verification steps (hash/nnonce/entropy reproduction).
 - Transaction helper: `lib/tx.ts` decodes instruction metadata and builds v0 transactions from backend responses (uses returned `recent_blockhash`); gacha page wires claim/sellback buttons to `signTransaction` + `connection.sendTransaction`.

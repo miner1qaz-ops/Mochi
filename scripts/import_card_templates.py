@@ -23,17 +23,30 @@ def main(csv_path: str):
             rows.append(r)
     with Session(engine) as session:
         for r in rows:
+            template_raw = r.get("template_id") or r.get("token_id") or r.get("Number")
+            if not template_raw:
+                continue
+            template_id = int(template_raw)
+            idx_raw = r.get("index") or template_id
+            name = r.get("card_name") or r.get("name") or r.get("Name") or ""
+            rarity = r.get("rarity") or r.get("Rarity") or "Common"
+            image_url = (
+                r.get("image_url")
+                or r.get("Image URL")
+                or r.get("image")
+                or r.get("Image")
+            )
             template = CardTemplate(
-                template_id=int(r["template_id"]),
-                index=int(r.get("index", 0)),
-                card_name=r.get("card_name") or r.get("name", ""),
-                rarity=r.get("rarity", "Common"),
+                template_id=template_id,
+                index=int(idx_raw),
+                card_name=name,
+                rarity=rarity,
                 variant=r.get("variant"),
                 set_code=r.get("set_code"),
                 set_name=r.get("set_name"),
-                is_energy=r.get("is_energy", "false").lower() in ["true", "1", "yes"],
+                is_energy=str(r.get("is_energy", "false")).lower() in ["true", "1", "yes"],
                 energy_type=r.get("energy_type"),
-                image_url=r.get("image_url"),
+                image_url=image_url,
             )
             session.merge(template)
         session.commit()

@@ -1,0 +1,16 @@
+{
+  "name": "Bulbasaur #001",
+  "symbol": "MOCHI",
+  "description": "Physical Pokémon card held in the Mochi vault. Not graded. Redeemable via burn.",
+  "image": "https://mochims.fun/img/packs/meg_web/meg_web_001_hires.png",
+  "attributes": [
+    { "trait_type": "Rarity", "value": "Common" },
+    { "trait_type": "Variant", "value": "Base" }
+  ],
+  "properties": {
+    "files": [
+      { "uri": "https://mochims.fun/img/packs/meg_web/meg_web_001_hires.png", "type": "image/png" }
+    ],
+    "category": "image"
+  }
+}

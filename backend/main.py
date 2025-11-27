@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import random
 import time
@@ -11,11 +12,19 @@ import requests
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
+import re
 from solders.pubkey import Pubkey
+from solders.instruction import Instruction
+from solders.keypair import Keypair as SoldersKeypair
+from solders.hash import Hash
+from solders.message import MessageV0
+from solders.transaction import VersionedTransaction
 from solana.rpc.api import Client as SolanaClient
+from solana.rpc.types import TxOpts
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 
 from tx_builder import (
+    build_admin_force_expire_ix,
     build_claim_pack_ix,
     build_fill_listing_ix,
     build_list_card_ix,
@@ -38,6 +47,7 @@ class Settings(BaseSettings):
     solana_devnet_rpc: str = "https://api.devnet.solana.com"
     helius_rpc_url: str = ""
     admin_address: Optional[str] = None
+    admin_keypair_path: Optional[str] = None
     platform_wallet: Optional[str] = None
     treasury_wallet: Optional[str] = None
     core_collection_address: Optional[str] = None
@@ -55,6 +65,7 @@ auth_settings = Settings()
 
 engine = create_engine(auth_settings.database_url)
 sol_client = SolanaClient(auth_settings.solana_rpc)
+ADMIN_KEYPAIR: Optional[SoldersKeypair] = None
 
 
 class CardTemplate(SQLModel, table=True):
@@ -207,6 +218,28 @@ class TxResponse(BaseModel):
     instructions: List[InstructionMeta]
 
 
+class AssetStatusView(BaseModel):
+    asset_id: str
+    template_id: Optional[int]
+    rarity: Optional[str]
+    status: str
+    owner: Optional[str]
+
+
+class SessionDiagnostic(BaseModel):
+    session_id: str
+    user: str
+    state: str
+    expires_at: float
+    has_pack_session: bool
+    asset_statuses: List[AssetStatusView]
+
+
+class UnreserveRequest(BaseModel):
+    owner: Optional[str] = None
+    statuses: Optional[List[str]] = None
+
+
 class ListRequest(BaseModel):
     core_asset: str
     price_lamports: int
@@ -222,6 +255,16 @@ class ListingView(BaseModel):
     currency_mint: Optional[str] = None
 
 
+class AssetView(BaseModel):
+    asset_id: str
+    template_id: int
+    rarity: str
+    status: str
+    owner: Optional[str] = None
+    name: Optional[str] = None
+    image_url: Optional[str] = None
+
+
 class MarketplaceActionRequest(BaseModel):
     core_asset: str
     wallet: str
@@ -229,6 +272,12 @@ class MarketplaceActionRequest(BaseModel):
 
 class AdminSessionSettleRequest(BaseModel):
     session_id: str
+
+
+class InventoryRefreshResponse(BaseModel):
+    owner: str
+    count: int
+    updated: List[str]
 
 
 def hash_seed(seed: str) -> str:
@@ -275,6 +324,34 @@ def treasury_pubkey() -> Pubkey:
     if not target:
         raise HTTPException(status_code=500, detail="Treasury wallet not configured")
     return to_pubkey(target)
+
+
+def load_admin_keypair() -> SoldersKeypair:
+    global ADMIN_KEYPAIR
+    if ADMIN_KEYPAIR:
+        return ADMIN_KEYPAIR
+    if not auth_settings.admin_keypair_path:
+        raise HTTPException(status_code=500, detail="ADMIN_KEYPAIR_PATH not configured")
+    path = auth_settings.admin_keypair_path
+    if not os.path.exists(path):
+        raise HTTPException(status_code=500, detail=f"Admin keypair file not found: {path}")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Failed to read admin keypair: {exc}") from exc
+    secret_bytes: bytes
+    if isinstance(data, list):
+        secret_bytes = bytes(data)
+    elif isinstance(data, dict) and "secretKey" in data:
+        secret_bytes = bytes(data["secretKey"])
+    else:
+        raise HTTPException(status_code=500, detail="Unsupported admin keypair format")
+    try:
+        ADMIN_KEYPAIR = SoldersKeypair.from_bytes(secret_bytes)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Failed to parse admin keypair: {exc}") from exc
+    return ADMIN_KEYPAIR
 
 
 def choose_weighted(rng: random.Random, odds: Dict[str, float]) -> str:
@@ -363,24 +440,35 @@ def listing_owner_from_chain(vault_state: Pubkey, core_asset: Pubkey) -> Optiona
 def helius_get_assets(owner: str, collection: Optional[str]) -> List[dict]:
     if not auth_settings.helius_rpc_url:
         return []
-    body = {
-        "jsonrpc": "2.0",
-        "id": "mochi",
-        "method": "getAssetsByOwner",
-        "params": {
-            "ownerAddress": owner,
-            "page": 1,
-            "limit": 100,
-            "options": {"showUnverifiedCollections": False},
-        },
-    }
-    if collection:
-        body["params"]["displayOptions"] = {"showCollectionMetadata": True}
-        body["params"]["grouping"] = ["collection", collection]
-    resp = requests.post(auth_settings.helius_rpc_url, json=body, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("result", {}).get("items", [])
+    page = 1
+    limit = 100
+    items: List[dict] = []
+    while True:
+        body = {
+            "jsonrpc": "2.0",
+            "id": f"mochi-{page}",
+            "method": "getAssetsByOwner",
+            "params": {
+                "ownerAddress": owner,
+                "page": page,
+                "limit": limit,
+                "options": {"showUnverifiedCollections": False},
+            },
+        }
+        if collection:
+            body["params"]["displayOptions"] = {"showCollectionMetadata": True}
+            body["params"]["grouping"] = ["collection", collection]
+        resp = requests.post(auth_settings.helius_rpc_url, json=body, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        chunk = data.get("result", {}).get("items", []) or []
+        if not chunk:
+            break
+        items.extend(chunk)
+        if len(chunk) < limit:
+            break
+        page += 1
+    return items
 
 
 @app.on_event("startup")
@@ -479,8 +567,8 @@ def build_pack(req: PackBuildRequest, db: Session = Depends(get_session)):
         user_currency_token=user_token_account,
         vault_currency_token=vault_token_account,
     )
-    tx_b64 = message_from_instructions([ix], to_pubkey(req.wallet))
     blockhash = get_latest_blockhash()
+    tx_b64 = message_from_instructions([ix], to_pubkey(req.wallet), blockhash)
     tx_v0_b64 = versioned_tx_b64(to_pubkey(req.wallet), blockhash, [ix])
     instr = wrap_instruction_meta(instruction_to_dict(ix))
 
@@ -537,8 +625,8 @@ def claim_pack(req: SessionActionRequest, db: Session = Depends(get_session)):
         user_currency_token=to_pubkey(req.user_token_account) if req.user_token_account else None,
         vault_currency_token=to_pubkey(req.vault_token_account) if req.vault_token_account else None,
     )
-    tx_b64 = message_from_instructions([ix], to_pubkey(req.wallet))
     blockhash = get_latest_blockhash()
+    tx_b64 = message_from_instructions([ix], to_pubkey(req.wallet), blockhash)
     tx_v0_b64 = versioned_tx_b64(to_pubkey(req.wallet), blockhash, [ix])
     instr = wrap_instruction_meta(instruction_to_dict(ix))
 
@@ -592,8 +680,8 @@ def sellback_pack(req: SessionActionRequest, db: Session = Depends(get_session))
         user_currency_token=to_pubkey(req.user_token_account) if req.user_token_account else None,
         vault_currency_token=to_pubkey(req.vault_token_account) if req.vault_token_account else None,
     )
-    tx_b64 = message_from_instructions([ix], to_pubkey(req.wallet))
     blockhash = get_latest_blockhash()
+    tx_b64 = message_from_instructions([ix], to_pubkey(req.wallet), blockhash)
     tx_v0_b64 = versioned_tx_b64(to_pubkey(req.wallet), blockhash, [ix])
     instr = wrap_instruction_meta(instruction_to_dict(ix))
 
@@ -653,8 +741,8 @@ def marketplace_list(req: ListRequest, db: Session = Depends(get_session)):
         price_lamports=req.price_lamports,
         currency_mint=req.currency_mint,
     )
-    tx_b64 = message_from_instructions([ix], to_pubkey(req.wallet))
     blockhash = get_latest_blockhash()
+    tx_b64 = message_from_instructions([ix], to_pubkey(req.wallet), blockhash)
     instr = wrap_instruction_meta(instruction_to_dict(ix))
 
     # Mirror listing status
@@ -695,8 +783,8 @@ def marketplace_fill(req: MarketplaceActionRequest, db: Session = Depends(get_se
         vault_authority=vault_authority,
         vault_treasury=treasury,
     )
-    tx_b64 = message_from_instructions([ix], to_pubkey(req.wallet))
     blockhash = get_latest_blockhash()
+    tx_b64 = message_from_instructions([ix], to_pubkey(req.wallet), blockhash)
     instr = wrap_instruction_meta(instruction_to_dict(ix))
 
     if record:
@@ -722,8 +810,8 @@ def marketplace_cancel(req: MarketplaceActionRequest, db: Session = Depends(get_
         card_record=card_record,
         listing=listing,
     )
-    tx_b64 = message_from_instructions([ix], to_pubkey(req.wallet))
     blockhash = get_latest_blockhash()
+    tx_b64 = message_from_instructions([ix], to_pubkey(req.wallet), blockhash)
     instr = wrap_instruction_meta(instruction_to_dict(ix))
 
     stmt = select(MintRecord).where(MintRecord.asset_id == req.core_asset)
@@ -770,6 +858,253 @@ def admin_session_settle(req: AdminSessionSettleRequest, db: Session = Depends(g
     db.add(mirror)
     db.commit()
     return {"ok": True, "session_id": req.session_id}
+
+
+@app.post("/admin/sessions/force_expire")
+def admin_force_expire(db: Session = Depends(get_session)):
+    stmt = select(SessionMirror).where(SessionMirror.state == "pending")
+    pending = db.exec(stmt).all()
+    if not pending:
+        return {"cleared": 0, "signature": None}
+
+    admin_keypair = load_admin_keypair()
+    admin_pub = admin_keypair.pubkey()
+    if auth_settings.admin_address and auth_settings.admin_address != str(admin_pub):
+        raise HTTPException(status_code=400, detail="Admin keypair does not match ADMIN_ADDRESS")
+
+    vault_state = vault_state_pda()
+    vault_authority = vault_authority_pda(vault_state)
+    treasury = treasury_pubkey()
+    vault_authority_str = str(vault_authority)
+
+    instructions: List[Instruction] = []
+    onchain_sessions: List[tuple[SessionMirror, List[str]]] = []
+    offline_sessions: List[tuple[SessionMirror, List[str]]] = []
+    for sess in pending:
+        user_pk = to_pubkey(sess.user)
+        pack_session = pack_session_pda(vault_state, user_pk)
+        assets = parse_asset_ids(sess.asset_ids)
+        if len(assets) < 11:
+            raise HTTPException(status_code=400, detail=f"Session {sess.session_id} missing card list")
+        card_records = [card_record_pda(vault_state, to_pubkey(asset)) for asset in assets[:11]]
+        if not pda_exists(pack_session):
+            offline_sessions.append((sess, assets[:11]))
+            continue
+        ix = build_admin_force_expire_ix(
+            admin=admin_pub,
+            user=user_pk,
+            vault_state=vault_state,
+            pack_session=pack_session,
+            vault_authority=vault_authority,
+            vault_treasury=treasury,
+            card_records=card_records,
+        )
+        instructions.append(ix)
+        onchain_sessions.append((sess, assets[:11]))
+
+    signature = None
+    if instructions:
+        blockhash = get_latest_blockhash()
+        try:
+            message = MessageV0.try_compile(admin_pub, instructions, [], Hash.from_string(blockhash))
+            tx = VersionedTransaction(message, [admin_keypair])
+            raw_tx = bytes(tx)
+            resp = sol_client.send_raw_transaction(raw_tx, opts=TxOpts(skip_preflight=False))
+            signature = resp.get("result") if isinstance(resp, dict) else resp
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"Force expire failed: {exc}") from exc
+
+    now = time.time()
+    def reset_session(sess: SessionMirror, assets: List[str]):
+        sess.state = "expired"
+        sess.expires_at = now
+        db.add(sess)
+        for asset in assets:
+            rec = db.get(MintRecord, asset)
+            if rec:
+                rec.status = "available"
+                rec.owner = vault_authority_str
+                rec.updated_at = now
+                db.add(rec)
+    for sess, assets in offline_sessions:
+        reset_session(sess, assets)
+    for sess, assets in onchain_sessions:
+        reset_session(sess, assets)
+    db.commit()
+    return {"cleared": len(pending), "signature": signature}
+
+
+@app.get("/admin/inventory/assets", response_model=List[AssetView])
+def admin_inventory_assets(db: Session = Depends(get_session)):
+    stmt = select(MintRecord)
+    rows = db.exec(stmt).all()
+    result: List[AssetView] = []
+    for row in rows:
+        name = None
+        image_url: Optional[str] = None
+        tmpl = db.get(CardTemplate, row.template_id)
+        if tmpl:
+            name = tmpl.card_name
+            image_url = tmpl.image_url
+        result.append(
+            AssetView(
+                asset_id=row.asset_id,
+                template_id=row.template_id,
+                rarity=row.rarity,
+                status=row.status,
+                owner=row.owner,
+                name=name,
+                image_url=image_url,
+            )
+        )
+    return result
+
+
+@app.get("/admin/inventory/reserved", response_model=List[AssetStatusView])
+def admin_inventory_reserved(db: Session = Depends(get_session)):
+    stmt = select(MintRecord).where(MintRecord.status != "available")
+    rows = db.exec(stmt).all()
+    result: List[AssetStatusView] = []
+    for row in rows:
+        result.append(
+            AssetStatusView(
+                asset_id=row.asset_id,
+                template_id=row.template_id,
+                rarity=row.rarity,
+                status=row.status,
+                owner=row.owner,
+            )
+        )
+    return result
+
+
+@app.get("/admin/sessions/diagnostic", response_model=List[SessionDiagnostic])
+def admin_sessions_diagnostic(db: Session = Depends(get_session)):
+    stmt = select(SessionMirror)
+    rows = db.exec(stmt).all()
+    vault_state = vault_state_pda()
+    diagnostics: List[SessionDiagnostic] = []
+    for row in rows:
+        user_pk = to_pubkey(row.user)
+        pack_session = pack_session_pda(vault_state, user_pk)
+        assets = parse_asset_ids(row.asset_ids)
+        statuses: List[AssetStatusView] = []
+        for asset_id in assets[:11]:
+            record = db.get(MintRecord, asset_id)
+            if record:
+                statuses.append(
+                    AssetStatusView(
+                        asset_id=record.asset_id,
+                        template_id=record.template_id,
+                        rarity=record.rarity,
+                        status=record.status,
+                        owner=record.owner,
+                    )
+                )
+            else:
+                statuses.append(
+                    AssetStatusView(
+                        asset_id=asset_id,
+                        template_id=None,
+                        rarity=None,
+                        status="missing",
+                        owner=None,
+                    )
+                )
+        diagnostics.append(
+            SessionDiagnostic(
+                session_id=row.session_id,
+                user=row.user,
+                state=row.state,
+                expires_at=row.expires_at,
+                has_pack_session=pda_exists(pack_session),
+                asset_statuses=statuses,
+            )
+        )
+    return diagnostics
+
+
+@app.post("/admin/inventory/unreserve")
+def admin_inventory_unreserve(req: UnreserveRequest, db: Session = Depends(get_session)):
+    vault_state = vault_state_pda()
+    vault_authority = str(vault_authority_pda(vault_state))
+    stmt = select(MintRecord).where(MintRecord.status != "available")
+    if req.owner:
+        stmt = stmt.where(MintRecord.owner == req.owner)
+    if req.statuses:
+        stmt = stmt.where(MintRecord.status.in_(req.statuses))
+    rows = db.exec(stmt).all()
+    now = time.time()
+    affected_sessions: set[str] = set()
+    for row in rows:
+        sess_stmt = select(SessionMirror).where(
+            SessionMirror.state.in_(["pending", "settled"]),
+            SessionMirror.asset_ids.like(f"%{row.asset_id}%"),
+        )
+        for sess in db.exec(sess_stmt).all():
+            sess.state = "expired"
+            sess.expires_at = now
+            db.add(sess)
+            affected_sessions.add(sess.session_id)
+        row.status = "available"
+        row.owner = vault_authority
+        row.updated_at = now
+        db.add(row)
+    db.commit()
+    return {"unreserved": len(rows), "sessions_marked": len(affected_sessions)}
+
+
+def template_id_from_uri(uri: str) -> Optional[int]:
+    if not uri:
+        return None
+    match = re.search(r"(\d{3})", uri)
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+@app.post("/admin/inventory/refresh", response_model=InventoryRefreshResponse)
+def admin_inventory_refresh(db: Session = Depends(get_session)):
+    vault_state = vault_state_pda()
+    vault_authority = vault_authority_pda(vault_state)
+    if not auth_settings.helius_rpc_url:
+        raise HTTPException(status_code=400, detail="HELIUS_RPC_URL not configured")
+    assets = helius_get_assets(str(vault_authority), auth_settings.core_collection_address)
+    updated: List[str] = []
+    for item in assets:
+        asset_id = item.get("id")
+        if not asset_id:
+            continue
+        content = item.get("content", {}) or {}
+        uri = content.get("json_uri") or content.get("links", {}).get("json")
+        tmpl_id = template_id_from_uri(uri or "")
+        template_row = db.get(CardTemplate, tmpl_id) if tmpl_id else None
+        rarity = "unknown"
+        if template_row:
+            rarity = template_row.rarity
+        existing = db.get(MintRecord, asset_id)
+        if existing:
+            existing.owner = str(vault_authority)
+            existing.status = "available"
+            existing.updated_at = time.time()
+            db.add(existing)
+        else:
+            db.add(
+                MintRecord(
+                    asset_id=asset_id,
+                    template_id=tmpl_id or 0,
+                    rarity=rarity,
+                    status="available",
+                    owner=str(vault_authority),
+                    updated_at=time.time(),
+                )
+            )
+        updated.append(asset_id)
+    db.commit()
+    return InventoryRefreshResponse(owner=str(vault_authority), count=len(updated), updated=updated)
 
 
 if __name__ == "__main__":

@@ -1,14 +1,18 @@
 import axios from 'axios';
 
-const API_BASE = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
+// Default to relative /api so browser calls hit the nginx proxy (fixes localhost issues in production).
+const API_BASE =
+  process.env.NEXT_PUBLIC_BACKEND_URL && process.env.NEXT_PUBLIC_BACKEND_URL !== ''
+    ? process.env.NEXT_PUBLIC_BACKEND_URL
+    : '/api';
 
 export const api = axios.create({ baseURL: API_BASE });
 
 export type PackSlot = { slot_index: number; rarity: string; template_id?: number | null };
 export type InstructionMeta = { program_id: string; keys: { pubkey: string; is_signer: boolean; is_writable: boolean }[]; data: string };
 
-export async function previewPack(client_seed: string, wallet: string) {
-  const { data } = await api.post('/program/open/preview', { client_seed, wallet, pack_type: 'meg_web' });
+export async function previewPack(client_seed: string, wallet: string, pack_type: string = 'meg_web') {
+  const { data } = await api.post('/program/open/preview', { client_seed, wallet, pack_type });
   return data as { server_seed_hash: string; server_nonce: string; entropy_proof: string; slots: PackSlot[] };
 }
 
@@ -19,11 +23,12 @@ export async function buildPack(
   user_token_account?: string,
   vault_token_account?: string,
   currency_mint?: string,
+  pack_type: string = 'meg_web',
 ) {
   const { data } = await api.post('/program/open/build', {
     client_seed,
     wallet,
-    pack_type: 'meg_web',
+    pack_type,
     currency,
     user_token_account,
     vault_token_account,

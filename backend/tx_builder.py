@@ -57,10 +57,10 @@ def listing_pda(vault_state: Pubkey, core_asset: Pubkey) -> Pubkey:
     )[0]
 
 
-def encode_currency_tag(currency: str) -> dict:
+def encode_currency_tag(currency: str):
     if currency.lower() == "sol":
-        return {"Sol": {}}
-    return {"Token": {}}
+        return CurrencyLayout.enum.Sol()
+    return CurrencyLayout.enum.Token()
 
 
 def encode_open_pack_start(currency: str, client_seed_hash: bytes, rarity_prices: List[int]) -> bytes:
@@ -86,6 +86,10 @@ def encode_sellback_pack() -> bytes:
 
 def encode_expire_session() -> bytes:
     return sighash("expire_session")
+
+
+def encode_admin_force_expire() -> bytes:
+    return sighash("admin_force_expire")
 
 
 def encode_list_card(price_lamports: int, currency_mint: Optional[str]) -> bytes:
@@ -218,6 +222,28 @@ def build_expire_session_ix(
     return Instruction(program_id=PROGRAM_ID, data=encode_expire_session(), accounts=accounts)
 
 
+def build_admin_force_expire_ix(
+    admin: Pubkey,
+    user: Pubkey,
+    vault_state: Pubkey,
+    pack_session: Pubkey,
+    vault_authority: Pubkey,
+    vault_treasury: Pubkey,
+    card_records: List[Pubkey],
+) -> Instruction:
+    accounts: List[AccountMeta] = [
+        AccountMeta(pubkey=admin, is_signer=True, is_writable=True),
+        AccountMeta(pubkey=user, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=vault_state, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=pack_session, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=vault_treasury, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=SYS_PROGRAM_ID, is_signer=False, is_writable=False),
+    ]
+    accounts.extend([AccountMeta(pubkey=cr, is_signer=False, is_writable=True) for cr in card_records])
+    return Instruction(program_id=PROGRAM_ID, data=encode_admin_force_expire(), accounts=accounts)
+
+
 def build_list_card_ix(
     seller: Pubkey,
     vault_state: Pubkey,
@@ -291,12 +317,11 @@ def instruction_to_dict(ix: Instruction) -> dict:
     }
 
 
-def message_from_instructions(ixs: List[Instruction], payer: Pubkey) -> str:
-    message = MessageV0.try_compile(payer, ixs, [])
+def message_from_instructions(ixs: List[Instruction], payer: Pubkey, blockhash: str) -> str:
+    message = MessageV0.try_compile(payer, ixs, [], Hash.from_string(blockhash))
     return base64.b64encode(bytes(message)).decode()
 
 
 def versioned_tx_b64(payer: Pubkey, blockhash: str, ixs: List[Instruction]) -> str:
     message = MessageV0.try_compile(payer, ixs, [], Hash.from_string(blockhash))
-    tx = VersionedTransaction(message, [])
-    return base64.b64encode(bytes(tx)).decode()
+    return base64.b64encode(bytes(message)).decode()

@@ -248,6 +248,23 @@ mod mochi_v2_vault {
         Ok(())
     }
 
+    pub fn admin_force_expire<'info>(ctx: Context<'_, '_, 'info, 'info, AdminForceExpire<'info>>) -> Result<()> {
+        require_keys_eq!(ctx.accounts.admin.key(), ctx.accounts.vault_state.admin, MochiError::Unauthorized);
+        let session = &mut ctx.accounts.pack_session;
+        require!(session.state == PackState::PendingDecision, MochiError::InvalidSessionState);
+
+        require!(ctx.remaining_accounts.len() >= PACK_CARD_COUNT, MochiError::InvalidCardCount);
+        for i in 0..PACK_CARD_COUNT {
+            let acc_info: &AccountInfo<'info> = &ctx.remaining_accounts[i];
+            let mut card_record: Account<CardRecord> = Account::try_from(acc_info)?;
+            card_record.status = CardStatus::Available;
+            card_record.owner = ctx.accounts.vault_authority.key();
+        }
+
+        session.state = PackState::Expired;
+        Ok(())
+    }
+
     pub fn list_card(
         ctx: Context<ListCard>,
         price_lamports: u64,
@@ -499,6 +516,25 @@ pub struct ResolvePack<'info> {
     pub system_program: UncheckedAccount<'info>,
     /// CHECK: mpl-core program
     pub mpl_core_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct AdminForceExpire<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    /// CHECK: user wallet (used for PDA derivation only)
+    pub user: UncheckedAccount<'info>,
+    #[account(mut, seeds = [b"vault_state"], bump)]
+    pub vault_state: Account<'info, VaultState>,
+    #[account(mut, seeds = [b"pack_session", vault_state.key().as_ref(), user.key().as_ref()], bump)]
+    pub pack_session: Account<'info, PackSession>,
+    /// CHECK: Vault authority PDA (validated by seeds)
+    #[account(mut, seeds = [b"vault_authority", vault_state.key().as_ref()], bump = vault_state.vault_authority_bump)]
+    pub vault_authority: UncheckedAccount<'info>,
+    #[account(mut)]
+    pub vault_treasury: SystemAccount<'info>,
+    /// CHECK: System program
+    pub system_program: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
