@@ -36,7 +36,10 @@ mod mochi_v2_vault {
     }
 
     pub fn deposit_card(ctx: Context<DepositCard>, template_id: u32, rarity: Rarity) -> Result<()> {
-        require!(ctx.accounts.admin.key() == ctx.accounts.vault_state.admin, MochiError::Unauthorized);
+        require!(
+            ctx.accounts.admin.key() == ctx.accounts.vault_state.admin,
+            MochiError::Unauthorized
+        );
 
         let record = &mut ctx.accounts.card_record;
         record.vault_state = ctx.accounts.vault_state.key();
@@ -60,14 +63,31 @@ mod mochi_v2_vault {
         let vault_state = &ctx.accounts.vault_state;
         let now = Clock::get()?.unix_timestamp;
 
+        let (card_accounts, _asset_accounts, extra_accounts) =
+            partition_pack_accounts(&ctx.remaining_accounts)?;
+        let mut user_token: Option<Account<'info, TokenAccount>> = None;
+        let mut vault_token: Option<Account<'info, TokenAccount>> = None;
+        if currency == Currency::Token {
+            require!(extra_accounts.len() >= 2, MochiError::MissingTokenAccount);
+            user_token = Some(Account::try_from(&extra_accounts[0])?);
+            vault_token = Some(Account::try_from(&extra_accounts[1])?);
+        }
+
         // Payment handling (simplified). For SOL we move lamports; for tokens we debit from user token account.
         match currency {
             Currency::Sol => {
                 let price = vault_state.pack_price_sol;
                 require!(price > 0, MochiError::InvalidPrice);
-                require!(ctx.accounts.user.lamports() >= price, MochiError::InsufficientFunds);
+                require!(
+                    ctx.accounts.user.lamports() >= price,
+                    MochiError::InsufficientFunds
+                );
                 invoke(
-                    &system_instruction::transfer(&ctx.accounts.user.key(), &ctx.accounts.vault_treasury.key(), price),
+                    &system_instruction::transfer(
+                        &ctx.accounts.user.key(),
+                        &ctx.accounts.vault_treasury.key(),
+                        price,
+                    ),
                     &[
                         ctx.accounts.user.to_account_info(),
                         ctx.accounts.vault_treasury.to_account_info(),
@@ -78,8 +98,10 @@ mod mochi_v2_vault {
             Currency::Token => {
                 let price = vault_state.pack_price_usdc;
                 require!(price > 0, MochiError::InvalidPrice);
-                let user_token = ctx.accounts.user_currency_token.as_ref().ok_or(MochiError::MissingTokenAccount)?;
-                let vault_token = ctx.accounts.vault_currency_token.as_ref().ok_or(MochiError::MissingTokenAccount)?;
+                let user_token = user_token.as_ref().ok_or(MochiError::MissingTokenAccount)?;
+                let vault_token = vault_token
+                    .as_ref()
+                    .ok_or(MochiError::MissingTokenAccount)?;
                 if let Some(mint) = vault_state.usdc_mint {
                     require_keys_eq!(user_token.mint, mint, MochiError::MintMismatch);
                     require_keys_eq!(vault_token.mint, mint, MochiError::MintMismatch);
@@ -90,26 +112,38 @@ mod mochi_v2_vault {
                     to: vault_token.to_account_info(),
                     authority: ctx.accounts.user.to_account_info(),
                 };
-                let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
+                let cpi_ctx =
+                    CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
                 token::transfer(cpi_ctx, price)?;
             }
         }
 
-        // Expect remaining accounts = 11 CardRecords + 11 Core assets, ordered by slot
-        require!(ctx.remaining_accounts.len() == PACK_CARD_COUNT * 2, MochiError::InvalidCardCount);
-
         let mut card_record_keys: [Pubkey; PACK_CARD_COUNT] = [Pubkey::default(); PACK_CARD_COUNT];
-        for i in 0..PACK_CARD_COUNT {
-            let acc_info: &AccountInfo<'info> = &ctx.remaining_accounts[i];
+        for (idx, acc_info) in card_accounts.iter().enumerate() {
             let card_record: Account<CardRecord> = Account::try_from(acc_info)?;
-            require_keys_eq!(card_record.vault_state, ctx.accounts.vault_state.key(), MochiError::VaultMismatch);
-            require!(card_record.status == CardStatus::Available, MochiError::CardNotAvailable);
-            card_record_keys[i] = acc_info.key();
+            require_keys_eq!(
+                card_record.vault_state,
+                ctx.accounts.vault_state.key(),
+                MochiError::VaultMismatch
+            );
+            require!(
+                card_record.status == CardStatus::Available,
+                MochiError::CardNotAvailable
+            );
+            card_record_keys[idx] = acc_info.key();
         }
-        // Core assets exist at offset PACK_CARD_COUNT..2*PACK_CARD_COUNT
 
         let session = &mut ctx.accounts.pack_session;
-        require!(session.state == PackState::Uninitialized, MochiError::SessionExists);
+        require!(
+            matches!(
+                session.state,
+                PackState::Uninitialized
+                    | PackState::Accepted
+                    | PackState::Rejected
+                    | PackState::Expired
+            ),
+            MochiError::SessionExists
+        );
         session.user = ctx.accounts.user.key();
         session.currency = currency.clone();
         session.paid_amount = match currency {
@@ -124,8 +158,7 @@ mod mochi_v2_vault {
         session.rarity_prices = rarity_prices;
 
         // Mark CardRecords as Reserved and set owner = user
-        for i in 0..PACK_CARD_COUNT {
-            let acc_info: &AccountInfo<'info> = &ctx.remaining_accounts[i];
+        for acc_info in card_accounts.iter() {
             let mut card_record: Account<CardRecord> = Account::try_from(acc_info)?;
             card_record.status = CardStatus::Reserved;
             card_record.owner = ctx.accounts.user.key();
@@ -137,18 +170,33 @@ mod mochi_v2_vault {
     pub fn claim_pack<'info>(ctx: Context<'_, '_, 'info, 'info, ResolvePack<'info>>) -> Result<()> {
         let session = &mut ctx.accounts.pack_session;
         let now = Clock::get()?.unix_timestamp;
-        require!(session.state == PackState::PendingDecision, MochiError::InvalidSessionState);
+        require!(
+            session.state == PackState::PendingDecision,
+            MochiError::InvalidSessionState
+        );
         require!(now <= session.expires_at, MochiError::SessionExpired);
 
-        require!(ctx.remaining_accounts.len() == PACK_CARD_COUNT * 2, MochiError::InvalidCardCount);
+        let (card_accounts, asset_accounts, _extras) =
+            partition_pack_accounts(&ctx.remaining_accounts)?;
+        require!(
+            asset_accounts.len() == PACK_CARD_COUNT,
+            MochiError::InvalidCardCount
+        );
         for i in 0..PACK_CARD_COUNT {
-            let acc_info: &AccountInfo<'info> = &ctx.remaining_accounts[i];
+            let acc_info: &AccountInfo<'info> = &card_accounts[i];
             let mut card_record: Account<CardRecord> = Account::try_from(acc_info)?;
-            require!(card_record.status == CardStatus::Reserved, MochiError::CardNotReserved);
-            require_keys_eq!(card_record.owner, ctx.accounts.user.key(), MochiError::Unauthorized);
+            require!(
+                card_record.status == CardStatus::Reserved,
+                MochiError::CardNotReserved
+            );
+            require_keys_eq!(
+                card_record.owner,
+                ctx.accounts.user.key(),
+                MochiError::Unauthorized
+            );
             card_record.status = CardStatus::UserOwned;
             card_record.owner = ctx.accounts.user.key();
-            let asset_info: &AccountInfo<'info> = &ctx.remaining_accounts[PACK_CARD_COUNT + i];
+            let asset_info: &AccountInfo<'info> = &asset_accounts[i];
             transfer_core_asset(
                 &asset_info,
                 &ctx.accounts.vault_authority,
@@ -165,27 +213,39 @@ mod mochi_v2_vault {
         Ok(())
     }
 
-    pub fn sellback_pack<'info>(ctx: Context<'_, '_, 'info, 'info, ResolvePack<'info>>) -> Result<()> {
+    pub fn sellback_pack<'info>(
+        ctx: Context<'_, '_, 'info, 'info, ResolvePack<'info>>,
+    ) -> Result<()> {
         let session = &mut ctx.accounts.pack_session;
         let vault_state = &ctx.accounts.vault_state;
         let now = Clock::get()?.unix_timestamp;
-        require!(session.state == PackState::PendingDecision, MochiError::InvalidSessionState);
+        require!(
+            session.state == PackState::PendingDecision,
+            MochiError::InvalidSessionState
+        );
         require!(now <= session.expires_at, MochiError::SessionExpired);
 
-        let total_value: u64 = session
-            .rarity_prices
-            .iter()
-            .copied()
-            .sum();
+        let total_value: u64 = session.rarity_prices.iter().copied().sum();
         let payout = total_value
             .checked_mul(vault_state.buyback_bps as u64)
             .and_then(|x| x.checked_div(10_000))
             .ok_or(MochiError::MathOverflow)?;
 
+        let (card_accounts, asset_accounts, extra_accounts) =
+            partition_pack_accounts(&ctx.remaining_accounts)?;
+        require!(
+            asset_accounts.len() == PACK_CARD_COUNT,
+            MochiError::InvalidCardCount
+        );
+
         match session.currency {
             Currency::Sol => {
                 invoke(
-                    &system_instruction::transfer(&ctx.accounts.vault_treasury.key(), &ctx.accounts.user.key(), payout),
+                    &system_instruction::transfer(
+                        &ctx.accounts.vault_treasury.key(),
+                        &ctx.accounts.user.key(),
+                        payout,
+                    ),
                     &[
                         ctx.accounts.vault_treasury.to_account_info(),
                         ctx.accounts.user.to_account_info(),
@@ -194,8 +254,9 @@ mod mochi_v2_vault {
                 )?;
             }
             Currency::Token => {
-                let user_token = ctx.accounts.user_currency_token.as_ref().ok_or(MochiError::MissingTokenAccount)?;
-                let vault_token = ctx.accounts.vault_currency_token.as_ref().ok_or(MochiError::MissingTokenAccount)?;
+                require!(extra_accounts.len() >= 2, MochiError::MissingTokenAccount);
+                let user_token: Account<TokenAccount> = Account::try_from(&extra_accounts[0])?;
+                let vault_token: Account<TokenAccount> = Account::try_from(&extra_accounts[1])?;
                 if let Some(mint) = vault_state.usdc_mint {
                     require_keys_eq!(user_token.mint, mint, MochiError::MintMismatch);
                     require_keys_eq!(vault_token.mint, mint, MochiError::MintMismatch);
@@ -206,7 +267,11 @@ mod mochi_v2_vault {
                     authority: ctx.accounts.vault_authority.to_account_info(),
                 };
                 let vault_key = vault_state.key();
-                let seeds = &[b"vault_authority", vault_key.as_ref(), &[vault_state.vault_authority_bump]];
+                let seeds = &[
+                    b"vault_authority",
+                    vault_key.as_ref(),
+                    &[vault_state.vault_authority_bump],
+                ];
                 let signer = &[&seeds[..]];
                 let cpi_ctx = CpiContext::new_with_signer(
                     ctx.accounts.token_program.to_account_info(),
@@ -217,9 +282,7 @@ mod mochi_v2_vault {
             }
         }
 
-        require!(ctx.remaining_accounts.len() == PACK_CARD_COUNT * 2, MochiError::InvalidCardCount);
-        for i in 0..PACK_CARD_COUNT {
-            let acc_info: &AccountInfo<'info> = &ctx.remaining_accounts[i];
+        for acc_info in card_accounts.iter() {
             let mut card_record: Account<CardRecord> = Account::try_from(acc_info)?;
             card_record.status = CardStatus::Available;
             card_record.owner = ctx.accounts.vault_authority.key();
@@ -230,15 +293,20 @@ mod mochi_v2_vault {
         Ok(())
     }
 
-    pub fn expire_session<'info>(ctx: Context<'_, '_, 'info, 'info, ResolvePack<'info>>) -> Result<()> {
+    pub fn expire_session<'info>(
+        ctx: Context<'_, '_, 'info, 'info, ResolvePack<'info>>,
+    ) -> Result<()> {
         let session = &mut ctx.accounts.pack_session;
         let now = Clock::get()?.unix_timestamp;
-        require!(session.state == PackState::PendingDecision, MochiError::InvalidSessionState);
+        require!(
+            session.state == PackState::PendingDecision,
+            MochiError::InvalidSessionState
+        );
         require!(now > session.expires_at, MochiError::SessionNotExpired);
 
-        require!(ctx.remaining_accounts.len() >= PACK_CARD_COUNT, MochiError::InvalidCardCount);
-        for i in 0..PACK_CARD_COUNT {
-            let acc_info: &AccountInfo<'info> = &ctx.remaining_accounts[i];
+        let (card_accounts, _asset_accounts, _extras) =
+            partition_pack_accounts(&ctx.remaining_accounts)?;
+        for acc_info in card_accounts.iter() {
             let mut card_record: Account<CardRecord> = Account::try_from(acc_info)?;
             card_record.status = CardStatus::Available;
             card_record.owner = ctx.accounts.vault_authority.key();
@@ -248,20 +316,85 @@ mod mochi_v2_vault {
         Ok(())
     }
 
-    pub fn admin_force_expire<'info>(ctx: Context<'_, '_, 'info, 'info, AdminForceExpire<'info>>) -> Result<()> {
-        require_keys_eq!(ctx.accounts.admin.key(), ctx.accounts.vault_state.admin, MochiError::Unauthorized);
+    pub fn admin_force_expire<'info>(
+        ctx: Context<'_, '_, 'info, 'info, AdminForceExpire<'info>>,
+    ) -> Result<()> {
+        require_keys_eq!(
+            ctx.accounts.admin.key(),
+            ctx.accounts.vault_state.admin,
+            MochiError::Unauthorized
+        );
         let session = &mut ctx.accounts.pack_session;
-        require!(session.state == PackState::PendingDecision, MochiError::InvalidSessionState);
+        require!(
+            session.state == PackState::PendingDecision,
+            MochiError::InvalidSessionState
+        );
 
-        require!(ctx.remaining_accounts.len() >= PACK_CARD_COUNT, MochiError::InvalidCardCount);
-        for i in 0..PACK_CARD_COUNT {
-            let acc_info: &AccountInfo<'info> = &ctx.remaining_accounts[i];
+        let (card_accounts, _asset_accounts, _extras) =
+            partition_pack_accounts(&ctx.remaining_accounts)?;
+        for acc_info in card_accounts.iter() {
             let mut card_record: Account<CardRecord> = Account::try_from(acc_info)?;
             card_record.status = CardStatus::Available;
             card_record.owner = ctx.accounts.vault_authority.key();
         }
 
         session.state = PackState::Expired;
+        Ok(())
+    }
+
+    pub fn admin_reset_session<'info>(
+        ctx: Context<'_, '_, 'info, 'info, AdminResetSession<'info>>,
+    ) -> Result<()> {
+        require_keys_eq!(
+            ctx.accounts.admin.key(),
+            ctx.accounts.vault_state.admin,
+            MochiError::Unauthorized
+        );
+
+        // Optionally free any card records passed in remaining accounts.
+        for acc_info in ctx.remaining_accounts.iter() {
+            if let Ok(mut card_record) = Account::<CardRecord>::try_from(acc_info) {
+                if card_record.vault_state == ctx.accounts.vault_state.key() {
+                    card_record.status = CardStatus::Available;
+                    card_record.owner = ctx.accounts.vault_authority.key();
+                }
+            }
+        }
+
+        let session = &mut ctx.accounts.pack_session;
+        require!(
+            session.state != PackState::PendingDecision,
+            MochiError::InvalidSessionState
+        );
+        session.state = PackState::Uninitialized;
+        session.paid_amount = 0;
+        session.created_at = 0;
+        session.expires_at = 0;
+        session.currency = Currency::Sol;
+        session.card_record_keys = [Pubkey::default(); PACK_CARD_COUNT];
+        session.client_seed_hash = [0u8; 32];
+        session.rarity_prices = Vec::new();
+        Ok(())
+    }
+
+    pub fn user_reset_session<'info>(
+        ctx: Context<'_, '_, 'info, 'info, UserResetSession<'info>>,
+    ) -> Result<()> {
+        let session = &mut ctx.accounts.pack_session;
+        require!(
+            session.state != PackState::PendingDecision,
+            MochiError::InvalidSessionState
+        );
+
+        for acc_info in ctx.remaining_accounts.iter() {
+            if let Ok(mut card_record) = Account::<CardRecord>::try_from(acc_info) {
+                if card_record.vault_state == ctx.accounts.vault_state.key() {
+                    card_record.status = CardStatus::Available;
+                    card_record.owner = ctx.accounts.vault_authority.key();
+                }
+            }
+        }
+        // Account will be closed to user via `close = user` attribute.
         Ok(())
     }
 
@@ -272,10 +405,14 @@ mod mochi_v2_vault {
     ) -> Result<()> {
         let record = &mut ctx.accounts.card_record;
         require!(
-            record.owner == ctx.accounts.seller.key() || record.owner == ctx.accounts.vault_authority.key(),
+            record.owner == ctx.accounts.seller.key()
+                || record.owner == ctx.accounts.vault_authority.key(),
             MochiError::Unauthorized
         );
-        require!(record.status == CardStatus::UserOwned || record.status == CardStatus::Available, MochiError::CardNotAvailable);
+        require!(
+            record.status == CardStatus::UserOwned || record.status == CardStatus::Available,
+            MochiError::CardNotAvailable
+        );
 
         record.status = CardStatus::Reserved;
         record.owner = ctx.accounts.vault_authority.key();
@@ -303,11 +440,22 @@ mod mochi_v2_vault {
 
     pub fn cancel_listing(ctx: Context<CancelListing>) -> Result<()> {
         let listing = &mut ctx.accounts.listing;
-        require!(listing.status == ListingStatus::Active, MochiError::InvalidListingState);
-        require_keys_eq!(listing.seller, ctx.accounts.seller.key(), MochiError::Unauthorized);
+        require!(
+            listing.status == ListingStatus::Active,
+            MochiError::InvalidListingState
+        );
+        require_keys_eq!(
+            listing.seller,
+            ctx.accounts.seller.key(),
+            MochiError::Unauthorized
+        );
 
         let record = &mut ctx.accounts.card_record;
-        require_keys_eq!(record.core_asset, listing.core_asset, MochiError::AssetMismatch);
+        require_keys_eq!(
+            record.core_asset,
+            listing.core_asset,
+            MochiError::AssetMismatch
+        );
         record.status = CardStatus::UserOwned;
         record.owner = ctx.accounts.seller.key();
         transfer_core_asset(
@@ -327,7 +475,10 @@ mod mochi_v2_vault {
 
     pub fn fill_listing(ctx: Context<FillListing>) -> Result<()> {
         let listing = &mut ctx.accounts.listing;
-        require!(listing.status == ListingStatus::Active, MochiError::InvalidListingState);
+        require!(
+            listing.status == ListingStatus::Active,
+            MochiError::InvalidListingState
+        );
 
         let fee_bps = ctx.accounts.vault_state.marketplace_fee_bps as u64;
         let fee = listing
@@ -335,11 +486,18 @@ mod mochi_v2_vault {
             .checked_mul(fee_bps)
             .and_then(|v| v.checked_div(10_000))
             .ok_or(MochiError::MathOverflow)?;
-        let seller_amount = listing.price_lamports.checked_sub(fee).ok_or(MochiError::MathOverflow)?;
+        let seller_amount = listing
+            .price_lamports
+            .checked_sub(fee)
+            .ok_or(MochiError::MathOverflow)?;
 
         // SOL path only for now
         invoke(
-            &system_instruction::transfer(&ctx.accounts.buyer.key(), &ctx.accounts.vault_treasury.key(), fee),
+            &system_instruction::transfer(
+                &ctx.accounts.buyer.key(),
+                &ctx.accounts.vault_treasury.key(),
+                fee,
+            ),
             &[
                 ctx.accounts.buyer.to_account_info(),
                 ctx.accounts.vault_treasury.to_account_info(),
@@ -348,7 +506,11 @@ mod mochi_v2_vault {
         )?;
 
         invoke(
-            &system_instruction::transfer(&ctx.accounts.buyer.key(), &ctx.accounts.seller.key(), seller_amount),
+            &system_instruction::transfer(
+                &ctx.accounts.buyer.key(),
+                &ctx.accounts.seller.key(),
+                seller_amount,
+            ),
             &[
                 ctx.accounts.buyer.to_account_info(),
                 ctx.accounts.seller.to_account_info(),
@@ -357,7 +519,11 @@ mod mochi_v2_vault {
         )?;
 
         let record = &mut ctx.accounts.card_record;
-        require_keys_eq!(record.core_asset, listing.core_asset, MochiError::AssetMismatch);
+        require_keys_eq!(
+            record.core_asset,
+            listing.core_asset,
+            MochiError::AssetMismatch
+        );
         record.status = CardStatus::UserOwned;
         record.owner = ctx.accounts.buyer.key();
         transfer_core_asset(
@@ -377,7 +543,11 @@ mod mochi_v2_vault {
 
     pub fn redeem_burn(ctx: Context<RedeemBurn>) -> Result<()> {
         let record = &mut ctx.accounts.card_record;
-        require_keys_eq!(record.owner, ctx.accounts.user.key(), MochiError::Unauthorized);
+        require_keys_eq!(
+            record.owner,
+            ctx.accounts.user.key(),
+            MochiError::Unauthorized
+        );
         burn_core_asset(
             &ctx.accounts.core_asset,
             &ctx.accounts.vault_authority,
@@ -392,7 +562,11 @@ mod mochi_v2_vault {
     }
 
     pub fn admin_migrate_asset(ctx: Context<AdminMigrateAsset>) -> Result<()> {
-        require_keys_eq!(ctx.accounts.admin.key(), ctx.accounts.vault_state.admin, MochiError::Unauthorized);
+        require_keys_eq!(
+            ctx.accounts.admin.key(),
+            ctx.accounts.vault_state.admin,
+            MochiError::Unauthorized
+        );
         let record = &mut ctx.accounts.card_record;
         transfer_core_asset(
             &ctx.accounts.core_asset,
@@ -410,9 +584,46 @@ mod mochi_v2_vault {
     }
 
     pub fn deprecate_card(ctx: Context<DeprecateCard>) -> Result<()> {
-        require_keys_eq!(ctx.accounts.admin.key(), ctx.accounts.vault_state.admin, MochiError::Unauthorized);
+        require_keys_eq!(
+            ctx.accounts.admin.key(),
+            ctx.accounts.vault_state.admin,
+            MochiError::Unauthorized
+        );
         let record = &mut ctx.accounts.card_record;
         record.status = CardStatus::Deprecated;
+        Ok(())
+    }
+
+    pub fn admin_force_close_session<'info>(
+        ctx: Context<'_, '_, 'info, 'info, AdminForceClose<'info>>,
+    ) -> Result<()> {
+        // Admin-only override: closes pack_session regardless of state and frees card records.
+        require_keys_eq!(
+            ctx.accounts.admin.key(),
+            ctx.accounts.vault_state.admin,
+            MochiError::Unauthorized
+        );
+
+        // Reset card records passed in remaining accounts (best-effort)
+        for acc_info in ctx.remaining_accounts.iter() {
+            if let Ok(mut card_record) = Account::<CardRecord>::try_from(acc_info) {
+                if card_record.vault_state == ctx.accounts.vault_state.key() {
+                    card_record.status = CardStatus::Available;
+                    card_record.owner = ctx.accounts.vault_authority.key();
+                }
+            }
+        }
+
+        // Zero out the pack_session; account will be closed to admin via the context.
+        let session = &mut ctx.accounts.pack_session;
+        session.state = PackState::Uninitialized;
+        session.paid_amount = 0;
+        session.created_at = 0;
+        session.expires_at = 0;
+        session.currency = Currency::Sol;
+        session.card_record_keys = [Pubkey::default(); PACK_CARD_COUNT];
+        session.client_seed_hash = [0u8; 32];
+        session.rarity_prices = Vec::new();
         Ok(())
     }
 }
@@ -482,11 +693,6 @@ pub struct OpenPackStart<'info> {
     /// Treasury to receive SOL fees
     #[account(mut)]
     pub vault_treasury: SystemAccount<'info>,
-    /// Optional token accounts for USDC path
-    #[account(mut)]
-    pub user_currency_token: Option<Account<'info, TokenAccount>>,
-    #[account(mut)]
-    pub vault_currency_token: Option<Account<'info, TokenAccount>>,
     pub token_program: Program<'info, Token>,
     /// CHECK: System program
     pub system_program: UncheckedAccount<'info>,
@@ -507,10 +713,6 @@ pub struct ResolvePack<'info> {
     pub vault_authority: UncheckedAccount<'info>,
     #[account(mut)]
     pub vault_treasury: SystemAccount<'info>,
-    #[account(mut)]
-    pub user_currency_token: Option<Account<'info, TokenAccount>>,
-    #[account(mut)]
-    pub vault_currency_token: Option<Account<'info, TokenAccount>>,
     pub token_program: Program<'info, Token>,
     /// CHECK: System program
     pub system_program: UncheckedAccount<'info>,
@@ -535,6 +737,64 @@ pub struct AdminForceExpire<'info> {
     pub vault_treasury: SystemAccount<'info>,
     /// CHECK: System program
     pub system_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct AdminResetSession<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    /// CHECK: user wallet (used for PDA derivation only)
+    pub user: UncheckedAccount<'info>,
+    #[account(mut, seeds = [b"vault_state"], bump)]
+    pub vault_state: Account<'info, VaultState>,
+    #[account(
+        mut,
+        close = user,
+        seeds = [b"pack_session", vault_state.key().as_ref(), user.key().as_ref()],
+        bump
+    )]
+    pub pack_session: Account<'info, PackSession>,
+    /// CHECK: Vault authority PDA (validated by seeds)
+    #[account(mut, seeds = [b"vault_authority", vault_state.key().as_ref()], bump = vault_state.vault_authority_bump)]
+    pub vault_authority: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct AdminForceClose<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    /// CHECK: user wallet (used for PDA derivation only)
+    pub user: UncheckedAccount<'info>,
+    #[account(mut, seeds = [b"vault_state"], bump)]
+    pub vault_state: Account<'info, VaultState>,
+    #[account(
+        mut,
+        close = admin,
+        seeds = [b"pack_session", vault_state.key().as_ref(), user.key().as_ref()],
+        bump
+    )]
+    pub pack_session: Account<'info, PackSession>,
+    /// CHECK: Vault authority PDA (validated by seeds)
+    #[account(mut, seeds = [b"vault_authority", vault_state.key().as_ref()], bump = vault_state.vault_authority_bump)]
+    pub vault_authority: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct UserResetSession<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    #[account(mut, seeds = [b"vault_state"], bump)]
+    pub vault_state: Account<'info, VaultState>,
+    #[account(
+        mut,
+        close = user,
+        seeds = [b"pack_session", vault_state.key().as_ref(), user.key().as_ref()],
+        bump
+    )]
+    pub pack_session: Account<'info, PackSession>,
+    /// CHECK: Vault authority PDA (validated by seeds)
+    #[account(mut, seeds = [b"vault_authority", vault_state.key().as_ref()], bump = vault_state.vault_authority_bump)]
+    pub vault_authority: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
@@ -702,7 +962,8 @@ pub struct PackSession {
     pub rarity_prices: Vec<u64>,
 }
 impl PackSession {
-    pub const SIZE: usize = 32 + 1 + 8 + 8 + 8 + (32 * PACK_CARD_COUNT) + 1 + 32 + 4 + 8 * PACK_CARD_COUNT;
+    pub const SIZE: usize =
+        32 + 1 + 8 + 8 + 8 + (32 * PACK_CARD_COUNT) + 1 + 32 + 4 + 8 * PACK_CARD_COUNT;
 }
 
 #[account]
@@ -803,6 +1064,26 @@ pub enum MochiError {
     CoreCpiError,
 }
 
+fn partition_pack_accounts<'info>(
+    accounts: &'info [AccountInfo<'info>],
+) -> Result<(
+    &'info [AccountInfo<'info>],
+    &'info [AccountInfo<'info>],
+    &'info [AccountInfo<'info>],
+)> {
+    require!(
+        accounts.len() >= PACK_CARD_COUNT,
+        MochiError::InvalidCardCount
+    );
+    let (card_slice, rest) = accounts.split_at(PACK_CARD_COUNT);
+    if rest.len() >= PACK_CARD_COUNT {
+        let (asset_slice, extras) = rest.split_at(PACK_CARD_COUNT);
+        Ok((card_slice, asset_slice, extras))
+    } else {
+        Ok((card_slice, &[], rest))
+    }
+}
+
 fn transfer_core_asset<'info>(
     asset: &AccountInfo<'info>,
     authority: &AccountInfo<'info>,
@@ -822,7 +1103,9 @@ fn transfer_core_asset<'info>(
         .authority(Some(authority))
         .new_owner(new_owner)
         .system_program(Some(system_program));
-    builder.invoke_signed(signer).map_err(|_| MochiError::CoreCpiError.into())
+    builder
+        .invoke_signed(signer)
+        .map_err(|_| MochiError::CoreCpiError.into())
 }
 
 fn burn_core_asset<'info>(
@@ -842,5 +1125,7 @@ fn burn_core_asset<'info>(
         .authority(Some(authority))
         .payer(payer)
         .system_program(Some(system_program));
-    builder.invoke_signed(signer).map_err(|_| MochiError::CoreCpiError.into())
+    builder
+        .invoke_signed(signer)
+        .map_err(|_| MochiError::CoreCpiError.into())
 }

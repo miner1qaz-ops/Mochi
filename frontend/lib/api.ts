@@ -10,6 +10,15 @@ export const api = axios.create({ baseURL: API_BASE });
 
 export type PackSlot = { slot_index: number; rarity: string; template_id?: number | null };
 export type InstructionMeta = { program_id: string; keys: { pubkey: string; is_signer: boolean; is_writable: boolean }[]; data: string };
+export type PendingSession = {
+  session_id: string;
+  wallet: string;
+  expires_at: number;
+  countdown_seconds: number;
+  lineup: PackSlot[];
+  asset_ids: string[];
+  provably_fair: Record<string, string>;
+};
 
 export async function previewPack(client_seed: string, wallet: string, pack_type: string = 'meg_web') {
   const { data } = await api.post('/program/open/preview', { client_seed, wallet, pack_type });
@@ -53,6 +62,32 @@ export async function claimPack(session_id: string, wallet: string) {
 export async function sellbackPack(session_id: string, wallet: string) {
   const { data } = await api.post('/program/sellback/build', { session_id, wallet });
   return data as { tx_b64: string; tx_v0_b64: string; recent_blockhash: string; instructions: InstructionMeta[] };
+}
+
+export async function expirePack(session_id: string, wallet: string) {
+  const { data } = await api.post('/program/expire/build', { session_id, wallet });
+  return data as { tx_b64: string; tx_v0_b64: string; recent_blockhash: string; instructions: InstructionMeta[] };
+}
+
+export async function fetchActiveSession(wallet: string) {
+  const { data } = await api.get('/program/session/pending', { params: { wallet } });
+  return data as PendingSession;
+}
+
+export async function resetPack(wallet: string) {
+  const { data } = await api.post('/program/open/reset_build', { wallet });
+  return data as { tx_b64: string; tx_v0_b64: string; recent_blockhash: string; instructions: InstructionMeta[] };
+}
+
+export async function confirmOpen(signature: string, wallet: string) {
+  const { data } = await api.post('/program/open/confirm', { signature, wallet });
+  return data as { state: string; assets: string[] };
+}
+
+export async function confirmClaim(signature: string, wallet: string, action: 'claim' | 'sellback' = 'claim') {
+  const endpoint = action === 'claim' ? '/program/claim/confirm' : '/program/sellback/confirm';
+  const { data } = await api.post(endpoint, { signature, wallet });
+  return data as { state: string; assets: string[] };
 }
 
 export async function listCard(core_asset: string, wallet: string, price_lamports: number, currency_mint?: string) {

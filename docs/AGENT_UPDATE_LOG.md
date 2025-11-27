@@ -163,3 +163,43 @@ Next steps:
 - Added backend diagnostics endpoints (`GET /admin/sessions/diagnostic`, `GET /admin/inventory/reserved`) plus a repair endpoint `POST /admin/inventory/unreserve` that flips any non-available MintRecords back to the vault and marks pending/settled sessions as expired.
 - Surfaced those diagnostics and a new “Unreserve all” button in the admin UI so you can inspect/clear stuck cards before retrying a pack buy.
 - Restarted backend/frontends and updated docs accordingly.
+
+## 2025-11-27T13:55:00+08:00 – Codex
+- Anchor pack instructions now slice `remaining_accounts` as `[11 CardRecords][11 Core assets][optional SPL token ATAs]`, so SOL purchases no longer provide dummy token accounts and sell-back only requires them when `currency == Token`.
+- `backend/tx_builder.py` appends the MPL Core program, every core asset account, and optional SPL ATAs in that order for open/claim/sellback/admin-force instructions; claim/sellback builders now take both account vectors explicitly.
+- `pick_template_ids` normalizes rarity strings (strip spaces/underscores + lowercase) so CSV entries like “Double rare” satisfy `DoubleRare` slot requests, fixing the “Missing asset for slot X” errors.
+- Ran `anchor build && anchor deploy` (sig `5VxYb7KABreUGbZRyQNpw6gz49tDtcx7fs3MP17psYxXewcHyrFu5fMg1wnog3ausMYbLUZnsPhQmuYaX9S1sVWQ`) and regenerated `target/idl/mochi_v2_vault.json`.
+- Restarted `mochi-backend.service` and confirmed `/program/open/build` for SOL now returns a tx + lineup (no more `AccountOwnedByWrongProgram`).
+
+## 2025-11-27T14:25:00+08:00 – Codex
+- Trimmed `open_pack_start` to accept only the 11 CardRecord PDAs (Core assets + SPL ATAs now live in the “extras” tail and are optional), while `claim_pack` / `sellback_pack` still enforce `[cards][assets]` so the Core CPI transfers have the accounts they need. Redeployed `mochi_v2_vault` again (sig `49p6UUntQVzYYAWfPmstTnKqetDXJoJgfSSpPiR8KXDy5XPZNs14LZwLAWoepaygyFLAm9gtzYkH9ZGENkrhdXfm`) and regenerated the IDL to capture the layout change.
+- Updated `tx_builder.py` so SOL pack transactions now ship only 19 accounts (5 base + 11 CardRecords + programs) while claim/sell-back/admin-force still append the Core assets. Message size dropped to ~834 bytes, well below the 1232-byte raw limit that previously triggered `VersionedTransaction too large`.
+- Restarted `mochi-backend.service` after the builder tweaks and reran the inventory repair endpoints (`/admin/inventory/refresh`, `/admin/inventory/unreserve`, `/admin/sessions/force_expire`) so pending sessions/cards were cleaned up before testing.
+
+## 2025-11-27T18:05:00+08:00 – Codex
+- Backend now blocks duplicate pack openings by checking the existing `pack_session` PDA before reserving cards and exposes `GET /program/session/pending` so the frontend can resume the card lineup/countdown via a simple wallet query.
+- `/program/claim/build` already required the PDA; the new open guard plus resume endpoint mean cancelled Phantom approvals no longer yield confusing runtime errors. Docs updated accordingly.
+- Gacha page now calls the resume endpoint on wallet connect, rehydrates slots/proof/countdown, and disables Buy/Claim/Sell buttons with loading states so users can’t spam-click into inconsistent states.
+- Ran `npm run build` for the frontend, restarted `mochi-frontend.service`, and bounced `mochi-backend.service` to pick up the API changes.
+
+## 2025-11-27T19:10:00+08:00 – Codex
+- Added `GET /program/session/pending` plus a devnet RPC guard in `/program/open/build` so wallets can resume pending sessions and can’t start overlapping packs; claim builds already enforce the pack_session PDA.
+- Admin `/admin/sessions` endpoint now accepts `page`/`page_size` and returns `{items,total,page,page_size}` when paginating; the dashboard uses Prev/Next controls so long histories don’t flood the UI.
+- `/gacha` gets a dedicated “Resume pending pack” button and disables Buy/Claim/Sell buttons while RPC/wallet calls are in flight to prevent spam clicks; when no session exists it surfaces a clear toast.
+- Rebuilt the frontend (`npm run build`) and restarted both `mochi-frontend` and `mochi-backend` services to apply the changes.
+
+## 2025-11-27T19:40:00+08:00 – Codex
+- Fixed the stuck-session loop: if a wallet still has a `pack_session` PDA on chain but no SessionMirror row, the backend now reads the pack_session + card_record accounts directly (skipping Anchor discriminators), restores the mirror, and re-marks the MintRecords as reserved so claim/sell-back/resume all work again.
+- `/program/session/pending` and `/program/open/build` both call this backfill helper, so hitting the Resume button (or simply retrying Claim/Sell-back) surfaces the active pack instead of blocking with “wallet already has a session”.
+- Verified the hot wallet `63KMUfAuxy…` now returns session `3sxb…` from `/program/session/pending`; admin pagination also shows the pending row so ops can force-expire if needed.
+
+## 2025-11-27T20:05:00+08:00 – Codex
+- Added `/program/expire/build` so wallets can sign an `expire_session` instruction the moment the 1h window lapses; the frontend now shows an **Expire session** button next to Claim/Sell when the countdown hits zero.
+- Fixed both the user and admin force-expire flows by marking `vault_authority` writable in the CPI builders, and updated the resume/backfill logic so pending sessions with missing DB rows are re-created automatically.
+- Rebuilt the frontend and restarted both services after the changes.
+
+## 2025-11-27T20:50:00+08:00 – Codex
+- Added on-chain `admin_force_close_session` instruction to forcibly close any pack_session (ignores state) and return card records to `Available`/vault ownership; redeployed `mochi_v2_vault` (sig `4pnMwuK9mZj4ZSnv3fk8QrPL5HUf7NNvgyhyrgAs2gtMsQ4yUSMQFxANBt8Lfb14D5jvV4Faw31CmHcnY5k7khgR`).
+- Backend: new `POST /admin/sessions/force_close` that deserializes the pack_session PDA, builds the new ix with the admin keypair, and frees card records + mirrors for the target wallet.
+- Frontend admin: added wallet input + “Force close session” button calling the new endpoint.
+- After deploy, backend and frontend services restarted; DB mirrors cleared and all 400 MintRecords set to Available/owned by the vault PDA.

@@ -1,9 +1,19 @@
 'use client';
 
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useWallet } from '@solana/wallet-adapter-react';
-import { buildPack, claimPack, previewPack, sellbackPack, PackSlot } from '../../lib/api';
+import {
+  buildPack,
+  claimPack,
+  previewPack,
+  sellbackPack,
+  expirePack,
+  PackSlot,
+  fetchActiveSession,
+  confirmOpen,
+  resetPack,
+} from '../../lib/api';
 import { buildV0Tx } from '../../lib/tx';
 import { deriveAta } from '../../lib/ata';
 import { useConnection } from '@solana/wallet-adapter-react';
@@ -25,8 +35,11 @@ type ApiErrorPayload = { detail?: string; message?: string };
 const extractErrorMessage = (err: unknown): string => {
   if (err && typeof err === 'object') {
     const axiosErr = err as AxiosError<ApiErrorPayload>;
-    const detail = axiosErr?.response?.data?.detail || axiosErr?.response?.data?.message;
-    if (detail) return detail;
+    const data = axiosErr?.response?.data as any;
+    const detail =
+      (data && (data.detail || data.message)) ||
+      (Array.isArray(data?.detail) ? data.detail.map((d: any) => d.msg || JSON.stringify(d)).join('; ') : null);
+    if (detail) return String(detail);
     if ('message' in err && typeof (err as { message?: string }).message === 'string') {
       return (err as { message?: string }).message as string;
     }
@@ -60,32 +73,37 @@ const FlipModalCard = ({
   return (
     <div style={{ perspective: 1000 }} className="w-full max-w-md mx-auto">
       <motion.div
+        className="cursor-grab active:cursor-grabbing"
         style={{
           width: '100%',
+          maxWidth: '360px',
           aspectRatio: '2/3',
           position: 'relative',
           transformStyle: 'preserve-3d',
-          cursor: 'pointer',
+          touchAction: 'none',
         }}
-        animate={{ rotateY: faceBack ? 0 : 180 }}
+        animate={{ rotateY: faceBack ? 0 : 180, x: 0 }}
         transition={{ duration: 0.6 }}
-        onClick={onAdvance}
-        drag="x"
-        dragConstraints={{ left: -300, right: 300 }}
-        dragElastic={0.35}
+        drag
+        dragConstraints={{ left: -200, right: 200, top: -200, bottom: 200 }}
+        dragElastic={0.22}
         dragMomentum={false}
+        dragSnapToOrigin
+        whileDrag={{ rotateX: -16, scale: 0.99 }}
+        onClick={onAdvance}
         onDragEnd={(_, info) => {
-          const threshold = 40;
-          if (Math.abs(info.offset.x) > threshold || Math.abs(info.velocity.x) > 800) {
+          const threshold = 10;
+          const velocityThreshold = 120;
+          const dist = Math.hypot(info.offset.x, info.offset.y);
+          if (dist > threshold || Math.hypot(info.velocity.x, info.velocity.y) > velocityThreshold) {
             onAdvance();
           }
         }}
-      >
+        >
         <div
           style={{
             position: 'absolute',
-            width: '100%',
-            height: '100%',
+            inset: 0,
             backfaceVisibility: 'hidden',
           }}
         >
@@ -94,14 +112,14 @@ const FlipModalCard = ({
             src={backImage}
             alt="card back"
             className="w-full h-full object-contain rounded-2xl"
-            style={{ display: 'block' }}
+            style={{ display: 'block', width: '100%', height: '100%' }}
+            draggable={false}
           />
         </div>
         <div
           style={{
             position: 'absolute',
-            width: '100%',
-            height: '100%',
+            inset: 0,
             backfaceVisibility: 'hidden',
             transform: 'rotateY(180deg)',
           }}
@@ -111,7 +129,8 @@ const FlipModalCard = ({
             src={frontImage}
             alt="card front"
             className="w-full h-full object-contain rounded-2xl"
-            style={{ display: 'block' }}
+            style={{ display: 'block', width: '100%', height: '100%' }}
+            draggable={false}
             onError={(e) => {
               (e.target as HTMLImageElement).src = '/card_back.png';
             }}
@@ -128,13 +147,19 @@ export default function GachaPage() {
   const [clientSeed, setClientSeed] = useState('');
   const [slots, setSlots] = useState<PackSlot[]>([]);
   const [sessionId, setSessionId] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [openLoading, setOpenLoading] = useState(false);
+  const [claimLoading, setClaimLoading] = useState(false);
+  const [sellbackLoading, setSellbackLoading] = useState(false);
+  const [expireLoading, setExpireLoading] = useState(false);
+  const [confirmLoading, setConfirmLoading] = useState(false);
+  const [resetLoading, setResetLoading] = useState(false);
   const [countdown, setCountdown] = useState<number | null>(null);
   const [proof, setProof] = useState<{ server_seed_hash: string; server_nonce: string; entropy_proof: string } | null>(null);
   const [clientProofSeed, setClientProofSeed] = useState<string>('');
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const [statusKind, setStatusKind] = useState<'info' | 'error'>('info');
   const [useUsdc, setUseUsdc] = useState(false);
+  const [testModeMsg, setTestModeMsg] = useState<string | null>(null);
   const usdcMint = process.env.NEXT_PUBLIC_USDC_MINT ? new PublicKey(process.env.NEXT_PUBLIC_USDC_MINT) : null;
   const [packStage, setPackStage] = useState<'idle' | 'swing' | 'tear' | 'reveal'>('idle');
   const [revealIndex, setRevealIndex] = useState<number>(-1);
@@ -143,6 +168,9 @@ export default function GachaPage() {
   const [templatesByPack, setTemplatesByPack] = useState<Record<string, Record<number, { name: string; image: string; rarity: string }>>>({});
   const [revealed, setRevealed] = useState<boolean[]>([]);
   const [modalFaceBack, setModalFaceBack] = useState(true);
+  const [resumeLoading, setResumeLoading] = useState(false);
+  const [openSignature, setOpenSignature] = useState<string | null>(null);
+  const [confirmDone, setConfirmDone] = useState(false);
   const packOptions = useMemo(
     () => [
       { id: 'meg_web_alt', name: 'Mega Evolutions Pack', priceSol: 0.12, priceUsdc: 12, image: '/img/pack_alt.jpg' },
@@ -150,6 +178,19 @@ export default function GachaPage() {
     []
   );
   const [selectedPack, setSelectedPack] = useState<string>('meg_web_alt');
+  const resetSessionState = useCallback(() => {
+    setSessionId(null);
+    setSlots([]);
+    setRevealed([]);
+    setRevealIndex(-1);
+    setShowOneModal(false);
+    setProof(null);
+    setClientProofSeed('');
+    setCountdown(null);
+    setPackStage('idle');
+    setOpenSignature(null);
+    setConfirmDone(false);
+  }, []);
 
   useEffect(() => {
     let timer: NodeJS.Timeout;
@@ -226,6 +267,65 @@ export default function GachaPage() {
     loadTemplates();
   }, []);
 
+  const hydrateSession = useCallback(
+    async (interactive = false) => {
+      if (!publicKey) return;
+      if (interactive) {
+        setResumeLoading(true);
+        setStatusMsg(null);
+      }
+      try {
+        const pending = await fetchActiveSession(publicKey.toBase58());
+        setSessionId(pending.session_id);
+        setSlots(pending.lineup);
+        setRevealed(Array(pending.lineup.length).fill(true));
+        setRevealIndex(pending.lineup.length - 1);
+        setModalFaceBack(false);
+        setShowOneModal(false);
+        setPackStage('reveal');
+        setCountdown(pending.countdown_seconds);
+        const fair = pending.provably_fair || {};
+        setProof({
+          server_seed_hash: fair.server_seed_hash || '',
+          server_nonce: fair.server_nonce || '',
+          entropy_proof: fair.entropy_proof || fair.assets || '',
+        });
+        setClientProofSeed('');
+        setConfirmDone(true); // resuming implies session already exists on-chain; allow claim/sell
+        if (interactive) {
+          setStatusKind('info');
+          setStatusMsg('Resumed your pending pack session. Claim or sell back before the timer ends.');
+        }
+      } catch (err) {
+        const axiosErr = err as AxiosError;
+        if (axiosErr?.response?.status === 404) {
+          if (interactive) {
+            setStatusKind('error');
+            setStatusMsg('No active session to resume.');
+          }
+          resetSessionState();
+        } else {
+          console.error('resume error', err);
+          setStatusKind('error');
+          setStatusMsg(extractErrorMessage(err));
+        }
+      } finally {
+        if (interactive) {
+          setResumeLoading(false);
+        }
+      }
+    },
+    [publicKey, resetSessionState],
+  );
+
+  useEffect(() => {
+    if (!publicKey) {
+      resetSessionState();
+      return;
+    }
+    hydrateSession(false);
+  }, [publicKey, hydrateSession, resetSessionState]);
+
   const handlePreview = async () => {
     setStatusMsg(null);
     setStatusKind('info');
@@ -241,8 +341,15 @@ export default function GachaPage() {
   };
 
   const handleOpen = async () => {
-    if (!connected || !publicKey) return;
-    setLoading(true);
+    if (!connected || !publicKey || openLoading) return;
+    if (sessionId) {
+      setStatusKind('error');
+      setStatusMsg('Finish or cancel your current pack before buying another.');
+      return;
+    }
+    setOpenSignature(null);
+    setConfirmDone(false);
+    setOpenLoading(true);
     try {
       setStatusMsg(null);
       let userToken: string | undefined;
@@ -289,46 +396,158 @@ export default function GachaPage() {
       const signed = await signTransaction(tx);
       setStatusMsg('Submitting transaction…');
       const sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
-      setStatusMsg(`Pack opened tx: ${sig}`);
+      setStatusMsg(`Pack opened tx: ${sig}. Verifying cards…`);
+      setOpenSignature(sig);
+      setConfirmDone(false);
+      // Auto-confirm immediately
+      try {
+        setConfirmLoading(true);
+        setStatusMsg('Verifying on-chain session and locking cards…');
+        const res = await confirmOpen(sig, publicKey.toBase58());
+        if (!res || !res.state) {
+          throw new Error('Confirm failed – no state returned.');
+        }
+        setConfirmDone(true);
+        setStatusMsg(`Cards locked. State: ${res.state}. You can now claim or sell back.`);
+      } catch (err) {
+        console.error('confirm open error', err);
+        setStatusKind('error');
+        setStatusMsg(`${extractErrorMessage(err)}. If stuck, click Reset session then reopen.`);
+      } finally {
+        setConfirmLoading(false);
+      }
     } catch (e) {
       console.error(e);
       setStatusKind('error');
       setStatusMsg(extractErrorMessage(e));
     } finally {
-      setLoading(false);
+      setOpenLoading(false);
+    }
+  };
+
+  const handleReset = async () => {
+    if (!publicKey || resetLoading) return;
+    setResetLoading(true);
+    try {
+      setStatusKind('info');
+      setStatusMsg('Resetting session… please sign reset tx.');
+      const res = await resetPack(publicKey.toBase58());
+      const tx = buildV0Tx(publicKey, res.recent_blockhash, res.instructions);
+      const signed = signTransaction ? await signTransaction(tx) : tx;
+      const sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
+      setStatusMsg(`Session reset tx: ${sig}. You may open a new pack.`);
+      resetSessionState();
+    } catch (e) {
+      console.error('reset error', e);
+      setStatusKind('error');
+      setStatusMsg(extractErrorMessage(e));
+    } finally {
+      setResetLoading(false);
     }
   };
 
   const handleClaim = async () => {
-    if (!sessionId || !publicKey) return;
-    const res = await claimPack(sessionId, publicKey.toBase58());
-    const tx = buildV0Tx(publicKey, res.recent_blockhash, res.instructions);
+    if (!sessionId || !publicKey || claimLoading) return;
+    if (!confirmDone) {
+      setStatusKind('error');
+      setStatusMsg('Please confirm cards before claiming.');
+      return;
+    }
+    setClaimLoading(true);
     try {
-      const signed = signTransaction ? await signTransaction(tx) : tx;
-      const sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
       setStatusKind('info');
+      setStatusMsg('Building claim transaction…');
+      const res = await claimPack(sessionId, publicKey.toBase58());
+      const tx = buildV0Tx(publicKey, res.recent_blockhash, res.instructions);
+      const signed = signTransaction ? await signTransaction(tx) : tx;
+      setStatusMsg('Submitting claim transaction…');
+      const sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
       setStatusMsg(`Claim tx: ${sig}`);
+      resetSessionState();
     } catch (e) {
       console.error('claim error', e);
       setStatusKind('error');
       setStatusMsg(extractErrorMessage(e));
+    } finally {
+      setClaimLoading(false);
     }
   };
 
   const handleSellback = async () => {
-    if (!sessionId || !publicKey) return;
-    const res = await sellbackPack(sessionId, publicKey.toBase58());
-    const tx = buildV0Tx(publicKey, res.recent_blockhash, res.instructions);
+    if (!sessionId || !publicKey || sellbackLoading) return;
+    if (!confirmDone) {
+      setStatusKind('error');
+      setStatusMsg('Please confirm cards before sell-back.');
+      return;
+    }
+    setSellbackLoading(true);
     try {
-      const signed = signTransaction ? await signTransaction(tx) : tx;
-      const sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
       setStatusKind('info');
-      setStatusMsg(`Sellback tx: ${sig}`);
+      setStatusMsg('Building sell-back transaction…');
+      const res = await sellbackPack(sessionId, publicKey.toBase58());
+      const tx = buildV0Tx(publicKey, res.recent_blockhash, res.instructions);
+      const signed = signTransaction ? await signTransaction(tx) : tx;
+      setStatusMsg('Submitting sell-back transaction…');
+      const sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
+      setStatusMsg(`Sell-back tx: ${sig}`);
+      resetSessionState();
     } catch (e) {
       console.error('sellback error', e);
       setStatusKind('error');
       setStatusMsg(extractErrorMessage(e));
+    } finally {
+      setSellbackLoading(false);
     }
+  };
+
+  const handleExpire = async () => {
+    if (!sessionId || !publicKey || expireLoading) return;
+    setExpireLoading(true);
+    try {
+      setStatusKind('info');
+      setStatusMsg('Building expire transaction…');
+      const res = await expirePack(sessionId, publicKey.toBase58());
+      const tx = buildV0Tx(publicKey, res.recent_blockhash, res.instructions);
+      const signed = signTransaction ? await signTransaction(tx) : tx;
+      setStatusMsg('Submitting expire transaction…');
+      const sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
+      setStatusMsg(`Expire session tx: ${sig}`);
+      resetSessionState();
+    } catch (e) {
+      console.error('expire error', e);
+      setStatusKind('error');
+      setStatusMsg(extractErrorMessage(e));
+    } finally {
+      setExpireLoading(false);
+    }
+  };
+
+  const handleTestPurchase = () => {
+    // Local-only pack to exercise the UI without chain calls.
+    setStatusKind('info');
+    setStatusMsg('Test pack: UI-only, no chain calls.');
+    setTestModeMsg('Demo pack loaded – flip/swipe to test the UI.');
+    const dummySlots: PackSlot[] = Array.from({ length: 11 }).map((_, i) => ({
+      slot_index: i,
+      rarity: ['Common', 'Uncommon', 'Rare', 'UltraRare'][i % 4],
+      template_id: i + 1,
+    }));
+    setSlots(dummySlots);
+    setRevealed(Array(dummySlots.length).fill(false));
+    setRevealIndex(0);
+    setModalFaceBack(true);
+    if (revealMode === 'one') setShowOneModal(true);
+    setSessionId('test-session');
+    setCountdown(3600);
+    setProof({
+      server_seed_hash: 'test-hash',
+      server_nonce: 'test-nonce',
+      entropy_proof: 'test-entropy',
+    });
+    setClientProofSeed('test-seed');
+    setPackStage('swing');
+    setTimeout(() => setPackStage('tear'), 800);
+    setTimeout(() => setPackStage('reveal'), 1500);
   };
 
   const enrichedSlots = useMemo(() => {
@@ -507,15 +726,43 @@ export default function GachaPage() {
           <input type="checkbox" checked={useUsdc} onChange={(e) => setUseUsdc(e.target.checked)} />
           <span>Pay with USDC</span>
         </div>
-        <button onClick={handlePreview} className="px-4 py-3 rounded-xl bg-white/10 border border-white/10">Preview RNG</button>
+        <button
+          onClick={handlePreview}
+          className="px-4 py-3 rounded-xl bg-white/10 border border-white/10"
+        >
+          Preview RNG
+        </button>
         <button
           onClick={handleOpen}
-          disabled={!connected || loading}
-          className="px-5 py-3 rounded-xl bg-sakura text-ink font-semibold shadow-glow disabled:opacity-50"
+          disabled={!connected || openLoading || !!sessionId}
+          className="px-5 py-3 rounded-xl bg-sakura text-ink font-semibold shadow-glow disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          {loading ? 'Building...' : 'Buy pack'}
+          {sessionId ? 'Session active' : openLoading ? 'Awaiting wallet…' : 'Buy pack'}
         </button>
       </div>
+      <div className="flex gap-3">
+        <button
+          onClick={handleTestPurchase}
+          className="px-4 py-2 rounded-xl bg-white/10 border border-white/10 text-sm"
+          type="button"
+        >
+          Demo / Test Pack – No Deduction
+        </button>
+        {testModeMsg && <p className="text-sm text-white/60">{testModeMsg}</p>}
+      </div>
+      {connected && (
+        <div className="flex gap-3">
+          <button
+            type="button"
+            onClick={() => hydrateSession(true)}
+            className="px-4 py-2 rounded-xl bg-white/10 border border-white/10 text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+            disabled={resumeLoading || !publicKey}
+          >
+            {resumeLoading ? 'Resuming…' : 'Resume pending pack'}
+          </button>
+          <p className="text-xs text-white/60">Use this if you refreshed mid-pack or need to reload the lineup.</p>
+        </div>
+      )}
       {sessionId && (
         <div className="rounded-2xl border border-white/10 bg-white/5 p-4 flex flex-wrap items-center gap-4 text-sm text-white/70 mt-3">
           <div className="font-semibold text-white">Active session</div>
@@ -527,9 +774,25 @@ export default function GachaPage() {
               Time left: <span className="font-semibold text-white">{countdown}s</span>
             </div>
           )}
-          <div className="text-white/60">
-            Claim or sell back before buying another pack (auto-expire after 1 hour).
-          </div>
+          <div className="text-white/60">Cards auto-verify after purchase. Reset if stuck.</div>
+        </div>
+      )}
+      {sessionId && (
+        <div className="flex flex-wrap gap-3">
+          <button
+            type="button"
+            onClick={handleReset}
+            disabled={resetLoading}
+            className="px-4 py-2 rounded-xl bg-white/10 border border-white/20 text-white disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {resetLoading ? 'Resetting…' : 'Reset session'}
+          </button>
+          {openSignature && (
+            <span className="text-xs text-white/60 break-all">
+              Open tx: {openSignature}
+            </span>
+          )}
+          {confirmLoading && <span className="text-xs text-white/60">Verifying cards…</span>}
         </div>
       )}
       {statusMsg && (
@@ -678,17 +941,24 @@ export default function GachaPage() {
       <div className="flex gap-3">
         <button
           onClick={handleClaim}
-          disabled={!sessionId}
-          className="px-5 py-3 rounded-xl bg-aurora text-ink font-semibold disabled:opacity-50"
+          disabled={!sessionId || claimLoading || !confirmDone}
+          className="px-5 py-3 rounded-xl bg-aurora text-ink font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          Keep cards
+          {claimLoading ? 'Claiming…' : confirmDone ? 'Keep cards' : 'Confirm cards first'}
         </button>
         <button
           onClick={handleSellback}
-          disabled={!sessionId}
-          className="px-5 py-3 rounded-xl border border-white/20 hover:border-sakura text-white disabled:opacity-50"
+          disabled={!sessionId || sellbackLoading || !confirmDone}
+          className="px-5 py-3 rounded-xl border border-white/20 hover:border-sakura text-white disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          Instant sell-back (90%)
+          {sellbackLoading ? 'Processing…' : confirmDone ? 'Instant sell-back (90%)' : 'Confirm cards first'}
+        </button>
+        <button
+          onClick={handleExpire}
+          disabled={!sessionId || !publicKey || (countdown !== null && countdown > 0) || expireLoading}
+          className="px-5 py-3 rounded-xl border border-white/20 text-white disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {expireLoading ? 'Expiring…' : 'Expire session'}
         </button>
       </div>
     </div>

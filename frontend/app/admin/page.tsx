@@ -1,12 +1,16 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { api } from '../../lib/api';
 
 export default function AdminPage() {
   const vaultAuthority = 'FKALjGXodzs1RhSGYKL72xnnQjB35nK9e6dtZ9fTLj3g';
   const [inventory, setInventory] = useState<Record<string, number>>({});
   const [sessions, setSessions] = useState<any[]>([]);
+  const [sessionsLoading, setSessionsLoading] = useState(false);
+  const [sessionPage, setSessionPage] = useState(1);
+  const [sessionPageSize] = useState(10);
+  const [sessionTotal, setSessionTotal] = useState(0);
   const [vaultAssets, setVaultAssets] = useState<string[]>([]);
   const [refreshing, setRefreshing] = useState(false);
   const [assets, setAssets] = useState<any[]>([]);
@@ -18,6 +22,31 @@ export default function AdminPage() {
   const [reserved, setReserved] = useState<any[]>([]);
   const [diagLoading, setDiagLoading] = useState(false);
   const [unreserving, setUnreserving] = useState(false);
+  const [forceCloseWallet, setForceCloseWallet] = useState('');
+  const [forceClosing, setForceClosing] = useState(false);
+
+  const fetchSessions = useCallback(
+    async (targetPage = 1) => {
+      try {
+        setSessionsLoading(true);
+        const res = await api.get('/admin/sessions', { params: { page: targetPage, page_size: sessionPageSize } });
+        if (Array.isArray(res.data)) {
+          setSessions(res.data);
+          setSessionTotal(res.data.length);
+          setSessionPage(1);
+        } else {
+          setSessions(res.data.items || []);
+          setSessionTotal(res.data.total || 0);
+          setSessionPage(res.data.page || targetPage);
+        }
+      } catch (err) {
+        console.error(err);
+      } finally {
+        setSessionsLoading(false);
+      }
+    },
+    [sessionPageSize],
+  );
 
   const loadDiagnostics = async () => {
     try {
@@ -37,14 +66,14 @@ export default function AdminPage() {
 
   useEffect(() => {
     api.get('/admin/inventory/rarity').then((res) => setInventory(res.data));
-    api.get('/admin/sessions').then((res) => setSessions(res.data));
+    fetchSessions(1);
     api.get('/admin/inventory/assets').then((res) => {
       setAssets(res.data);
       setVaultAssets(res.data.map((a: any) => a.asset_id));
     });
     api.get(`/profile/${vaultAuthority}`).then((res) => setGalleryAssets(res.data.assets || []));
     loadDiagnostics();
-  }, []);
+  }, [fetchSessions]);
 
   const handleRefresh = async () => {
     try {
@@ -56,8 +85,7 @@ export default function AdminPage() {
       setInventory(inv.data);
       const assetsRes = await api.get('/admin/inventory/assets');
       setAssets(assetsRes.data);
-      const sessionsRes = await api.get('/admin/sessions');
-      setSessions(sessionsRes.data);
+      await fetchSessions(sessionPage);
       await loadDiagnostics();
     } catch (e) {
       console.error(e);
@@ -77,7 +105,8 @@ export default function AdminPage() {
           ? `Cleared ${cleared} sessions${signature ? ` • sig ${signature}` : ''}`
           : 'No pending sessions to clear'
       );
-      await handleRefresh();
+      await fetchSessions(1);
+      await loadDiagnostics();
     } catch (e: any) {
       const detail = e?.response?.data?.detail || e?.message || 'Force expire failed';
       setAdminMessage(detail);
@@ -100,6 +129,29 @@ export default function AdminPage() {
     }
   };
 
+  const handleForceClose = async () => {
+    if (!forceCloseWallet) {
+      setAdminMessage('Enter a wallet address to force-close.');
+      return;
+    }
+    try {
+      setForceClosing(true);
+      setAdminMessage(null);
+      const res = await api.post('/admin/sessions/force_close', { wallet: forceCloseWallet });
+      const sig = res.data?.signature;
+      setAdminMessage(`Force-closed session for ${forceCloseWallet}${sig ? ` • sig ${sig}` : ''}`);
+      await fetchSessions(1);
+      await loadDiagnostics();
+    } catch (e: any) {
+      const detail = e?.response?.data?.detail || e?.message || 'Force-close failed';
+      setAdminMessage(detail);
+    } finally {
+      setForceClosing(false);
+    }
+  };
+
+  const totalPages = sessionPageSize ? Math.max(1, Math.ceil((sessionTotal || 0) / sessionPageSize)) : 1;
+
   return (
     <div className="space-y-6">
       <div>
@@ -116,7 +168,7 @@ export default function AdminPage() {
         </div>
         <div className="p-4 rounded-2xl bg-aurora/15 border border-white/10">
           <p className="text-xs uppercase text-white/60">Active sessions</p>
-          <p className="text-2xl font-semibold mt-1">{sessions.length || '—'}</p>
+          <p className="text-2xl font-semibold mt-1">{sessionTotal || '—'}</p>
           <p className="text-white/60 text-sm">Pending decisions</p>
         </div>
         <div className="p-4 rounded-2xl bg-sakura/15 border border-white/10">
@@ -149,6 +201,22 @@ export default function AdminPage() {
             disabled={refreshing}
           >
             {refreshing ? 'Refreshing…' : 'Refresh vault'}
+          </button>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <input
+            value={forceCloseWallet}
+            onChange={(e) => setForceCloseWallet(e.target.value)}
+            placeholder="Wallet to force-close session"
+            className="flex-1 rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-sm text-white placeholder:text-white/40"
+          />
+          <button
+            type="button"
+            onClick={handleForceClose}
+            className="px-4 py-2 rounded-xl bg-sakura/20 border border-sakura/50 text-sm"
+            disabled={forceClosing}
+          >
+            {forceClosing ? 'Force closing…' : 'Force close session'}
           </button>
         </div>
         <div className="grid md:grid-cols-2 gap-2 text-sm max-h-72 overflow-auto">
@@ -285,10 +353,12 @@ export default function AdminPage() {
         </div>
         {adminMessage && <p className="text-xs text-white/70 mb-2">{adminMessage}</p>}
         <div className="space-y-2 text-sm">
+          {sessionsLoading && <p className="text-white/60">Loading sessions…</p>}
           {sessions.map((s) => (
             <div key={s.session_id} className="p-3 rounded-xl bg-white/5 flex justify-between">
               <div>
                 <p className="font-semibold">{s.user}</p>
+                <p className="text-white/60 break-all text-xs">{s.session_id}</p>
                 <p className="text-white/60">Rarities: {s.rarities}</p>
               </div>
               <div className="text-right text-white/70">
@@ -297,7 +367,30 @@ export default function AdminPage() {
               </div>
             </div>
           ))}
-          {!sessions.length && <p className="text-white/60">No sessions.</p>}
+          {!sessionsLoading && !sessions.length && <p className="text-white/60">No sessions.</p>}
+        </div>
+        <div className="flex flex-wrap items-center justify-between text-xs text-white/70 mt-3 gap-2">
+          <span>
+            Page {sessionPage} / {totalPages} • {sessionTotal} total
+          </span>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => fetchSessions(Math.max(1, sessionPage - 1))}
+              className="px-3 py-1 rounded-lg border border-white/20 disabled:opacity-40 disabled:cursor-not-allowed"
+              disabled={sessionPage <= 1 || sessionsLoading}
+            >
+              ← Prev
+            </button>
+            <button
+              type="button"
+              onClick={() => fetchSessions(Math.min(totalPages, sessionPage + 1))}
+              className="px-3 py-1 rounded-lg border border-white/20 disabled:opacity-40 disabled:cursor-not-allowed"
+              disabled={sessionPage >= totalPages || sessionsLoading}
+            >
+              Next →
+            </button>
+          </div>
         </div>
       </div>
       <div className="card-blur rounded-2xl p-4 border border-white/5 space-y-3">

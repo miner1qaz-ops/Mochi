@@ -57,6 +57,8 @@ Program ID (devnet): `Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx`
   - Anyone; if expired PendingDecision, resets CardRecords, state=Expired.
 - `admin_force_expire()`
   - Admin-only; bypasses the one-hour wait and forcibly resets Reserved CardRecords + marks the PackSession Expired (used by the backend “force clear sessions” action).
+- `admin_force_close_session()`
+  - Admin-only; ignores PackSession state, frees all passed CardRecords back to `Available` with owner = vault_authority, zeroes the session, and closes the pack_session PDA to the admin signer. Pass the 11 CardRecord PDAs as remaining accounts.
 - `list_card(price_lamports, currency_mint)`
   - Moves card into vault escrow, creates Listing Active.
 - `cancel_listing()`
@@ -72,10 +74,10 @@ Program ID (devnet): `Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx`
 
 ## CPI hooks / TODOs
 - Metaplex Core CPI transfer/burn wired via TransferV1/BurnV1 with vault_authority seeds; remaining account order matters for pack flows.
-- USDC path uses SPL transfers with mint/account checks; SOL path uses system transfer.
+- USDC path uses SPL transfers with mint/account checks; SOL path uses system transfer. The program now pulls the SPL token accounts from the `remaining_accounts` slice (after the 11 card + 11 asset entries) so SOL purchases no longer need dummy token ATAs.
 
 ## Custody expectations
-- Pack open/claim/sellback: remaining accounts must be 22 accounts: first 11 = CardRecord PDAs, next 11 = Core asset accounts in matching slot order.
+- `open_pack_start` only needs the 11 CardRecord PDAs in its remaining accounts (plus optional SPL token accounts in the extras tail when `currency == Token`). `claim_pack` / `sellback_pack` still require the 22-entry layout: first 11 CardRecords, next 11 Core asset accounts in matching slot order; after that come the optional SPL token accounts for the Token currency path.
 - Marketplace instructions include `core_asset` + `mpl_core_program` and use vault_authority PDA as signer for custody moves.
 
 ## Sizes

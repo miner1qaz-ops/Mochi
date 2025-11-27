@@ -12,6 +12,7 @@ from solders.pubkey import Pubkey
 PROGRAM_ID = Pubkey.from_string("Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx")
 SYS_PROGRAM_ID = Pubkey.from_string("11111111111111111111111111111111")
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+MPL_CORE_PROGRAM_ID = Pubkey.from_string("CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d")
 
 
 CurrencyLayout = Enum("Sol" / CStruct(), "Token" / CStruct(), enum_name="Currency")
@@ -92,6 +93,18 @@ def encode_admin_force_expire() -> bytes:
     return sighash("admin_force_expire")
 
 
+def encode_admin_reset_session() -> bytes:
+    return sighash("admin_reset_session")
+
+
+def encode_admin_force_close_session() -> bytes:
+    return sighash("admin_force_close_session")
+
+
+def encode_user_reset_session() -> bytes:
+    return sighash("user_reset_session")
+
+
 def encode_list_card(price_lamports: int, currency_mint: Optional[str]) -> bytes:
     currency_bytes = None if not currency_mint else list(Pubkey.from_string(currency_mint).to_bytes())
     data = ListCardLayout.build({"price_lamports": price_lamports, "currency_mint": currency_bytes})
@@ -123,21 +136,23 @@ def build_open_pack_ix(
         AccountMeta(pubkey=user, is_signer=True, is_writable=True),
         AccountMeta(pubkey=vault_state, is_signer=False, is_writable=True),
         AccountMeta(pubkey=pack_session, is_signer=False, is_writable=True),
-        AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=True),
         AccountMeta(pubkey=vault_treasury, is_signer=False, is_writable=True),
     ]
+    accounts.extend(
+        [
+            AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
+            AccountMeta(pubkey=SYS_PROGRAM_ID, is_signer=False, is_writable=False),
+            AccountMeta(pubkey=MPL_CORE_PROGRAM_ID, is_signer=False, is_writable=False),
+        ]
+    )
+    # For open_pack_start, only the 11 CardRecords are needed in remaining accounts.
+    accounts.extend([AccountMeta(pubkey=cr, is_signer=False, is_writable=True) for cr in card_records])
     if currency.lower() == "usdc" or currency.lower() == "token":
         if not user_currency_token or not vault_currency_token:
             raise ValueError("Token currency requires token accounts")
         accounts.append(AccountMeta(pubkey=user_currency_token, is_signer=False, is_writable=True))
         accounts.append(AccountMeta(pubkey=vault_currency_token, is_signer=False, is_writable=True))
-    accounts.extend(
-        [
-            AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
-            AccountMeta(pubkey=SYS_PROGRAM_ID, is_signer=False, is_writable=False),
-        ]
-    )
-    accounts.extend([AccountMeta(pubkey=cr, is_signer=False, is_writable=True) for cr in card_records])
     data = encode_open_pack_start(currency, client_seed_hash, rarity_prices)
     return Instruction(program_id=PROGRAM_ID, data=data, accounts=accounts)
 
@@ -149,26 +164,26 @@ def build_claim_pack_ix(
     vault_authority: Pubkey,
     vault_treasury: Pubkey,
     card_records: List[Pubkey],
-    user_currency_token: Optional[Pubkey] = None,
-    vault_currency_token: Optional[Pubkey] = None,
+    core_assets: List[Pubkey],
 ) -> Instruction:
+    if len(card_records) != len(core_assets):
+        raise ValueError("card_records/core_assets length mismatch")
     accounts: List[AccountMeta] = [
         AccountMeta(pubkey=user, is_signer=True, is_writable=True),
         AccountMeta(pubkey=vault_state, is_signer=False, is_writable=True),
         AccountMeta(pubkey=pack_session, is_signer=False, is_writable=True),
-        AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=True),
         AccountMeta(pubkey=vault_treasury, is_signer=False, is_writable=True),
     ]
-    if user_currency_token and vault_currency_token:
-        accounts.append(AccountMeta(pubkey=user_currency_token, is_signer=False, is_writable=True))
-        accounts.append(AccountMeta(pubkey=vault_currency_token, is_signer=False, is_writable=True))
     accounts.extend(
         [
             AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
             AccountMeta(pubkey=SYS_PROGRAM_ID, is_signer=False, is_writable=False),
+            AccountMeta(pubkey=MPL_CORE_PROGRAM_ID, is_signer=False, is_writable=False),
         ]
     )
     accounts.extend([AccountMeta(pubkey=cr, is_signer=False, is_writable=True) for cr in card_records])
+    accounts.extend([AccountMeta(pubkey=asset, is_signer=False, is_writable=True) for asset in core_assets])
     return Instruction(program_id=PROGRAM_ID, data=encode_claim_pack(), accounts=accounts)
 
 
@@ -179,26 +194,31 @@ def build_sellback_pack_ix(
     vault_authority: Pubkey,
     vault_treasury: Pubkey,
     card_records: List[Pubkey],
+    core_assets: List[Pubkey],
     user_currency_token: Optional[Pubkey] = None,
     vault_currency_token: Optional[Pubkey] = None,
 ) -> Instruction:
+    if len(card_records) != len(core_assets):
+        raise ValueError("card_records/core_assets length mismatch")
     accounts: List[AccountMeta] = [
         AccountMeta(pubkey=user, is_signer=True, is_writable=True),
         AccountMeta(pubkey=vault_state, is_signer=False, is_writable=True),
         AccountMeta(pubkey=pack_session, is_signer=False, is_writable=True),
-        AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=True),
         AccountMeta(pubkey=vault_treasury, is_signer=False, is_writable=True),
     ]
-    if user_currency_token and vault_currency_token:
-        accounts.append(AccountMeta(pubkey=user_currency_token, is_signer=False, is_writable=True))
-        accounts.append(AccountMeta(pubkey=vault_currency_token, is_signer=False, is_writable=True))
     accounts.extend(
         [
             AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
             AccountMeta(pubkey=SYS_PROGRAM_ID, is_signer=False, is_writable=False),
+            AccountMeta(pubkey=MPL_CORE_PROGRAM_ID, is_signer=False, is_writable=False),
         ]
     )
     accounts.extend([AccountMeta(pubkey=cr, is_signer=False, is_writable=True) for cr in card_records])
+    accounts.extend([AccountMeta(pubkey=asset, is_signer=False, is_writable=True) for asset in core_assets])
+    if user_currency_token and vault_currency_token:
+        accounts.append(AccountMeta(pubkey=user_currency_token, is_signer=False, is_writable=True))
+        accounts.append(AccountMeta(pubkey=vault_currency_token, is_signer=False, is_writable=True))
     return Instruction(program_id=PROGRAM_ID, data=encode_sellback_pack(), accounts=accounts)
 
 
@@ -209,16 +229,25 @@ def build_expire_session_ix(
     vault_authority: Pubkey,
     vault_treasury: Pubkey,
     card_records: List[Pubkey],
+    core_assets: Optional[List[Pubkey]] = None,
 ) -> Instruction:
     accounts: List[AccountMeta] = [
         AccountMeta(pubkey=user, is_signer=True, is_writable=True),
         AccountMeta(pubkey=vault_state, is_signer=False, is_writable=True),
         AccountMeta(pubkey=pack_session, is_signer=False, is_writable=True),
-        AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=True),
         AccountMeta(pubkey=vault_treasury, is_signer=False, is_writable=True),
-        AccountMeta(pubkey=SYS_PROGRAM_ID, is_signer=False, is_writable=False),
     ]
-    accounts.extend([AccountMeta(pubkey=cr, is_signer=False, is_writable=True) for cr in card_records])
+    accounts.extend(
+        [
+            AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
+            AccountMeta(pubkey=SYS_PROGRAM_ID, is_signer=False, is_writable=False),
+            AccountMeta(pubkey=MPL_CORE_PROGRAM_ID, is_signer=False, is_writable=False),
+        ]
+    )
+    accounts.extend(
+        [AccountMeta(pubkey=cr, is_signer=False, is_writable=True) for cr in card_records]
+    )
     return Instruction(program_id=PROGRAM_ID, data=encode_expire_session(), accounts=accounts)
 
 
@@ -230,18 +259,87 @@ def build_admin_force_expire_ix(
     vault_authority: Pubkey,
     vault_treasury: Pubkey,
     card_records: List[Pubkey],
+    core_assets: Optional[List[Pubkey]] = None,
 ) -> Instruction:
     accounts: List[AccountMeta] = [
+        AccountMeta(pubkey=admin, is_signer=True, is_writable=True),
+        AccountMeta(pubkey=user, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=vault_state, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=pack_session, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=vault_treasury, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=SYS_PROGRAM_ID, is_signer=False, is_writable=False),
+    ]
+    accounts.extend(
+        [AccountMeta(pubkey=cr, is_signer=False, is_writable=True) for cr in card_records]
+    )
+    if core_assets:
+        accounts.extend(
+            [AccountMeta(pubkey=asset, is_signer=False, is_writable=True) for asset in core_assets]
+    )
+    return Instruction(program_id=PROGRAM_ID, data=encode_admin_force_expire(), accounts=accounts)
+
+
+def build_admin_reset_session_ix(
+    admin: Pubkey,
+    user: Pubkey,
+    vault_state: Pubkey,
+    pack_session: Pubkey,
+    vault_authority: Pubkey,
+    card_records: Optional[List[Pubkey]] = None,
+) -> Instruction:
+    accounts: List[AccountMeta] = [
+        AccountMeta(pubkey=admin, is_signer=True, is_writable=True),
+        AccountMeta(pubkey=user, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=vault_state, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=pack_session, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=True),
+    ]
+    if card_records:
+        accounts.extend(
+            [AccountMeta(pubkey=cr, is_signer=False, is_writable=True) for cr in card_records]
+        )
+    return Instruction(program_id=PROGRAM_ID, data=encode_admin_reset_session(), accounts=accounts)
+
+
+def build_admin_force_close_session_ix(
+    admin: Pubkey,
+    user: Pubkey,
+    vault_state: Pubkey,
+    pack_session: Pubkey,
+    vault_authority: Pubkey,
+    card_records: list[Pubkey],
+) -> Instruction:
+    accounts = [
         AccountMeta(pubkey=admin, is_signer=True, is_writable=True),
         AccountMeta(pubkey=user, is_signer=False, is_writable=False),
         AccountMeta(pubkey=vault_state, is_signer=False, is_writable=True),
         AccountMeta(pubkey=pack_session, is_signer=False, is_writable=True),
-        AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=False),
-        AccountMeta(pubkey=vault_treasury, is_signer=False, is_writable=True),
-        AccountMeta(pubkey=SYS_PROGRAM_ID, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=True),
     ]
-    accounts.extend([AccountMeta(pubkey=cr, is_signer=False, is_writable=True) for cr in card_records])
-    return Instruction(program_id=PROGRAM_ID, data=encode_admin_force_expire(), accounts=accounts)
+    for cr in card_records:
+        accounts.append(AccountMeta(pubkey=cr, is_signer=False, is_writable=True))
+    return Instruction(program_id=PROGRAM_ID, data=encode_admin_force_close_session(), accounts=accounts)
+
+
+def build_user_reset_session_ix(
+    user: Pubkey,
+    vault_state: Pubkey,
+    pack_session: Pubkey,
+    vault_authority: Pubkey,
+    card_records: Optional[List[Pubkey]] = None,
+) -> Instruction:
+    accounts: List[AccountMeta] = [
+        AccountMeta(pubkey=user, is_signer=True, is_writable=True),
+        AccountMeta(pubkey=vault_state, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=pack_session, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=True),
+    ]
+    if card_records:
+        accounts.extend(
+            [AccountMeta(pubkey=cr, is_signer=False, is_writable=True) for cr in card_records]
+        )
+    return Instruction(program_id=PROGRAM_ID, data=encode_user_reset_session(), accounts=accounts)
 
 
 def build_list_card_ix(
