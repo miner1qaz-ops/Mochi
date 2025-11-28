@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useParams } from 'next/navigation';
 import { useConnection, useWallet } from '@solana/wallet-adapter-react';
 import { PublicKey } from '@solana/web3.js';
-import { api, fetchVirtualCards, VirtualCard } from '../../../lib/api';
+import { api, fetchVirtualCards, listCard, VirtualCard } from '../../../lib/api';
 import { deriveAta } from '../../../lib/ata';
 import { buildV0Tx } from '../../../lib/tx';
 
@@ -18,6 +18,8 @@ export default function ProfilePage() {
   const [recycleLoading, setRecycleLoading] = useState(false);
   const [sortKey, setSortKey] = useState<'rarity' | 'name'>('rarity');
   const [filterVirtual, setFilterVirtual] = useState<'all' | 'nft' | 'virtual'>('all');
+  const [searchTerm, setSearchTerm] = useState('');
+  const [priceInputs, setPriceInputs] = useState<Record<string, number>>({});
   const { publicKey, signTransaction } = useWallet();
   const { connection } = useConnection();
   const mochiMint = useMemo(
@@ -62,11 +64,12 @@ export default function ProfilePage() {
   }, [assets, sortKey, rarityOrder]);
 
   const filteredAssets = useMemo(() => {
-    if (filterVirtual === 'all') return sortedAssets;
-    if (filterVirtual === 'nft') return sortedAssets;
-    // NFTs only; virtual cards are in separate panel
-    return sortedAssets;
-  }, [sortedAssets, filterVirtual]);
+    return sortedAssets.filter((asset) => {
+      const name = (asset.content?.metadata?.name || '').toLowerCase();
+      const matchesSearch = searchTerm ? name.includes(searchTerm.toLowerCase()) : true;
+      return matchesSearch;
+    });
+  }, [sortedAssets, searchTerm]);
 
   const totalVirtual = virtualCards.reduce((sum, v) => sum + v.count, 0);
 
@@ -128,19 +131,21 @@ export default function ProfilePage() {
           </select>
         </div>
         <div className="flex items-center gap-2">
-          <span>Filter:</span>
-          <select
-            value={filterVirtual}
-            onChange={(e) => setFilterVirtual(e.target.value as any)}
-            className="bg-black/40 border border-white/10 rounded-lg px-2 py-1"
-          >
-            <option value="all">All NFTs</option>
-            <option value="nft">NFTs</option>
-          </select>
+          <span>Search:</span>
+          <input
+            value={searchTerm}
+            onChange={(e) => setSearchTerm(e.target.value)}
+            className="bg-black/40 border border-white/10 rounded-lg px-2 py-1 text-white"
+            placeholder="Pokémon name"
+          />
         </div>
         <div className="flex items-center gap-2">
           <span>Total virtual:</span>
           <span className="font-semibold text-white">{totalVirtual}</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <span>Total NFTs:</span>
+          <span className="font-semibold text-white">{filteredAssets.length}</span>
         </div>
       </div>
 
@@ -163,6 +168,49 @@ export default function ProfilePage() {
               <div className="space-y-1 text-sm">
                 <p className="font-semibold">{name}</p>
                 <p className="text-xs text-white/60 break-all">{asset.id}</p>
+                {publicKey?.toBase58() === address && (
+                  <div className="flex items-center gap-2 mt-2">
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.01"
+                      value={priceInputs[asset.id] ?? ''}
+                      onChange={(e) =>
+                        setPriceInputs((prev) => ({
+                          ...prev,
+                          [asset.id]: parseFloat(e.target.value || '0'),
+                        }))
+                      }
+                      className="w-24 px-2 py-1 rounded-lg bg-white/10 border border-white/10 text-xs"
+                      placeholder="Price SOL"
+                    />
+                    <button
+                      type="button"
+                      className="px-2 py-1 rounded-lg bg-aurora text-ink text-xs font-semibold"
+                      onClick={async () => {
+                        const price = priceInputs[asset.id];
+                        if (!price || price <= 0) return;
+                        const lamports = Math.floor(price * 1_000_000_000);
+                        try {
+                          const { data } = await api.post('/marketplace/list/build', {
+                            core_asset: asset.id,
+                            wallet: address,
+                            price_lamports: lamports,
+                          });
+                          const tx = buildV0Tx(new PublicKey(address), data.recent_blockhash, data.instructions);
+                          const signed = signTransaction ? await signTransaction(tx) : tx;
+                          const sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
+                          setRecycleStatus(`Listed ${name} at ${price} SOL. Tx: ${sig}`);
+                        } catch (err) {
+                          console.error('list error', err);
+                          setRecycleStatus('Listing failed. Ensure you own the NFT and try again.');
+                        }
+                      }}
+                    >
+                      List
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
           );

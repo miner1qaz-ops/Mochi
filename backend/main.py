@@ -1310,8 +1310,9 @@ def confirm_open_v2(req: ConfirmOpenRequest, db: Session = Depends(get_session))
     info = parse_pack_session_v2_account(bytes(resp.value.data))
     if not info:
         raise HTTPException(status_code=400, detail="Unable to parse on-chain session")
-    if info.get("state") != "pending":
-        raise HTTPException(status_code=400, detail=f"Unexpected on-chain session state {info.get('state')}")
+    on_state = info.get("state")
+    if on_state not in ["pending", "accepted"]:
+        raise HTTPException(status_code=400, detail=f"Unexpected on-chain session state {on_state}")
 
     session_id = str(pack_session)
     mirror = db.get(SessionMirror, session_id)
@@ -1364,8 +1365,10 @@ def confirm_open_v2(req: ConfirmOpenRequest, db: Session = Depends(get_session))
     db.add(mirror)
     db.commit()
 
-    mutate_virtual_cards(wallet, low_tier_virtual_items(rarities, template_ids), db, direction=1)
-    return {"state": "pending", "assets": rare_assets}
+    # Add low-tier virtuals on open; guard against double-add by checking mirror state
+    if not mirror or mirror.state != "pending":
+        mutate_virtual_cards(wallet, low_tier_virtual_items(rarities, template_ids), db, direction=1)
+    return {"state": on_state, "assets": rare_assets}
 
 
 @app.post("/program/claim/confirm")
