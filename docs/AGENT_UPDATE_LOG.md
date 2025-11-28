@@ -220,3 +220,9 @@ Next steps:
 ## 2025-11-28T12:36:00+08:00 – Codex
 - Frontend: Buy flow now only calls `/program/open/confirm` after `sendTransaction` succeeds; if the send throws or returns no signature, it surfaces the error and clears local session state (no confirm call).
 - Rebuilt frontend (`npm run build`) and restarted `mochi-frontend.service`.
+
+## 2025-11-29TXX:XX:00+08:00 – Codex
+- Program: added `claim_pack_batch3` (exactly 3 cards) and tightened `claim_pack_batch` to 1–2 cards per ix to avoid heap OOM. Redeployed `mochi_v2_vault` (same ID) with deploy sig `4YnkpmsvkNPLzDgVeYBnpvFiRLqNxGnScAiMH82SX2WMHh4J9UNA23gG7Axift8iWi8V1XQTtuBd947SpycbT1is`.
+- Backend: disabled old single-shot claim; added `/program/claim/batch_flow` (per-card tx list + finalize) and `/program/claim/test3` (single 3-card test tx). Restarted `mochi-backend`.
+- Frontend gacha: “Keep cards” now uses `batch_flow` sequential txs; added “Test claim 3 NFTs” button calling `/api/program/claim/test3`. Rebuilt frontend and restarted `mochi-frontend`.
+- State hygiene: force-closed sessions; reset all CardRecords in current vault to Available. One corrupted CardRecord in an old vault_state remains but is ignored by current flows.

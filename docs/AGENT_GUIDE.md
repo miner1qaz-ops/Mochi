@@ -56,6 +56,7 @@ This is a clean rebuild of the Mochi real‑world‑asset Pokémon card platform
 - Asset pipeline: `cd ../nft_pipeline && npm run fetch:tcgdex && npm run generate && npm run upload -- --target local`
 - Mint + deposit Core assets: `CORE_TEMPLATE_OFFSET=0 CORE_TEMPLATE_LIMIT=40 TS_NODE_TRANSPILE_ONLY=1 npx ts-node -P tsconfig.scripts.json scripts/mint_and_deposit.ts`
 - Refresh backend inventory mirror: `curl -X POST http://127.0.0.1:8000/admin/inventory/refresh`
+- Claim flow (dev): use `/program/claim/batch_flow` (per-card txs + finalize) or `/program/claim/test3` for a 3-card benchmark; single-shot claim is disabled. Always send the returned txs sequentially and finalize afterward.
 
 ## Contact points
 - Admin address: set via env `ADMIN_ADDRESS` / `NEXT_PUBLIC_ADMIN_ADDRESS`.

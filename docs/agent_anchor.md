@@ -50,7 +50,13 @@ Program ID (devnet): `Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx`
 - `open_pack_start(currency, client_seed_hash, rarity_prices)`
   - Collects payment, reserves 11 CardRecords (remaining accounts), writes PackSession.
 - `claim_pack()`
-  - Requires PendingDecision + not expired; marks cards UserOwned and session Accepted.
+  - Legacy single-shot claim (not used in prod); marks all cards UserOwned and session Accepted.
+- `claim_pack_batch()`
+  - Batch claim for 1–2 cards (to avoid heap OOM); transfers Core assets to user, marks cards UserOwned; session stays PendingDecision.
+- `claim_pack_batch3()`
+  - Benchmark/test instruction that claims exactly 3 cards in one tx (minimal logging).
+- `finalize_claim()`
+  - After all cards are UserOwned, sets session Accepted (used after multiple batch claims).
 - `sellback_pack()`
   - PendingDecision + not expired; pays out buyback, resets CardRecords, session Rejected.
 - `expire_session()`
