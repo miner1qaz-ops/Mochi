@@ -13,6 +13,10 @@ This is a clean rebuild of the Mochi real‑world‑asset Pokémon card platform
   1) Frontend calls `/program/open/preview` with client seed to show rarities.
   2) `/program/open/build` selects specific assets (DB/Helius), builds `open_pack_start` tx.
   3) User signs; decision window = 1 hour. `claim_pack` or `sellback_pack` txs are built by backend.
+- **Pack opening v2 (Rare+ only on-chain):**
+  - New `pack_session_v2` PDA holds only Rare+ CardRecord bindings (max 3); Common/Uncommon/Energy stay off-chain in the DB.
+  - `open_pack` (v2) reserves Rare+ CardRecords, `claim_pack_v2`/`sellback_pack_v2` resolve, `expire_session_v2` frees after the window, and `admin_force_close_v2` clears stuck sessions.
+  - SessionMirror now keeps `template_ids` and `version=2` for hybrid inventory; VirtualCard table tracks low-tier counts; recycle endpoint mints Mochi tokens from recycled low-tier cards.
 - **Marketplace:** Listings stored on-chain via `Listing` PDA; backend provides tx builders; frontend renders grid & actions.
 - **Profiles:** Read holdings via Helius DAS filtered by Core collection; enrich with CSV template metadata.
 - **Admin:** Inventory by rarity, session mirrors, cleanup/settle helpers.

@@ -1,11 +1,12 @@
 use anchor_lang::prelude::*;
-use anchor_lang::solana_program::{program::invoke, system_instruction};
+use anchor_lang::solana_program::{program::invoke, program::invoke_signed, system_instruction};
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 use mpl_core::instructions::{BurnV1CpiBuilder, TransferV1CpiBuilder};
 
 declare_id!("Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx");
 
 const PACK_CARD_COUNT: usize = 11;
+const MAX_RARE_CARDS: usize = 3;
 
 #[program]
 mod mochi_v2_vault {
@@ -51,6 +52,347 @@ mod mochi_v2_vault {
 
         // NOTE: Real implementation should CPI-transfer Metaplex Core asset into the vault_authority PDA escrow.
         // Placeholder until Core CPI wiring is finalized.
+        Ok(())
+    }
+
+    /// New lightweight open: only Rare+ CardRecords are reserved on-chain (max 3).
+    /// remaining_accounts: [rare_card_records...]
+    pub fn open_pack(
+        ctx: Context<OpenPackV2>,
+        currency: Currency,
+        client_seed_hash: [u8; 32],
+        rare_templates: Vec<u32>,
+    ) -> Result<()> {
+        let vault_state = &ctx.accounts.vault_state;
+        let now = Clock::get()?.unix_timestamp;
+
+        let rare_count = rare_templates.len();
+        require!(rare_count <= MAX_RARE_CARDS, MochiError::TooManyRareCards);
+        require!(
+            ctx.remaining_accounts.len() >= rare_count,
+            MochiError::InvalidCardCount
+        );
+
+        // Fail fast if an active session already exists.
+        let session = &mut ctx.accounts.pack_session;
+        if session.state == PackState::PendingDecision && now <= session.expires_at {
+            return err!(MochiError::SessionExists);
+        }
+
+        // Process payment first.
+        let paid_amount = match currency {
+            Currency::Sol => {
+                let price = vault_state.pack_price_sol;
+                require!(price > 0, MochiError::InvalidPrice);
+                invoke(
+                    &system_instruction::transfer(
+                        &ctx.accounts.user.key(),
+                        &ctx.accounts.vault_treasury.key(),
+                        price,
+                    ),
+                    &[
+                        ctx.accounts.user.to_account_info(),
+                        ctx.accounts.vault_treasury.to_account_info(),
+                        ctx.accounts.system_program.to_account_info(),
+                    ],
+                )?;
+                price
+            }
+            Currency::Token => {
+                let price = vault_state.pack_price_usdc;
+                require!(price > 0, MochiError::InvalidPrice);
+                require!(
+                    ctx.remaining_accounts.len() >= rare_count + 2,
+                    MochiError::MissingTokenAccount
+                );
+                let token_accounts = &ctx.remaining_accounts[rare_count..];
+                let user_token: Account<TokenAccount> = Account::try_from(&token_accounts[0])?;
+                let vault_token: Account<TokenAccount> = Account::try_from(&token_accounts[1])?;
+                if let Some(mint) = vault_state.usdc_mint {
+                    require_keys_eq!(user_token.mint, mint, MochiError::MintMismatch);
+                    require_keys_eq!(vault_token.mint, mint, MochiError::MintMismatch);
+                }
+                let cpi_accounts = Transfer {
+                    from: user_token.to_account_info(),
+                    to: vault_token.to_account_info(),
+                    authority: ctx.accounts.user.to_account_info(),
+                };
+                let cpi_ctx =
+                    CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
+                token::transfer(cpi_ctx, price)?;
+                price
+            }
+        };
+
+        // Reserve Rare+ CardRecords only.
+        let mut rare_keys: Vec<Pubkey> = Vec::with_capacity(rare_count);
+        for (idx, acc_info) in ctx.remaining_accounts.iter().take(rare_count).enumerate() {
+            let mut card_record: Account<CardRecord> = Account::try_from(acc_info)?;
+            require_keys_eq!(
+                card_record.vault_state,
+                vault_state.key(),
+                MochiError::VaultMismatch
+            );
+            require!(
+                card_record.status == CardStatus::Available,
+                MochiError::CardNotAvailable
+            );
+            require!(
+                is_rare_or_above(&card_record.rarity),
+                MochiError::CardTooCommon
+            );
+            require!(
+                card_record.template_id == rare_templates[idx],
+                MochiError::TemplateMismatch
+            );
+            card_record.status = CardStatus::Reserved;
+            card_record.owner = ctx.accounts.user.key();
+            rare_keys.push(acc_info.key());
+            persist_card_record(&card_record, acc_info)?;
+        }
+
+        // Write session state
+        session.user = ctx.accounts.user.key();
+        session.currency = currency;
+        session.paid_amount = paid_amount;
+        session.created_at = now;
+        session.expires_at = now + vault_state.claim_window_seconds;
+        session.state = PackState::PendingDecision;
+        session.client_seed_hash = client_seed_hash;
+        session.rare_card_keys = rare_keys;
+        session.rare_templates = rare_templates;
+        session.total_slots = PACK_CARD_COUNT as u8;
+        session.bump = ctx.bumps.get("pack_session").copied().unwrap_or_default();
+        Ok(())
+    }
+
+    /// Tx2 Keep path – transfers only the Rare+ assets listed in the PackSessionV2.
+    /// remaining_accounts: [rare_card_records...][core_assets...]
+    pub fn claim_pack_v2<'info>(
+        ctx: Context<'_, '_, 'info, 'info, ResolvePackV2<'info>>,
+    ) -> Result<()> {
+        let session = &mut ctx.accounts.pack_session;
+        let now = Clock::get()?.unix_timestamp;
+        require!(
+            session.state == PackState::PendingDecision,
+            MochiError::InvalidSessionState
+        );
+        require!(now <= session.expires_at, MochiError::SessionExpired);
+
+        let rare_count = session.rare_card_keys.len();
+        let (card_accounts, asset_accounts, _) =
+            split_rare_accounts(&ctx.remaining_accounts, rare_count)?;
+        require!(
+            asset_accounts.len() == rare_count,
+            MochiError::InvalidCardCount
+        );
+
+        for i in 0..rare_count {
+            let acc_info: &AccountInfo<'info> = &card_accounts[i];
+            require_keys_eq!(
+                acc_info.key(),
+                session.rare_card_keys[i],
+                MochiError::CardKeyMismatch
+            );
+            let mut card_record: Account<CardRecord> = Account::try_from(acc_info)?;
+            require!(
+                card_record.status == CardStatus::Reserved,
+                MochiError::CardNotReserved
+            );
+            require_keys_eq!(
+                card_record.owner,
+                ctx.accounts.user.key(),
+                MochiError::Unauthorized
+            );
+            let asset_info: &AccountInfo<'info> = &asset_accounts[i];
+            transfer_core_asset(
+                asset_info,
+                &ctx.accounts.vault_authority,
+                &ctx.accounts.vault_authority,
+                &ctx.accounts.user.to_account_info(),
+                &ctx.accounts.vault_state.key(),
+                ctx.accounts.vault_state.vault_authority_bump,
+                &ctx.accounts.system_program.to_account_info(),
+                &ctx.accounts.mpl_core_program.to_account_info(),
+            )?;
+            card_record.status = CardStatus::UserOwned;
+            card_record.owner = ctx.accounts.user.key();
+            persist_card_record(&card_record, acc_info)?;
+        }
+
+        session.state = PackState::Accepted;
+        Ok(())
+    }
+
+    /// Tx2 Sellback path – frees Rare+ reservations and pays the refund.
+    /// remaining_accounts: [rare_card_records...][core_assets...][optional token accounts]
+    pub fn sellback_pack_v2<'info>(
+        ctx: Context<'_, '_, 'info, 'info, ResolvePackV2<'info>>,
+    ) -> Result<()> {
+        let session = &mut ctx.accounts.pack_session;
+        let vault_state = &ctx.accounts.vault_state;
+        let now = Clock::get()?.unix_timestamp;
+        require!(
+            session.state == PackState::PendingDecision,
+            MochiError::InvalidSessionState
+        );
+        require!(now <= session.expires_at, MochiError::SessionExpired);
+
+        let payout = session
+            .paid_amount
+            .checked_mul(vault_state.buyback_bps as u64)
+            .and_then(|v| v.checked_div(10_000))
+            .ok_or(MochiError::MathOverflow)?;
+
+        let rare_count = session.rare_card_keys.len();
+        let (card_accounts, _asset_accounts, extras) =
+            split_rare_accounts(&ctx.remaining_accounts, rare_count)?;
+
+        // Pay refund
+        match session.currency {
+            Currency::Sol => {
+                let vault_key = vault_state.key();
+                let seeds = &[
+                    b"vault_authority",
+                    vault_key.as_ref(),
+                    &[vault_state.vault_authority_bump],
+                ];
+                let signer = &[&seeds[..]];
+                invoke_signed(
+                    &system_instruction::transfer(
+                        &ctx.accounts.vault_authority.key(),
+                        &ctx.accounts.user.key(),
+                        payout,
+                    ),
+                    &[
+                        ctx.accounts.vault_authority.to_account_info(),
+                        ctx.accounts.user.to_account_info(),
+                        ctx.accounts.system_program.to_account_info(),
+                    ],
+                    signer,
+                )?;
+            }
+            Currency::Token => {
+                require!(extras.len() >= 2, MochiError::MissingTokenAccount);
+                let user_token: Account<TokenAccount> = Account::try_from(&extras[0])?;
+                let vault_token: Account<TokenAccount> = Account::try_from(&extras[1])?;
+                if let Some(mint) = vault_state.usdc_mint {
+                    require_keys_eq!(user_token.mint, mint, MochiError::MintMismatch);
+                    require_keys_eq!(vault_token.mint, mint, MochiError::MintMismatch);
+                }
+                let vault_key = vault_state.key();
+                let seeds = &[
+                    b"vault_authority",
+                    vault_key.as_ref(),
+                    &[vault_state.vault_authority_bump],
+                ];
+                let signer = &[&seeds[..]];
+                let cpi_accounts = Transfer {
+                    from: vault_token.to_account_info(),
+                    to: user_token.to_account_info(),
+                    authority: ctx.accounts.vault_authority.to_account_info(),
+                };
+                let cpi_ctx = CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    cpi_accounts,
+                    signer,
+                );
+                token::transfer(cpi_ctx, payout)?;
+            }
+        }
+
+        for (idx, acc_info) in card_accounts.iter().enumerate() {
+            require_keys_eq!(
+                acc_info.key(),
+                session.rare_card_keys[idx],
+                MochiError::CardKeyMismatch
+            );
+            let mut card_record: Account<CardRecord> = Account::try_from(acc_info)?;
+            require!(
+                card_record.status == CardStatus::Reserved,
+                MochiError::CardNotReserved
+            );
+            require_keys_eq!(
+                card_record.owner,
+                ctx.accounts.user.key(),
+                MochiError::Unauthorized
+            );
+            card_record.status = CardStatus::Available;
+            card_record.owner = ctx.accounts.vault_authority.key();
+            persist_card_record(&card_record, acc_info)?;
+        }
+
+        session.state = PackState::Rejected;
+        Ok(())
+    }
+
+    /// Post-window cleanup – frees Rare+ reservations without payout.
+    pub fn expire_session_v2<'info>(
+        ctx: Context<'_, '_, 'info, 'info, ResolvePackV2<'info>>,
+    ) -> Result<()> {
+        let session = &mut ctx.accounts.pack_session;
+        let now = Clock::get()?.unix_timestamp;
+        require!(
+            session.state == PackState::PendingDecision,
+            MochiError::InvalidSessionState
+        );
+        require!(now > session.expires_at, MochiError::SessionNotExpired);
+
+        let rare_count = session.rare_card_keys.len();
+        let (card_accounts, _assets, _) =
+            split_rare_accounts(&ctx.remaining_accounts, rare_count)?;
+        for (idx, acc_info) in card_accounts.iter().enumerate() {
+            require_keys_eq!(
+                acc_info.key(),
+                session.rare_card_keys[idx],
+                MochiError::CardKeyMismatch
+            );
+            let mut card_record: Account<CardRecord> = Account::try_from(acc_info)?;
+            require!(
+                card_record.status == CardStatus::Reserved,
+                MochiError::CardNotReserved
+            );
+            card_record.status = CardStatus::Available;
+            card_record.owner = ctx.accounts.vault_authority.key();
+            persist_card_record(&card_record, acc_info)?;
+        }
+
+        session.state = PackState::Expired;
+        Ok(())
+    }
+
+    /// Admin-only hard reset for V2 sessions; frees any passed Rare+ CardRecords.
+    pub fn admin_force_close_v2<'info>(
+        ctx: Context<'_, '_, 'info, 'info, AdminForceCloseV2<'info>>,
+    ) -> Result<()> {
+        require_keys_eq!(
+            ctx.accounts.admin.key(),
+            ctx.accounts.vault_state.admin,
+            MochiError::Unauthorized
+        );
+        let session = &mut ctx.accounts.pack_session;
+        let rare_count = session.rare_card_keys.len();
+        let (card_accounts, _, _) =
+            split_rare_accounts(&ctx.remaining_accounts, rare_count)?;
+        for acc_info in card_accounts.iter() {
+            if let Ok(mut card_record) = Account::<CardRecord>::try_from(acc_info) {
+                if card_record.vault_state == ctx.accounts.vault_state.key() {
+                    card_record.status = CardStatus::Available;
+                    card_record.owner = ctx.accounts.vault_authority.key();
+                    persist_card_record(&card_record, acc_info)?;
+                }
+            }
+        }
+
+        // Zero session but keep account alive for the user; they can reuse it on next open.
+        session.state = PackState::Uninitialized;
+        session.paid_amount = 0;
+        session.created_at = 0;
+        session.expires_at = 0;
+        session.currency = Currency::Sol;
+        session.rare_card_keys.clear();
+        session.rare_templates.clear();
+        session.total_slots = PACK_CARD_COUNT as u8;
         Ok(())
     }
 
@@ -799,6 +1141,66 @@ mod mochi_v2_vault {
 }
 
 #[derive(Accounts)]
+pub struct OpenPackV2 <'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    #[account(mut, seeds = [b"vault_state"], bump)]
+    pub vault_state: Account<'info, VaultState>,
+    #[account(
+        init_if_needed,
+        payer = user,
+        seeds = [b"pack_session_v2", vault_state.key().as_ref(), user.key().as_ref()],
+        bump,
+        space = 8 + PackSessionV2::SIZE,
+    )]
+    pub pack_session: Account<'info, PackSessionV2>,
+    /// CHECK: Vault authority PDA (validated by seeds)
+    #[account(mut, seeds = [b"vault_authority", vault_state.key().as_ref()], bump = vault_state.vault_authority_bump)]
+    pub vault_authority: UncheckedAccount<'info>,
+    /// Treasury to receive SOL fees (typically same as vault_authority PDA)
+    #[account(mut)]
+    pub vault_treasury: SystemAccount<'info>,
+    pub token_program: Program<'info, Token>,
+    /// CHECK: System program
+    pub system_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ResolvePackV2<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    #[account(mut, seeds = [b"vault_state"], bump)]
+    pub vault_state: Account<'info, VaultState>,
+    #[account(mut, seeds = [b"pack_session_v2", vault_state.key().as_ref(), user.key().as_ref()], bump)]
+    pub pack_session: Account<'info, PackSessionV2>,
+    /// CHECK: Vault authority PDA (validated by seeds)
+    #[account(mut, seeds = [b"vault_authority", vault_state.key().as_ref()], bump = vault_state.vault_authority_bump)]
+    pub vault_authority: UncheckedAccount<'info>,
+    #[account(mut)]
+    pub vault_treasury: SystemAccount<'info>,
+    pub token_program: Program<'info, Token>,
+    /// CHECK: System program
+    pub system_program: UncheckedAccount<'info>,
+    /// CHECK: mpl-core program
+    pub mpl_core_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct AdminForceCloseV2<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    /// CHECK: target user wallet (for PDA derivation)
+    pub user: UncheckedAccount<'info>,
+    #[account(mut, seeds = [b"vault_state"], bump)]
+    pub vault_state: Account<'info, VaultState>,
+    #[account(mut, seeds = [b"pack_session_v2", vault_state.key().as_ref(), user.key().as_ref()], bump)]
+    pub pack_session: Account<'info, PackSessionV2>,
+    /// CHECK: Vault authority PDA (validated by seeds)
+    #[account(mut, seeds = [b"vault_authority", vault_state.key().as_ref()], bump = vault_state.vault_authority_bump)]
+    pub vault_authority: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
 pub struct InitializeVault<'info> {
     #[account(mut)]
     pub admin: Signer<'info>,
@@ -1144,6 +1546,35 @@ impl CardRecord {
 }
 
 #[account]
+pub struct PackSessionV2 {
+    pub user: Pubkey,
+    pub currency: Currency,
+    pub paid_amount: u64,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub rare_card_keys: Vec<Pubkey>,
+    pub rare_templates: Vec<u32>,
+    pub state: PackState,
+    pub client_seed_hash: [u8; 32],
+    pub total_slots: u8,
+    pub bump: u8,
+}
+impl PackSessionV2 {
+    pub const SIZE: usize =
+        32 // user
+        + 1 // currency enum
+        + 8 // paid_amount
+        + 8 // created_at
+        + 8 // expires_at
+        + 4 + (32 * MAX_RARE_CARDS) // rare_card_keys vec
+        + 4 + (4 * MAX_RARE_CARDS) // rare_templates vec
+        + 1 // state enum
+        + 32 // client_seed_hash
+        + 1 // total_slots
+        + 1; // bump
+}
+
+#[account]
 pub struct PackSession {
     pub user: Pubkey,
     pub currency: Currency,
@@ -1256,6 +1687,51 @@ pub enum MochiError {
     MintMismatch,
     #[msg("Core CPI error")]
     CoreCpiError,
+    #[msg("Too many Rare+ cards provided")]
+    TooManyRareCards,
+    #[msg("Card rarity must be Rare or above")]
+    CardTooCommon,
+    #[msg("Card template mismatch")]
+    TemplateMismatch,
+    #[msg("Card key mismatch")]
+    CardKeyMismatch,
+}
+
+fn persist_card_record(card_record: &CardRecord, acc_info: &AccountInfo) -> Result<()> {
+    let mut data = acc_info.try_borrow_mut_data()?;
+    let mut cursor = std::io::Cursor::new(&mut data[..]);
+    card_record.try_serialize(&mut cursor)?;
+    Ok(())
+}
+
+fn is_rare_or_above(rarity: &Rarity) -> bool {
+    matches!(
+        rarity,
+        Rarity::Rare
+            | Rarity::DoubleRare
+            | Rarity::UltraRare
+            | Rarity::IllustrationRare
+            | Rarity::SpecialIllustrationRare
+            | Rarity::MegaHyperRare
+    )
+}
+
+fn split_rare_accounts<'info>(
+    accounts: &'info [AccountInfo<'info>],
+    rare_count: usize,
+) -> Result<(
+    &'info [AccountInfo<'info>],
+    &'info [AccountInfo<'info>],
+    &'info [AccountInfo<'info>],
+)> {
+    require!(accounts.len() >= rare_count, MochiError::InvalidCardCount);
+    let (card_slice, rest) = accounts.split_at(rare_count);
+    if rest.len() >= rare_count {
+        let (asset_slice, extras) = rest.split_at(rare_count);
+        Ok((card_slice, asset_slice, extras))
+    } else {
+        Ok((card_slice, &[], rest))
+    }
 }
 
 fn partition_pack_accounts<'info>(

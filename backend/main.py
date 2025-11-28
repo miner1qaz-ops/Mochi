@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -15,7 +16,7 @@ from pydantic_settings import BaseSettings
 import re
 from solders.pubkey import Pubkey
 from solders.signature import Signature
-from solders.instruction import Instruction
+from solders.instruction import Instruction, AccountMeta
 from solders.keypair import Keypair as SoldersKeypair
 from solders.hash import Hash
 from solders.message import MessageV0
@@ -28,19 +29,28 @@ from sqlmodel import Field, Session, SQLModel, create_engine, select, func
 from tx_builder import (
     build_admin_force_expire_ix,
     build_admin_force_close_session_ix,
+    build_admin_force_close_v2_ix,
     build_admin_reset_session_ix,
     build_user_reset_session_ix,
     build_expire_session_ix,
+    build_expire_session_v2_ix,
     build_claim_pack_ix,
+    build_claim_pack_v2_ix,
     build_fill_listing_ix,
     build_list_card_ix,
     build_open_pack_ix,
+    build_open_pack_v2_ix,
     build_sellback_pack_ix,
+    build_sellback_pack_v2_ix,
+    build_expire_session_v2_ix,
+    build_admin_force_close_v2_ix,
     card_record_pda,
     instruction_to_dict,
     listing_pda,
     message_from_instructions,
     pack_session_pda,
+    pack_session_v2_pda,
+    TOKEN_PROGRAM_ID,
     to_pubkey,
     vault_authority_pda,
     vault_state_pda,
@@ -58,6 +68,10 @@ class Settings(BaseSettings):
     treasury_wallet: Optional[str] = None
     core_collection_address: Optional[str] = None
     usdc_mint: Optional[str] = None
+    mochi_token_mint: Optional[str] = None
+    mochi_token_decimals: int = 9
+    recycle_rate: int = 10
+    claim_window_seconds: int = 3600
     server_seed: str = os.environ.get("SERVER_SEED", "dev-server-seed")
     database_url: str = "sqlite:///./mochi.db"
 
@@ -106,6 +120,25 @@ class SessionMirror(SQLModel, table=True):
     state: str = Field(default="pending")
     created_at: float = Field(default_factory=lambda: time.time())
     expires_at: float
+    template_ids: str = Field(default="")
+    version: int = Field(default=1)
+
+
+class VirtualCard(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    wallet: str
+    template_id: int
+    rarity: str
+    count: int = Field(default=0)
+    updated_at: float = Field(default_factory=lambda: time.time())
+
+
+class RecycleLog(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    wallet: str
+    total_cards: int
+    reward_amount: int
+    created_at: float = Field(default_factory=lambda: time.time())
 
 
 def init_db():
@@ -131,6 +164,14 @@ RARITY_LABELS = [
     "MegaHyperRare",
     "Energy",
 ]
+RARE_PLUS = {
+    "Rare",
+    "DoubleRare",
+    "UltraRare",
+    "IllustrationRare",
+    "SpecialIllustrationRare",
+    "MegaHyperRare",
+}
 PACK_STATE_LABELS = [
     "uninitialized",
     "pending",
@@ -196,6 +237,7 @@ class PackSlot(BaseModel):
     slot_index: int
     rarity: str
     template_id: Optional[int]
+    is_nft: bool = False
 
 
 class PackPreviewResponse(BaseModel):
@@ -228,6 +270,21 @@ class PackBuildResponse(BaseModel):
 class SessionActionRequest(BaseModel):
     session_id: str
     wallet: str
+    user_token_account: Optional[str] = None
+    vault_token_account: Optional[str] = None
+
+
+class PackBuildV2Request(BaseModel):
+    client_seed: str
+    wallet: str
+    currency: str = "SOL"
+    user_token_account: Optional[str] = None
+    vault_token_account: Optional[str] = None
+
+
+class SessionActionV2Request(BaseModel):
+    wallet: str
+    session_id: Optional[str] = None
     user_token_account: Optional[str] = None
     vault_token_account: Optional[str] = None
 
@@ -351,6 +408,24 @@ class ConfirmClaimRequest(BaseModel):
     action: str = "claim"
 
 
+class RecycleItem(BaseModel):
+    template_id: int
+    rarity: str
+    count: int = 1
+
+
+class RecycleBuildRequest(BaseModel):
+    wallet: str
+    items: List[RecycleItem]
+    user_token_account: str
+
+
+class VirtualCardView(BaseModel):
+    template_id: int
+    rarity: str
+    count: int
+
+
 def hash_seed(seed: str) -> str:
     return hashlib.sha256(seed.encode()).hexdigest()
 
@@ -454,6 +529,17 @@ def normalized_rarity(value: str) -> str:
     return value.replace(" ", "").replace("_", "").lower()
 
 
+def rarity_is_rare_plus(value: str) -> bool:
+    return normalized_rarity(value).capitalize() in {v.capitalize() for v in RARE_PLUS}
+
+
+def rarity_is_low_tier(value: str) -> bool:
+    lower = value.lower()
+    if lower in ["common", "uncommon", "energy"]:
+        return True
+    return not rarity_is_rare_plus(value)
+
+
 def pick_template_ids(rng: random.Random, rarities: List[str], db: Session) -> List[Optional[int]]:
     result: List[Optional[int]] = []
     for rarity in rarities:
@@ -477,6 +563,41 @@ def pick_template_ids(rng: random.Random, rarities: List[str], db: Session) -> L
         chosen = rng.choice(templates)
         result.append(chosen.template_id)
     return result
+
+
+def mutate_virtual_cards(wallet: str, items: List[tuple[int, str]], db: Session, direction: int):
+    """
+    direction = +1 to add, -1 to remove
+    """
+    now = time.time()
+    for template_id, rarity in items:
+        if template_id is None:
+            continue
+        stmt = select(VirtualCard).where(
+            VirtualCard.wallet == wallet,
+            VirtualCard.template_id == template_id,
+        )
+        row = db.exec(stmt).first()
+        if not row:
+            if direction < 0:
+                continue
+            row = VirtualCard(wallet=wallet, template_id=template_id, rarity=rarity, count=0)
+        row.count = max(0, row.count + direction)
+        row.rarity = rarity
+        row.updated_at = now
+        db.add(row)
+    db.commit()
+
+
+def low_tier_virtual_items(rarities: List[str], template_ids: List[Optional[int]]) -> List[tuple[int, str]]:
+    items: List[tuple[int, str]] = []
+    for rarity, tmpl in zip(rarities, template_ids):
+        if tmpl is None:
+            continue
+        if rarity_is_rare_plus(rarity):
+            continue
+        items.append((tmpl, rarity))
+    return items
 
 
 def choose_assets_for_templates(
@@ -504,6 +625,31 @@ def choose_assets_for_templates(
     if reserve:
         db.commit()
     return asset_ids
+
+
+def choose_rare_assets_only(
+    template_ids: List[Optional[int]],
+    rarities: List[str],
+    wallet: str,
+    db: Session,
+):
+    rare_indices: List[int] = []
+    rare_templates: List[int] = []
+    rare_assets: List[str] = []
+    for idx, rarity in enumerate(rarities):
+        if not rarity_is_rare_plus(rarity):
+            continue
+        rare_indices.append(idx)
+        tmpl = template_ids[idx]
+        if tmpl is None:
+            raise HTTPException(status_code=400, detail=f"Missing template for rare slot {idx}")
+        stmt = select(MintRecord).where(MintRecord.template_id == tmpl, MintRecord.status == "available")
+        record = db.exec(stmt).first()
+        if not record:
+            raise HTTPException(status_code=400, detail=f"No available asset for template {tmpl} (rare slot {idx})")
+        rare_templates.append(tmpl)
+        rare_assets.append(record.asset_id)
+    return rare_indices, rare_templates, rare_assets
 
 
 def parse_asset_ids(csv_assets: str) -> List[str]:
@@ -565,6 +711,97 @@ def parse_pack_session_account(data: bytes) -> Optional[dict]:
         "client_seed_hash": client_seed_hash,
         "rarity_prices": rarity_prices,
     }
+
+
+def parse_pack_session_v2_account(data: bytes) -> Optional[dict]:
+    if len(data) < 8:
+        return None
+    offset = 8
+    min_len = offset + 32 + 1 + 8 + 8 + 8 + 4
+    if len(data) < min_len:
+        return None
+    user = Pubkey.from_bytes(data[offset : offset + 32])
+    offset += 32
+    currency_idx = data[offset]
+    offset += 1
+    paid_amount = int.from_bytes(data[offset : offset + 8], "little")
+    offset += 8
+    created_at = int.from_bytes(data[offset : offset + 8], "little", signed=True)
+    offset += 8
+    expires_at = int.from_bytes(data[offset : offset + 8], "little", signed=True)
+    offset += 8
+    # rare_card_keys vec
+    if len(data) < offset + 4:
+        return None
+    rare_len = int.from_bytes(data[offset : offset + 4], "little")
+    offset += 4
+    rare_cards: List[Pubkey] = []
+    for _ in range(rare_len):
+        if len(data) < offset + 32:
+            break
+        rare_cards.append(Pubkey.from_bytes(data[offset : offset + 32]))
+        offset += 32
+    # rare_templates vec
+    if len(data) < offset + 4:
+        return None
+    tmpl_len = int.from_bytes(data[offset : offset + 4], "little")
+    offset += 4
+    rare_templates: List[int] = []
+    for _ in range(tmpl_len):
+        if len(data) < offset + 4:
+            break
+        rare_templates.append(int.from_bytes(data[offset : offset + 4], "little"))
+        offset += 4
+    if len(data) < offset + 1 + 32 + 1:
+        return None
+    state_idx = data[offset]
+    offset += 1
+    client_seed_hash = data[offset : offset + 32]
+    offset += 32
+    total_slots = data[offset] if offset < len(data) else 11
+    currency = "SOL" if currency_idx == 0 else "Token"
+    state = PACK_STATE_LABELS[state_idx] if 0 <= state_idx < len(PACK_STATE_LABELS) else str(state_idx)
+    return {
+        "user": user,
+        "currency": currency,
+        "paid_amount": paid_amount,
+        "created_at": created_at,
+        "expires_at": expires_at,
+        "rare_cards": rare_cards,
+        "rare_templates": rare_templates,
+        "state": state,
+        "client_seed_hash": client_seed_hash,
+        "total_slots": total_slots,
+    }
+
+
+def templates_to_csv(templates: List[Optional[int]]) -> str:
+    return ",".join("" if t is None else str(t) for t in templates)
+
+
+def parse_templates(csv_templates: str) -> List[Optional[int]]:
+    if not csv_templates:
+        return []
+    out: List[Optional[int]] = []
+    for token in csv_templates.split(","):
+        if token == "":
+            out.append(None)
+            continue
+        try:
+            out.append(int(token))
+        except ValueError:
+            out.append(None)
+    return out
+
+
+def build_mint_to_ix(mint: Pubkey, destination: Pubkey, authority: Pubkey, amount: int) -> Instruction:
+    data = bytes([7]) + amount.to_bytes(8, "little")
+    metas = [
+        AccountMeta(pubkey=mint, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=destination, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=authority, is_signer=True, is_writable=False),
+    ]
+    return Instruction(program_id=TOKEN_PROGRAM_ID, data=data, accounts=metas)
 
 
 def parse_card_record_account(data: bytes) -> Optional[dict]:
@@ -819,6 +1056,106 @@ def build_pack(req: PackBuildRequest, db: Session = Depends(get_session)):
         recent_blockhash=blockhash,
         session_id=session_id,
         lineup=slots,
+        provably_fair=provably_fair,
+        instructions=instrs_meta,
+    )
+
+
+@app.post("/program/v2/open/build", response_model=PackBuildResponse)
+def build_pack_v2(req: PackBuildV2Request, db: Session = Depends(get_session)):
+    is_sol = req.currency.upper() == "SOL"
+    if not is_sol:
+        if not (req.user_token_account and req.vault_token_account):
+            raise HTTPException(status_code=400, detail="Token currency requires token accounts")
+    vault_state = vault_state_pda()
+    pack_session = pack_session_v2_pda(vault_state, to_pubkey(req.wallet))
+    if pda_exists(pack_session):
+        resp = sol_client.get_account_info(pack_session)
+        info = parse_pack_session_v2_account(bytes(resp.value.data)) if resp.value and resp.value.data else None
+        if info and info.get("state") == "pending":
+            raise HTTPException(
+                status_code=400,
+                detail="A v2 pack session already exists. Claim, sell back, or expire it before opening another.",
+            )
+
+    nonce = compute_nonce(req.client_seed)
+    rng = build_rng(auth_settings.server_seed, req.client_seed)
+    rarities = slot_rarities(rng)
+    template_ids = pick_template_ids(rng, rarities, db)
+    rare_indices, rare_templates, rare_assets = choose_rare_assets_only(template_ids, rarities, req.wallet, db)
+    rare_card_records = [card_record_pda(vault_state, to_pubkey(asset)) for asset in rare_assets]
+    for cr in rare_card_records:
+        if not pda_exists(cr):
+            raise HTTPException(status_code=400, detail=f"CardRecord PDA missing on-chain: {cr}")
+
+    client_seed_hash = hashlib.sha256(req.client_seed.encode()).digest()
+    currency = "Sol" if is_sol else "Token"
+    user_token_account = to_pubkey(req.user_token_account) if req.user_token_account else None
+    vault_token_account = to_pubkey(req.vault_token_account) if req.vault_token_account else None
+    open_ix = build_open_pack_v2_ix(
+        user=to_pubkey(req.wallet),
+        vault_state=vault_state,
+        pack_session=pack_session,
+        vault_authority=vault_authority_pda(vault_state),
+        vault_treasury=treasury_pubkey(),
+        rare_card_records=rare_card_records,
+        currency=currency,
+        client_seed_hash=client_seed_hash,
+        rare_templates=rare_templates,
+        user_currency_token=user_token_account,
+        vault_currency_token=vault_token_account,
+    )
+    compute_ix = set_compute_unit_limit(units=350_000)
+    instructions = [compute_ix, open_ix]
+    blockhash = get_latest_blockhash()
+    tx_b64 = message_from_instructions(instructions, to_pubkey(req.wallet), blockhash)
+    tx_v0_b64 = versioned_tx_b64(to_pubkey(req.wallet), blockhash, instructions)
+    instrs_meta = [wrap_instruction_meta(instruction_to_dict(ix_)) for ix_ in instructions]
+
+    lineup: List[PackSlot] = []
+    rare_set = set(rare_indices)
+    for idx, rarity in enumerate(rarities):
+        lineup.append(
+            PackSlot(
+                slot_index=idx,
+                rarity=rarity,
+                template_id=template_ids[idx],
+                is_nft=idx in rare_set,
+            )
+        )
+
+    provably_fair = {
+        "server_seed_hash": SERVER_SEED_HASH,
+        "server_nonce": nonce,
+        "client_seed": req.client_seed,
+        "templates": templates_to_csv(template_ids),
+        "rarities": ",".join(rarities),
+        "entropy_proof": entropy_hex(req.client_seed, nonce),
+    }
+    session_id = str(pack_session)
+    expires_at = time.time() + auth_settings.claim_window_seconds if hasattr(auth_settings, "claim_window_seconds") else time.time() + 3600
+    mirror = SessionMirror(
+        session_id=session_id,
+        user=req.wallet,
+        rarities=",".join(rarities),
+        asset_ids=",".join(rare_assets),
+        server_seed_hash=SERVER_SEED_HASH,
+        server_nonce=nonce,
+        state="building",
+        created_at=time.time(),
+        expires_at=expires_at,
+        template_ids=templates_to_csv(template_ids),
+        version=2,
+    )
+    db.add(mirror)
+    db.commit()
+
+    return PackBuildResponse(
+        tx_b64=tx_b64,
+        tx_v0_b64=tx_v0_b64,
+        recent_blockhash=blockhash,
+        session_id=session_id,
+        lineup=lineup,
         provably_fair=provably_fair,
         instructions=instrs_meta,
     )
@@ -1108,6 +1445,62 @@ def claim_pack_batch(req: BatchClaimRequest, db: Session = Depends(get_session))
     )
 
 
+@app.post("/program/v2/claim/build", response_model=TxResponse)
+def claim_pack_v2(req: SessionActionV2Request, db: Session = Depends(get_session)):
+    vault_state = vault_state_pda()
+    vault_authority = vault_authority_pda(vault_state)
+    pack_session = pack_session_v2_pda(vault_state, to_pubkey(req.wallet))
+    treasury = treasury_pubkey()
+
+    resp = sol_client.get_account_info(pack_session)
+    if resp.value is None or resp.value.data is None:
+        raise HTTPException(status_code=404, detail="Session not found on-chain")
+    session_info = parse_pack_session_v2_account(bytes(resp.value.data))
+    if not session_info:
+        raise HTTPException(status_code=400, detail="Unable to parse on-chain session")
+    if session_info.get("state") != "pending":
+        raise HTTPException(status_code=400, detail=f"Session in state {session_info.get('state')}")
+    if time.time() > session_info.get("expires_at", 0):
+        raise HTTPException(status_code=400, detail="Session expired")
+
+    rare_cards = session_info.get("rare_cards", [])
+    core_assets: List[Pubkey] = []
+    for cr in rare_cards:
+        cr_resp = sol_client.get_account_info(cr)
+        if cr_resp.value is None or cr_resp.value.data is None:
+            raise HTTPException(status_code=400, detail=f"CardRecord PDA missing on-chain: {cr}")
+        record_info = parse_card_record_account(bytes(cr_resp.value.data))
+        if not record_info:
+            raise HTTPException(status_code=400, detail=f"Could not parse CardRecord: {cr}")
+        if record_info["status"] != 1 or str(record_info["owner"]) != req.wallet:
+            raise HTTPException(status_code=400, detail="Cards are not reserved; please reset and reopen the pack.")
+        core_assets.append(record_info["core_asset"])
+
+    ix = build_claim_pack_v2_ix(
+        user=to_pubkey(req.wallet),
+        vault_state=vault_state,
+        pack_session=pack_session,
+        vault_authority=vault_authority,
+        vault_treasury=treasury,
+        card_records=rare_cards,
+        core_assets=core_assets,
+    )
+    compute_ix = set_compute_unit_limit(units=350_000)
+    instructions = [compute_ix, ix]
+    blockhash = get_latest_blockhash()
+    payer = to_pubkey(req.wallet)
+    tx_b64 = message_from_instructions(instructions, payer, blockhash)
+    tx_v0_b64 = versioned_tx_b64(payer, blockhash, instructions)
+    instrs_meta = [wrap_instruction_meta(instruction_to_dict(ix_)) for ix_ in instructions]
+
+    return TxResponse(
+        tx_b64=tx_b64,
+        tx_v0_b64=tx_v0_b64,
+        recent_blockhash=blockhash,
+        instructions=instrs_meta,
+    )
+
+
 @app.post("/program/claim/finalize", response_model=TxResponse)
 def finalize_claim(wallet: str, db: Session = Depends(get_session)):
     vault_state = vault_state_pda()
@@ -1306,6 +1699,63 @@ def confirm_open(req: ConfirmOpenRequest, db: Session = Depends(get_session)):
     return {"state": "pending", "assets": assets}
 
 
+@app.post("/program/v2/open/confirm")
+def confirm_open_v2(req: ConfirmOpenRequest, db: Session = Depends(get_session)):
+    signature = req.signature
+    wallet = req.wallet
+    if not wait_for_confirmation(signature):
+        raise HTTPException(status_code=400, detail="Signature not confirmed or transaction failed")
+
+    vault_state = vault_state_pda()
+    pack_session = pack_session_v2_pda(vault_state, to_pubkey(wallet))
+    resp = sol_client.get_account_info(pack_session)
+    if resp.value is None or resp.value.data is None:
+        raise HTTPException(status_code=400, detail="Pack session v2 not found on-chain after confirmation")
+    info = parse_pack_session_v2_account(bytes(resp.value.data))
+    if not info or info.get("state") != "pending":
+        raise HTTPException(status_code=400, detail=f"Unexpected on-chain session state {info.get('state') if info else 'unknown'}")
+
+    session_id = str(pack_session)
+    mirror = db.get(SessionMirror, session_id)
+    if not mirror:
+        raise HTTPException(status_code=400, detail="Missing local lineup for session; please rebuild and retry")
+    rarities = mirror.rarities.split(",")
+    template_ids = parse_templates(mirror.template_ids)
+
+    rare_cards = info.get("rare_cards", [])
+    rare_assets: List[str] = []
+    now = time.time()
+    for cr in rare_cards:
+        cr_resp = sol_client.get_account_info(cr)
+        if cr_resp.value is None or cr_resp.value.data is None:
+            raise HTTPException(status_code=400, detail=f"CardRecord missing on-chain: {cr}")
+        record_info = parse_card_record_account(bytes(cr_resp.value.data))
+        if not record_info:
+            raise HTTPException(status_code=400, detail=f"Could not parse CardRecord: {cr}")
+        if record_info["status"] != 1 or str(record_info["owner"]) != wallet:
+            raise HTTPException(status_code=400, detail="Cards are not reserved; please reset and reopen the pack.")
+        asset_id = str(record_info["core_asset"])
+        rare_assets.append(asset_id)
+        rec = db.get(MintRecord, asset_id)
+        if rec:
+            rec.status = "reserved"
+            rec.owner = wallet
+            rec.updated_at = now
+            db.add(rec)
+
+    mirror.state = "pending"
+    mirror.asset_ids = ",".join(rare_assets)
+    mirror.expires_at = float(info.get("expires_at", mirror.expires_at))
+    mirror.server_nonce = info.get("client_seed_hash", b"").hex()
+    mirror.version = 2
+    db.add(mirror)
+    db.commit()
+
+    # Add low-tier virtual cards to the user's inventory.
+    mutate_virtual_cards(wallet, low_tier_virtual_items(rarities, template_ids), db, direction=1)
+    return {"state": "pending", "assets": rare_assets}
+
+
 @app.post("/program/claim/confirm")
 def confirm_claim(req: ConfirmClaimRequest, db: Session = Depends(get_session)):
     signature = req.signature
@@ -1319,6 +1769,51 @@ def confirm_claim(req: ConfirmClaimRequest, db: Session = Depends(get_session)):
     return {"state": state, "assets": res.get("assets")}
 
 
+@app.post("/program/v2/claim/confirm")
+def confirm_claim_v2(req: ConfirmClaimRequest, db: Session = Depends(get_session)):
+    signature = req.signature
+    wallet = req.wallet
+    if not wait_for_confirmation(signature):
+        raise HTTPException(status_code=400, detail="Signature not confirmed")
+
+    vault_state = vault_state_pda()
+    pack_session = pack_session_v2_pda(vault_state, to_pubkey(wallet))
+    resp = sol_client.get_account_info(pack_session)
+    if resp.value is None or resp.value.data is None:
+        raise HTTPException(status_code=404, detail="Session not found on-chain")
+    info = parse_pack_session_v2_account(bytes(resp.value.data))
+    if not info:
+        raise HTTPException(status_code=400, detail="Unable to parse on-chain session")
+    state = info.get("state")
+    if state != "accepted":
+        raise HTTPException(status_code=400, detail=f"On-chain session state is {state}, expected accepted")
+
+    rare_cards = info.get("rare_cards", [])
+    assets: list[str] = []
+    now = time.time()
+    for cr in rare_cards:
+        cr_resp = sol_client.get_account_info(cr)
+        if cr_resp.value and cr_resp.value.data:
+            record_info = parse_card_record_account(bytes(cr_resp.value.data))
+            if record_info:
+                asset_id = str(record_info["core_asset"])
+                assets.append(asset_id)
+                rec = db.get(MintRecord, asset_id)
+                if rec:
+                    rec.status = "user_owned"
+                    rec.owner = wallet
+                    rec.updated_at = now
+                    db.add(rec)
+    mirror = db.get(SessionMirror, str(pack_session))
+    if mirror:
+        mirror.state = "accepted"
+        mirror.expires_at = float(info.get("expires_at", mirror.expires_at))
+        mirror.version = 2
+        db.add(mirror)
+    db.commit()
+    return {"state": state, "assets": assets}
+
+
 @app.post("/program/sellback/confirm")
 def confirm_sellback(signature: str, wallet: str, db: Session = Depends(get_session)):
     if not wait_for_confirmation(signature):
@@ -1328,6 +1823,103 @@ def confirm_sellback(signature: str, wallet: str, db: Session = Depends(get_sess
     if state != "rejected":
         raise HTTPException(status_code=400, detail=f"On-chain session state is {state}, expected rejected")
     return {"state": state, "assets": res.get("assets")}
+
+
+@app.post("/program/v2/sellback/confirm")
+def confirm_sellback_v2(signature: str, wallet: str, db: Session = Depends(get_session)):
+    if not wait_for_confirmation(signature):
+        raise HTTPException(status_code=400, detail="Signature not confirmed")
+
+    vault_state = vault_state_pda()
+    pack_session = pack_session_v2_pda(vault_state, to_pubkey(wallet))
+    resp = sol_client.get_account_info(pack_session)
+    if resp.value is None or resp.value.data is None:
+        raise HTTPException(status_code=404, detail="Session not found on-chain")
+    info = parse_pack_session_v2_account(bytes(resp.value.data))
+    if not info:
+        raise HTTPException(status_code=400, detail="Unable to parse on-chain session")
+    state = info.get("state")
+    if state != "rejected":
+        raise HTTPException(status_code=400, detail=f"On-chain session state is {state}, expected rejected")
+
+    session_id = str(pack_session)
+    mirror = db.get(SessionMirror, session_id)
+    rarities = mirror.rarities.split(",") if mirror else []
+    template_ids = parse_templates(mirror.template_ids) if mirror else []
+
+    now = time.time()
+    assets: list[str] = []
+    for cr in info.get("rare_cards", []):
+        cr_resp = sol_client.get_account_info(cr)
+        if cr_resp.value and cr_resp.value.data:
+            record_info = parse_card_record_account(bytes(cr_resp.value.data))
+            if record_info:
+                asset_id = str(record_info["core_asset"])
+                assets.append(asset_id)
+                rec = db.get(MintRecord, asset_id)
+                if rec:
+                    rec.status = "available"
+                    rec.owner = str(vault_authority_pda(vault_state))
+                    rec.updated_at = now
+                    db.add(rec)
+    if mirror:
+        mirror.state = "rejected"
+        mirror.expires_at = float(info.get("expires_at", mirror.expires_at))
+        mirror.version = 2
+        db.add(mirror)
+    db.commit()
+    # Remove the low-tier virtual cards that were added on open.
+    if rarities and template_ids:
+        mutate_virtual_cards(wallet, low_tier_virtual_items(rarities, template_ids), db, direction=-1)
+    return {"state": state, "assets": assets}
+
+
+@app.post("/program/v2/expire/confirm")
+def confirm_expire_v2(signature: str, wallet: str, db: Session = Depends(get_session)):
+    if not wait_for_confirmation(signature):
+        raise HTTPException(status_code=400, detail="Signature not confirmed")
+
+    vault_state = vault_state_pda()
+    pack_session = pack_session_v2_pda(vault_state, to_pubkey(wallet))
+    resp = sol_client.get_account_info(pack_session)
+    if resp.value is None or resp.value.data is None:
+        raise HTTPException(status_code=404, detail="Session not found on-chain")
+    info = parse_pack_session_v2_account(bytes(resp.value.data))
+    if not info:
+        raise HTTPException(status_code=400, detail="Unable to parse on-chain session")
+    state = info.get("state")
+    if state != "expired":
+        raise HTTPException(status_code=400, detail=f"On-chain session state is {state}, expected expired")
+
+    session_id = str(pack_session)
+    mirror = db.get(SessionMirror, session_id)
+    rarities = mirror.rarities.split(",") if mirror else []
+    template_ids = parse_templates(mirror.template_ids) if mirror else []
+
+    now = time.time()
+    assets: list[str] = []
+    for cr in info.get("rare_cards", []):
+        cr_resp = sol_client.get_account_info(cr)
+        if cr_resp.value and cr_resp.value.data:
+            record_info = parse_card_record_account(bytes(cr_resp.value.data))
+            if record_info:
+                asset_id = str(record_info["core_asset"])
+                assets.append(asset_id)
+                rec = db.get(MintRecord, asset_id)
+                if rec:
+                    rec.status = "available"
+                    rec.owner = str(vault_authority_pda(vault_state))
+                    rec.updated_at = now
+                    db.add(rec)
+    if mirror:
+        mirror.state = "expired"
+        mirror.expires_at = float(info.get("expires_at", mirror.expires_at))
+        mirror.version = 2
+        db.add(mirror)
+    db.commit()
+    if rarities and template_ids:
+        mutate_virtual_cards(wallet, low_tier_virtual_items(rarities, template_ids), db, direction=-1)
+    return {"state": state, "assets": assets}
 
 
 @app.post("/program/open/reset_build", response_model=TxResponse)
@@ -1398,6 +1990,41 @@ def expire_pack(req: SessionActionRequest, db: Session = Depends(get_session)):
     return TxResponse(tx_b64=tx_b64, tx_v0_b64=tx_v0_b64, recent_blockhash=blockhash, instructions=[instr])
 
 
+@app.post("/program/v2/expire/build", response_model=TxResponse)
+def expire_pack_v2(req: SessionActionV2Request, db: Session = Depends(get_session)):
+    vault_state = vault_state_pda()
+    vault_authority = vault_authority_pda(vault_state)
+    pack_session = pack_session_v2_pda(vault_state, to_pubkey(req.wallet))
+    treasury = treasury_pubkey()
+
+    resp = sol_client.get_account_info(pack_session)
+    if resp.value is None or resp.value.data is None:
+        raise HTTPException(status_code=404, detail="Session not found on-chain")
+    session_info = parse_pack_session_v2_account(bytes(resp.value.data))
+    if not session_info:
+        raise HTTPException(status_code=400, detail="Unable to parse on-chain session")
+    if session_info.get("state") != "pending":
+        raise HTTPException(status_code=400, detail=f"Session in state {session_info.get('state')}")
+    if time.time() <= session_info.get("expires_at", 0):
+        raise HTTPException(status_code=400, detail="Session not yet expired")
+
+    rare_cards = session_info.get("rare_cards", [])
+    ix = build_expire_session_v2_ix(
+        user=to_pubkey(req.wallet),
+        vault_state=vault_state,
+        pack_session=pack_session,
+        vault_authority=vault_authority,
+        vault_treasury=treasury,
+        card_records=rare_cards,
+    )
+    blockhash = get_latest_blockhash()
+    payer = to_pubkey(req.wallet)
+    tx_b64 = message_from_instructions([ix], payer, blockhash)
+    tx_v0_b64 = versioned_tx_b64(payer, blockhash, [ix])
+    instr = wrap_instruction_meta(instruction_to_dict(ix))
+    return TxResponse(tx_b64=tx_b64, tx_v0_b64=tx_v0_b64, recent_blockhash=blockhash, instructions=[instr])
+
+
 @app.post("/program/sellback/build", response_model=TxResponse)
 def sellback_pack(req: SessionActionRequest, db: Session = Depends(get_session)):
     stmt = select(SessionMirror).where(SessionMirror.session_id == req.session_id)
@@ -1444,10 +2071,130 @@ def sellback_pack(req: SessionActionRequest, db: Session = Depends(get_session))
     return TxResponse(tx_b64=tx_b64, tx_v0_b64=tx_v0_b64, recent_blockhash=blockhash, instructions=[instr])
 
 
+@app.post("/program/v2/sellback/build", response_model=TxResponse)
+def sellback_pack_v2(req: SessionActionV2Request, db: Session = Depends(get_session)):
+    vault_state = vault_state_pda()
+    vault_authority = vault_authority_pda(vault_state)
+    pack_session = pack_session_v2_pda(vault_state, to_pubkey(req.wallet))
+    treasury = treasury_pubkey()
+
+    resp = sol_client.get_account_info(pack_session)
+    if resp.value is None or resp.value.data is None:
+        raise HTTPException(status_code=404, detail="Session not found on-chain")
+    session_info = parse_pack_session_v2_account(bytes(resp.value.data))
+    if not session_info:
+        raise HTTPException(status_code=400, detail="Unable to parse on-chain session")
+    if session_info.get("state") != "pending":
+        raise HTTPException(status_code=400, detail=f"Session in state {session_info.get('state')}")
+    if time.time() > session_info.get("expires_at", 0):
+        raise HTTPException(status_code=400, detail="Session expired")
+
+    rare_cards = session_info.get("rare_cards", [])
+    core_assets: List[Pubkey] = []
+    for cr in rare_cards:
+        cr_resp = sol_client.get_account_info(cr)
+        if cr_resp.value is None or cr_resp.value.data is None:
+            raise HTTPException(status_code=400, detail=f"CardRecord PDA missing on-chain: {cr}")
+        record_info = parse_card_record_account(bytes(cr_resp.value.data))
+        if not record_info:
+            raise HTTPException(status_code=400, detail=f"Could not parse CardRecord: {cr}")
+        core_assets.append(record_info["core_asset"])
+
+    ix = build_sellback_pack_v2_ix(
+        user=to_pubkey(req.wallet),
+        vault_state=vault_state,
+        pack_session=pack_session,
+        vault_authority=vault_authority,
+        vault_treasury=treasury,
+        card_records=rare_cards,
+        core_assets=core_assets,
+        user_currency_token=to_pubkey(req.user_token_account) if req.user_token_account else None,
+        vault_currency_token=to_pubkey(req.vault_token_account) if req.vault_token_account else None,
+    )
+    blockhash = get_latest_blockhash()
+    payer = to_pubkey(req.wallet)
+    tx_b64 = message_from_instructions([ix], payer, blockhash)
+    tx_v0_b64 = versioned_tx_b64(payer, blockhash, [ix])
+    instr = wrap_instruction_meta(instruction_to_dict(ix))
+
+    return TxResponse(tx_b64=tx_b64, tx_v0_b64=tx_v0_b64, recent_blockhash=blockhash, instructions=[instr])
+
+
 @app.get("/profile/{wallet}")
 def profile(wallet: str):
     assets = helius_get_assets(wallet, auth_settings.core_collection_address)
     return {"wallet": wallet, "assets": assets}
+
+
+@app.get("/profile/{wallet}/virtual", response_model=List[VirtualCardView])
+def profile_virtual(wallet: str, db: Session = Depends(get_session)):
+    stmt = select(VirtualCard).where(VirtualCard.wallet == wallet)
+    rows = db.exec(stmt).all()
+    result: List[VirtualCardView] = []
+    for row in rows:
+        result.append(
+            VirtualCardView(
+                template_id=row.template_id,
+                rarity=row.rarity,
+                count=row.count,
+            )
+        )
+    return result
+
+
+@app.post("/profile/recycle/build", response_model=TxResponse)
+def recycle_build(req: RecycleBuildRequest, db: Session = Depends(get_session)):
+    if not req.items:
+        raise HTTPException(status_code=400, detail="No items provided for recycle")
+    mint_str = auth_settings.mochi_token_mint
+    if not mint_str:
+        raise HTTPException(status_code=500, detail="MOCHI_TOKEN_MINT not configured")
+    # Validate inventory
+    balance: Dict[int, int] = {}
+    stmt = select(VirtualCard).where(VirtualCard.wallet == req.wallet)
+    for row in db.exec(stmt).all():
+        balance[row.template_id] = row.count
+    total_cards = 0
+    for item in req.items:
+        have = balance.get(item.template_id, 0)
+        if have < item.count:
+            raise HTTPException(status_code=400, detail=f"Not enough virtual cards for template {item.template_id}")
+        total_cards += item.count
+    if total_cards < auth_settings.recycle_rate:
+        raise HTTPException(status_code=400, detail=f"Need at least {auth_settings.recycle_rate} cards to recycle")
+
+    reward_tokens = total_cards // auth_settings.recycle_rate
+    if reward_tokens <= 0:
+        raise HTTPException(status_code=400, detail="Recycle did not produce any rewards")
+    reward_amount = reward_tokens * (10 ** auth_settings.mochi_token_decimals)
+
+    admin_kp = load_admin_keypair()
+    admin_pub = admin_kp.pubkey()
+    mint_pub = to_pubkey(mint_str)
+    dest_token = to_pubkey(req.user_token_account)
+    mint_ix = build_mint_to_ix(mint_pub, dest_token, admin_pub, reward_amount)
+    blockhash = get_latest_blockhash()
+    message = MessageV0.try_compile(admin_pub, [mint_ix], [], Hash.from_string(blockhash))
+    tx = VersionedTransaction(message, [admin_kp])
+    tx_b64 = base64.b64encode(bytes(tx)).decode()
+    tx_v0_b64 = tx_b64  # already versioned message
+    instr = wrap_instruction_meta(instruction_to_dict(mint_ix))
+
+    # Deduct recycled cards and log
+    expanded: List[tuple[int, str]] = []
+    for item in req.items:
+        for _ in range(item.count):
+            expanded.append((item.template_id, item.rarity))
+    mutate_virtual_cards(req.wallet, expanded, db, direction=-1)
+    db.add(RecycleLog(wallet=req.wallet, total_cards=total_cards, reward_amount=reward_amount))
+    db.commit()
+
+    return TxResponse(
+        tx_b64=tx_b64,
+        tx_v0_b64=tx_v0_b64,
+        recent_blockhash=blockhash,
+        instructions=[instr],
+    )
 
 
 @app.get("/marketplace/listings", response_model=List[ListingView])
@@ -1577,6 +2324,10 @@ def admin_inventory(db: Session = Depends(get_session)):
     counts: Dict[str, int] = {}
     for row in rows:
         counts[row.rarity] = counts.get(row.rarity, 0) + 1
+    vrows = db.exec(select(VirtualCard)).all()
+    for row in vrows:
+        key = f"virtual_{row.rarity}"
+        counts[key] = counts.get(key, 0) + row.count
     return counts
 
 

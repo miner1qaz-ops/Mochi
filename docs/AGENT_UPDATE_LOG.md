@@ -198,6 +198,12 @@ Next steps:
 - Fixed both the user and admin force-expire flows by marking `vault_authority` writable in the CPI builders, and updated the resume/backfill logic so pending sessions with missing DB rows are re-created automatically.
 - Rebuilt the frontend and restarted both services after the changes.
 
+## 2025-11-28 – Codex
+- Introduced gacha v2 on-chain flow: new `PackSessionV2` PDA (`pack_session_v2` seed), Rare+ only reservations (max 3), and streamlined instructions `open_pack`, `claim_pack_v2`, `sellback_pack_v2`, `expire_session_v2`, and `admin_force_close_v2`. Added helper utilities and error codes for Rare+ validation.
+- Tx builder now supports v2 layouts/signatures and derives the new PDA; added builders for open/claim/sellback/expire/admin v2 instructions.
+- Backend scaffolding for the hybrid inventory: VirtualCard/RecycleLog tables, v2 open/build/confirm + claim/sellback/expire endpoints using Rare+ CardRecords only, virtual low-tier tracking, and recycle build endpoint to mint Mochi tokens via admin mint authority.
+- Pack lineup slots now mark NFT vs virtual cards, SessionMirror stores template_ids/version, and admin rarity inventory aggregates virtual counts.
+
 ## 2025-11-27T20:50:00+08:00 – Codex
 - Added on-chain `admin_force_close_session` instruction to forcibly close any pack_session (ignores state) and return card records to `Available`/vault ownership; redeployed `mochi_v2_vault` (sig `4pnMwuK9mZj4ZSnv3fk8QrPL5HUf7NNvgyhyrgAs2gtMsQ4yUSMQFxANBt8Lfb14D5jvV4Faw31CmHcnY5k7khgR`).
 - Backend: new `POST /admin/sessions/force_close` that deserializes the pack_session PDA, builds the new ix with the admin keypair, and frees card records + mirrors for the target wallet.
