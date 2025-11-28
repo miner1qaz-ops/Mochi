@@ -462,16 +462,55 @@ export default function GachaPage() {
     setClaimLoading(true);
     try {
       setStatusKind('info');
-      setStatusMsg('Building claim transaction…');
-      const res = await claimPack(sessionId, publicKey.toBase58());
-      const tx = buildV0Tx(publicKey, res.recent_blockhash, res.instructions);
-      const signed = signTransaction ? await signTransaction(tx) : tx;
-      setStatusMsg('Submitting claim transaction…');
-      const sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
-      setStatusMsg(`Claim tx: ${sig}`);
+      setStatusMsg('Building per-card claim transactions…');
+      // batch_flow returns an ordered list of txs (per-card or small batch) + finalize
+      const res = await fetch('/api/program/claim/batch_flow', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ wallet: publicKey.toBase58(), session_id: sessionId }),
+      }).then((r) => r.json());
+      if (!res?.txs || !Array.isArray(res.txs)) {
+        throw new Error(res?.detail || 'Failed to build claim batch');
+      }
+      // Send sequentially to avoid nonce reuse and to surface any failure early
+      for (let i = 0; i < res.txs.length; i += 1) {
+        const txResp = res.txs[i];
+        const tx = buildV0Tx(publicKey, txResp.recent_blockhash, txResp.instructions);
+        const signed = signTransaction ? await signTransaction(tx) : tx;
+        setStatusMsg(`Submitting claim ${i + 1}/${res.txs.length}…`);
+        const sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
+        console.log('claim chunk sig', sig);
+      }
+      setStatusMsg('All claim txs submitted. Finalizing…');
       resetSessionState();
     } catch (e) {
       console.error('claim error', e);
+      setStatusKind('error');
+      setStatusMsg(extractErrorMessage(e));
+    } finally {
+      setClaimLoading(false);
+    }
+  };
+
+  // Test button: claim exactly 3 NFTs in one tx for benchmarking
+  const handleClaim3 = async () => {
+    if (!sessionId || !publicKey || claimLoading) return;
+    setClaimLoading(true);
+    try {
+      setStatusKind('info');
+      setStatusMsg('Building 3-NFT claim test tx…');
+      const res = await fetch('/api/program/claim/test3', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ wallet: publicKey.toBase58() }),
+      }).then((r) => r.json());
+      const tx = buildV0Tx(publicKey, res.recent_blockhash, res.instructions);
+      const signed = signTransaction ? await signTransaction(tx) : tx;
+      setStatusMsg('Submitting 3-NFT claim test…');
+      const sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
+      setStatusMsg(`3-NFT claim test tx: ${sig}`);
+    } catch (e) {
+      console.error('claim3 error', e);
       setStatusKind('error');
       setStatusMsg(extractErrorMessage(e));
     } finally {
@@ -951,6 +990,13 @@ export default function GachaPage() {
           className="px-5 py-3 rounded-xl bg-aurora text-ink font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {claimLoading ? 'Claiming…' : confirmDone ? 'Keep cards' : 'Confirm cards first'}
+        </button>
+        <button
+          onClick={handleClaim3}
+          disabled={!sessionId || claimLoading || !confirmDone}
+          className="px-5 py-3 rounded-xl border border-white/20 text-white disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {claimLoading ? 'Running test…' : 'Test claim 3 NFTs'}
         </button>
         <button
           onClick={handleSellback}

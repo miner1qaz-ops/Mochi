@@ -81,6 +81,18 @@ def encode_claim_pack() -> bytes:
     return sighash("claim_pack")
 
 
+def encode_claim_pack_batch() -> bytes:
+    return sighash("claim_pack_batch")
+
+
+def encode_claim_pack_batch3() -> bytes:
+    return sighash("claim_pack_batch3")
+
+
+def encode_finalize_claim() -> bytes:
+    return sighash("finalize_claim")
+
+
 def encode_sellback_pack() -> bytes:
     return sighash("sellback_pack")
 
@@ -185,6 +197,81 @@ def build_claim_pack_ix(
     accounts.extend([AccountMeta(pubkey=cr, is_signer=False, is_writable=True) for cr in card_records])
     accounts.extend([AccountMeta(pubkey=asset, is_signer=False, is_writable=True) for asset in core_assets])
     return Instruction(program_id=PROGRAM_ID, data=encode_claim_pack(), accounts=accounts)
+
+
+def build_claim_batch_ix(
+    user: Pubkey,
+    vault_state: Pubkey,
+    pack_session: Pubkey,
+    vault_authority: Pubkey,
+    vault_treasury: Pubkey,
+    card_records: List[Pubkey],
+    core_assets: List[Pubkey],
+) -> Instruction:
+    if len(card_records) != len(core_assets):
+        raise ValueError("card_records/core_assets length mismatch")
+    accounts: List[AccountMeta] = [
+        AccountMeta(pubkey=user, is_signer=True, is_writable=True),
+        AccountMeta(pubkey=vault_state, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=pack_session, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=vault_treasury, is_signer=False, is_writable=True),
+    ]
+    accounts.extend(
+        [
+            AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
+            AccountMeta(pubkey=SYS_PROGRAM_ID, is_signer=False, is_writable=False),
+            AccountMeta(pubkey=MPL_CORE_PROGRAM_ID, is_signer=False, is_writable=False),
+        ]
+    )
+    accounts.extend([AccountMeta(pubkey=cr, is_signer=False, is_writable=True) for cr in card_records])
+    accounts.extend([AccountMeta(pubkey=asset, is_signer=False, is_writable=True) for asset in core_assets])
+    return Instruction(program_id=PROGRAM_ID, data=encode_claim_pack_batch(), accounts=accounts)
+
+
+def build_claim_batch3_ix(
+    user: Pubkey,
+    vault_state: Pubkey,
+    pack_session: Pubkey,
+    vault_authority: Pubkey,
+    vault_treasury: Pubkey,
+    card_records: List[Pubkey],
+    core_assets: List[Pubkey],
+) -> Instruction:
+    if len(card_records) != 3 or len(core_assets) != 3:
+        raise ValueError("claim_batch3 requires exactly 3 card_records/core_assets")
+    accounts: List[AccountMeta] = [
+        AccountMeta(pubkey=user, is_signer=True, is_writable=True),
+        AccountMeta(pubkey=vault_state, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=pack_session, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=vault_treasury, is_signer=False, is_writable=True),
+    ]
+    accounts.extend(
+        [
+            AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
+            AccountMeta(pubkey=SYS_PROGRAM_ID, is_signer=False, is_writable=False),
+            AccountMeta(pubkey=MPL_CORE_PROGRAM_ID, is_signer=False, is_writable=False),
+        ]
+    )
+    accounts.extend([AccountMeta(pubkey=cr, is_signer=False, is_writable=True) for cr in card_records])
+    accounts.extend([AccountMeta(pubkey=asset, is_signer=False, is_writable=True) for asset in core_assets])
+    return Instruction(program_id=PROGRAM_ID, data=encode_claim_pack_batch3(), accounts=accounts)
+
+
+def build_finalize_claim_ix(
+    user: Pubkey,
+    vault_state: Pubkey,
+    pack_session: Pubkey,
+    vault_authority: Pubkey,
+) -> Instruction:
+    accounts: List[AccountMeta] = [
+        AccountMeta(pubkey=user, is_signer=True, is_writable=True),
+        AccountMeta(pubkey=vault_state, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=pack_session, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=True),
+    ]
+    return Instruction(program_id=PROGRAM_ID, data=encode_finalize_claim(), accounts=accounts)
 
 
 def build_sellback_pack_ix(

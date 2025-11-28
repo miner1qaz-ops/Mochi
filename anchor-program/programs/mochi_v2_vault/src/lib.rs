@@ -143,7 +143,6 @@ mod mochi_v2_vault {
         };
         session.created_at = now;
         session.expires_at = now + vault_state.claim_window_seconds;
-        session.card_record_keys = card_record_keys;
         session.state = PackState::PendingDecision;
         session.client_seed_hash = client_seed_hash;
         session.rarity_prices = rarity_prices;
@@ -163,7 +162,12 @@ mod mochi_v2_vault {
             card_record_keys[idx] = acc_info.key();
             card_record.status = CardStatus::Reserved;
             card_record.owner = ctx.accounts.user.key();
+            // Manually serialize because we constructed Account<T> from raw AccountInfo
+            let mut data = acc_info.try_borrow_mut_data()?;
+            let mut cursor = std::io::Cursor::new(&mut data[..]);
+            card_record.try_serialize(&mut cursor)?;
         }
+        session.card_record_keys = card_record_keys;
         Ok(())
     }
 
@@ -178,11 +182,77 @@ mod mochi_v2_vault {
 
         let (card_accounts, asset_accounts, _extras) =
             partition_pack_accounts(&ctx.remaining_accounts)?;
+        msg!(
+            "claim_pack: cards {} assets {} rarity_prices_len {} state {:?}",
+            card_accounts.len(),
+            asset_accounts.len(),
+            session.rarity_prices.len(),
+            session.state
+        );
         require!(
             asset_accounts.len() == PACK_CARD_COUNT,
             MochiError::InvalidCardCount
         );
+        // Defensive: ensure rarity_prices never allocates huge vec on deserialize
+        if session.rarity_prices.len() > PACK_CARD_COUNT {
+            session.rarity_prices.truncate(PACK_CARD_COUNT);
+        }
         for i in 0..PACK_CARD_COUNT {
+            let acc_info: &AccountInfo<'info> = &card_accounts[i];
+            let mut card_record: Account<CardRecord> = Account::try_from(acc_info)?;
+            require!(
+                card_record.status == CardStatus::Reserved,
+                MochiError::CardNotReserved
+            );
+            require_keys_eq!(
+                card_record.owner,
+                ctx.accounts.user.key(),
+                MochiError::Unauthorized
+            );
+            msg!("claim idx {} card {}", i, acc_info.key());
+            card_record.status = CardStatus::UserOwned;
+            card_record.owner = ctx.accounts.user.key();
+            // Transfer Core asset to user
+            let asset_info: &AccountInfo<'info> = &asset_accounts[i];
+            msg!("claim transfer asset {}", asset_info.key());
+            transfer_core_asset(
+                &asset_info,
+                &ctx.accounts.vault_authority,
+                &ctx.accounts.vault_authority, // payer = vault authority
+                &ctx.accounts.user.to_account_info(),
+                &ctx.accounts.vault_state.key(),
+                ctx.accounts.vault_state.vault_authority_bump,
+                &ctx.accounts.system_program.to_account_info(),
+                &ctx.accounts.mpl_core_program.to_account_info(),
+            )?;
+            msg!("claim transfer done {}", asset_info.key());
+            // Persist card_record changes
+            let mut data = acc_info.try_borrow_mut_data()?;
+            let mut cursor = std::io::Cursor::new(&mut data[..]);
+            card_record.try_serialize(&mut cursor)?;
+        }
+
+        session.state = PackState::Accepted;
+        Ok(())
+    }
+
+    /// New: claim selected cards in smaller batches to reduce heap/CU pressure.
+    /// remaining_accounts = [card_records..., core_assets...] with equal lengths >0.
+    pub fn claim_pack_batch<'info>(
+        ctx: Context<'_, '_, 'info, 'info, ResolvePack<'info>>,
+    ) -> Result<()> {
+        let session = &mut ctx.accounts.pack_session;
+        let now = Clock::get()?.unix_timestamp;
+        require!(
+            session.state == PackState::PendingDecision,
+            MochiError::InvalidSessionState
+        );
+        require!(now <= session.expires_at, MochiError::SessionExpired);
+
+        let (card_accounts, asset_accounts, _extras) = partition_half_accounts(&ctx.remaining_accounts)?;
+        // Restrict batch size to 1 or 2 to avoid heap blowups.
+        require!(card_accounts.len() > 0 && card_accounts.len() <= 2, MochiError::InvalidCardCount);
+        for i in 0..card_accounts.len() {
             let acc_info: &AccountInfo<'info> = &card_accounts[i];
             let mut card_record: Account<CardRecord> = Account::try_from(acc_info)?;
             require!(
@@ -200,15 +270,91 @@ mod mochi_v2_vault {
             transfer_core_asset(
                 &asset_info,
                 &ctx.accounts.vault_authority,
-                &ctx.accounts.vault_authority, // payer = vault authority
+                &ctx.accounts.vault_authority,
                 &ctx.accounts.user.to_account_info(),
                 &ctx.accounts.vault_state.key(),
                 ctx.accounts.vault_state.vault_authority_bump,
                 &ctx.accounts.system_program.to_account_info(),
                 &ctx.accounts.mpl_core_program.to_account_info(),
             )?;
+            let mut data = acc_info.try_borrow_mut_data()?;
+            let mut cursor = std::io::Cursor::new(&mut data[..]);
+            card_record.try_serialize(&mut cursor)?;
         }
+        // Keep session pending; frontend/backend should call finalize_claim when all cards processed.
+        Ok(())
+    }
 
+    /// Test helper: claim exactly 3 cards in one ix (for benchmarking); minimal logging.
+    pub fn claim_pack_batch3<'info>(
+        ctx: Context<'_, '_, 'info, 'info, ResolvePack<'info>>,
+    ) -> Result<()> {
+        let session = &mut ctx.accounts.pack_session;
+        let now = Clock::get()?.unix_timestamp;
+        require!(
+            session.state == PackState::PendingDecision,
+            MochiError::InvalidSessionState
+        );
+        require!(now <= session.expires_at, MochiError::SessionExpired);
+
+        let (card_accounts, asset_accounts, _extras) = partition_half_accounts(&ctx.remaining_accounts)?;
+        require!(card_accounts.len() == 3, MochiError::InvalidCardCount);
+        for i in 0..card_accounts.len() {
+            let acc_info: &AccountInfo<'info> = &card_accounts[i];
+            let mut card_record: Account<CardRecord> = Account::try_from(acc_info)?;
+            require!(
+                card_record.status == CardStatus::Reserved,
+                MochiError::CardNotReserved
+            );
+            require_keys_eq!(
+                card_record.owner,
+                ctx.accounts.user.key(),
+                MochiError::Unauthorized
+            );
+            card_record.status = CardStatus::UserOwned;
+            card_record.owner = ctx.accounts.user.key();
+            let asset_info: &AccountInfo<'info> = &asset_accounts[i];
+            transfer_core_asset(
+                &asset_info,
+                &ctx.accounts.vault_authority,
+                &ctx.accounts.vault_authority,
+                &ctx.accounts.user.to_account_info(),
+                &ctx.accounts.vault_state.key(),
+                ctx.accounts.vault_state.vault_authority_bump,
+                &ctx.accounts.system_program.to_account_info(),
+                &ctx.accounts.mpl_core_program.to_account_info(),
+            )?;
+            let mut data = acc_info.try_borrow_mut_data()?;
+            let mut cursor = std::io::Cursor::new(&mut data[..]);
+            card_record.try_serialize(&mut cursor)?;
+        }
+        Ok(())
+    }
+
+    /// New: finalize after all cards are user-owned; sets state = Accepted.
+    /// remaining_accounts should include all card_record PDAs for verification.
+    pub fn finalize_claim<'info>(
+        ctx: Context<'_, '_, 'info, 'info, ResolvePack<'info>>,
+    ) -> Result<()> {
+        let session = &mut ctx.accounts.pack_session;
+        let now = Clock::get()?.unix_timestamp;
+        require!(
+            session.state == PackState::PendingDecision,
+            MochiError::InvalidSessionState
+        );
+        require!(now <= session.expires_at, MochiError::SessionExpired);
+        for acc_info in ctx.remaining_accounts.iter() {
+            let card_record: Account<CardRecord> = Account::try_from(acc_info)?;
+            require!(
+                card_record.status == CardStatus::UserOwned,
+                MochiError::CardNotReserved
+            );
+            require_keys_eq!(
+                card_record.owner,
+                ctx.accounts.user.key(),
+                MochiError::Unauthorized
+            );
+        }
         session.state = PackState::Accepted;
         Ok(())
     }
@@ -626,6 +772,30 @@ mod mochi_v2_vault {
         session.rarity_prices = Vec::new();
         Ok(())
     }
+
+    pub fn admin_reset_cards<'info>(
+        ctx: Context<'_, '_, 'info, 'info, AdminResetCards<'info>>,
+    ) -> Result<()> {
+        // Admin loop to set any provided CardRecords back to Available/ vault authority owner.
+        require_keys_eq!(
+            ctx.accounts.admin.key(),
+            ctx.accounts.vault_state.admin,
+            MochiError::Unauthorized
+        );
+        msg!("admin_reset_cards rem len {}", ctx.remaining_accounts.len());
+        for acc_info in ctx.remaining_accounts.iter() {
+            if let Ok(mut card_record) = Account::<CardRecord>::try_from(acc_info) {
+                if card_record.vault_state == ctx.accounts.vault_state.key() {
+                    card_record.status = CardStatus::Available;
+                    card_record.owner = ctx.accounts.vault_authority.key();
+                    let mut data = acc_info.try_borrow_mut_data()?;
+                    let mut cursor = std::io::Cursor::new(&mut data[..]);
+                    card_record.try_serialize(&mut cursor)?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Accounts)]
@@ -780,6 +950,17 @@ pub struct AdminForceClose<'info> {
 }
 
 #[derive(Accounts)]
+pub struct AdminResetCards<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    #[account(mut, seeds = [b"vault_state"], bump)]
+    pub vault_state: Account<'info, VaultState>,
+    /// CHECK: Vault authority PDA (validated by seeds)
+    #[account(seeds = [b"vault_authority", vault_state.key().as_ref()], bump = vault_state.vault_authority_bump)]
+    pub vault_authority: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
 pub struct UserResetSession<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
@@ -791,6 +972,19 @@ pub struct UserResetSession<'info> {
         seeds = [b"pack_session", vault_state.key().as_ref(), user.key().as_ref()],
         bump
     )]
+    pub pack_session: Account<'info, PackSession>,
+    /// CHECK: Vault authority PDA (validated by seeds)
+    #[account(mut, seeds = [b"vault_authority", vault_state.key().as_ref()], bump = vault_state.vault_authority_bump)]
+    pub vault_authority: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct FinalizeClaim<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    #[account(mut, seeds = [b"vault_state"], bump)]
+    pub vault_state: Account<'info, VaultState>,
+    #[account(mut, seeds = [b"pack_session", vault_state.key().as_ref(), user.key().as_ref()], bump)]
     pub pack_session: Account<'info, PackSession>,
     /// CHECK: Vault authority PDA (validated by seeds)
     #[account(mut, seeds = [b"vault_authority", vault_state.key().as_ref()], bump = vault_state.vault_authority_bump)]
@@ -1008,7 +1202,7 @@ pub enum Currency {
     Token,
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq, Debug)]
 pub enum PackState {
     Uninitialized,
     PendingDecision,
@@ -1082,6 +1276,19 @@ fn partition_pack_accounts<'info>(
     } else {
         Ok((card_slice, &[], rest))
     }
+}
+
+/// Split remaining accounts into equal halves (card_records, assets)
+fn partition_half_accounts<'info>(
+    accounts: &'info [AccountInfo<'info>],
+) -> Result<(&'info [AccountInfo<'info>], &'info [AccountInfo<'info>], &'info [AccountInfo<'info>])>
+{
+    require!(accounts.len() >= 2, MochiError::InvalidCardCount);
+    let half = accounts.len() / 2;
+    require!(half > 0 && half * 2 == accounts.len(), MochiError::InvalidCardCount);
+    let (cards, rest) = accounts.split_at(half);
+    let (assets, extras) = rest.split_at(half);
+    Ok((cards, assets, extras))
 }
 
 fn transfer_core_asset<'info>(

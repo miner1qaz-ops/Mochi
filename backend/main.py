@@ -232,6 +232,15 @@ class SessionActionRequest(BaseModel):
     vault_token_account: Optional[str] = None
 
 
+class BatchClaimRequest(BaseModel):
+    wallet: str
+    batch_assets: List[str]
+
+
+class TestClaim3Request(BaseModel):
+    wallet: str
+
+
 class AdminResetRequest(BaseModel):
     wallet: str
 
@@ -257,6 +266,10 @@ class InstructionMeta(BaseModel):
     keys: List[KeyMeta]
     data: str
 
+
+class MultiTxResponse(BaseModel):
+    """Return a sequence of transactions to be sent in order."""
+    txs: List[TxResponse]
 
 class TxResponse(BaseModel):
     tx_b64: str
@@ -857,6 +870,179 @@ def get_pending_session(wallet: str, db: Session = Depends(get_session)):
 
 @app.post("/program/claim/build", response_model=TxResponse)
 def claim_pack(req: SessionActionRequest, db: Session = Depends(get_session)):
+    raise HTTPException(
+        status_code=400,
+        detail="Use /program/claim/batch_flow to claim in chunks (old single-shot claim disabled)",
+    )
+
+
+def _session_and_cards(wallet: str):
+    vault_state = vault_state_pda()
+    pack_session = pack_session_pda(vault_state, to_pubkey(wallet))
+    resp = sol_client.get_account_info(pack_session)
+    if resp.value is None or resp.value.data is None:
+        raise HTTPException(status_code=404, detail="Session not found on-chain")
+    session_info = parse_pack_session_account(bytes(resp.value.data))
+    if not session_info:
+        raise HTTPException(status_code=400, detail="Unable to parse on-chain session")
+    if session_info.get("state") != "pending":
+        raise HTTPException(status_code=400, detail=f"Session in state {session_info.get('state')}")
+    if time.time() > session_info.get("expires_at", 0):
+        raise HTTPException(status_code=400, detail="Session expired")
+    card_records = session_info.get("card_record_keys", [])
+    if len(card_records) != PACK_CARD_COUNT:
+        raise HTTPException(status_code=400, detail="Incomplete card_record_keys in session")
+    return vault_state, pack_session, session_info, card_records
+
+
+def _chunk(lst: List[str], sizes: List[int]) -> List[List[str]]:
+    out = []
+    idx = 0
+    for sz in sizes:
+        if idx >= len(lst):
+            break
+        out.append(lst[idx : idx + sz])
+        idx += sz
+    if idx < len(lst):
+        out.append(lst[idx:])
+    return [chunk for chunk in out if chunk]
+
+
+@app.post("/program/claim/batch_flow", response_model=MultiTxResponse)
+def claim_pack_batch_flow(req: SessionActionRequest, db: Session = Depends(get_session)):
+    """
+    Build a series of batch claim txs (default 3/3/3/2) plus finalize_claim.
+    """
+    vault_state, pack_session, session_info, card_records = _session_and_cards(req.wallet)
+    vault_authority = vault_authority_pda(vault_state)
+    treasury = treasury_pubkey()
+
+    # Validate all cards are still reserved
+    record_map: dict[str, dict] = {}
+    for cr in card_records:
+        cr_resp = sol_client.get_account_info(cr)
+        if cr_resp.value is None or cr_resp.value.data is None:
+            raise HTTPException(status_code=400, detail=f"CardRecord PDA missing on-chain: {cr}")
+        record_info = parse_card_record_account(bytes(cr_resp.value.data))
+        if not record_info:
+            raise HTTPException(status_code=400, detail=f"Could not parse CardRecord: {cr}")
+        if record_info["status"] != 1 or str(record_info["owner"]) != req.wallet:  # 1 = Reserved
+            raise HTTPException(status_code=400, detail="Cards are not reserved; please reset and reopen the pack.")
+        record_map[str(cr)] = record_info
+
+    # Chunk the card_records
+    default_sizes = [3, 3, 3, 2]
+    chunks = _chunk([str(c) for c in card_records], default_sizes)
+    txs: List[TxResponse] = []
+    payer = to_pubkey(req.wallet)
+
+    for chunk in chunks:
+        batch_card_records: List[Pubkey] = []
+        batch_core_assets: List[Pubkey] = []
+        for cr_str in chunk:
+            info = record_map[cr_str]
+            batch_card_records.append(to_pubkey(cr_str))
+            batch_core_assets.append(info["core_asset"])
+        ix = build_claim_batch_ix(
+            user=payer,
+            vault_state=vault_state,
+            pack_session=pack_session,
+            vault_authority=vault_authority,
+            vault_treasury=treasury,
+            card_records=batch_card_records,
+            core_assets=batch_core_assets,
+        )
+        compute_ix = set_compute_unit_limit(units=400_000)
+        instructions = [compute_ix, ix]
+        blockhash = get_latest_blockhash()
+        tx_b64 = message_from_instructions(instructions, payer, blockhash)
+        tx_v0_b64 = versioned_tx_b64(payer, blockhash, instructions)
+        instrs_meta = [wrap_instruction_meta(instruction_to_dict(ix_)) for ix_ in instructions]
+        txs.append(
+            TxResponse(
+                tx_b64=tx_b64,
+                tx_v0_b64=tx_v0_b64,
+                recent_blockhash=blockhash,
+                instructions=instrs_meta,
+            )
+        )
+
+    # Finalize
+    ix_fin = build_finalize_claim_ix(
+        user=payer,
+        vault_state=vault_state,
+        pack_session=pack_session,
+        vault_authority=vault_authority,
+    )
+    blockhash = get_latest_blockhash()
+    tx_b64 = message_from_instructions([ix_fin], payer, blockhash)
+    tx_v0_b64 = versioned_tx_b64(payer, blockhash, [ix_fin])
+    instrs_meta = [wrap_instruction_meta(instruction_to_dict(ix_fin))]
+    txs.append(
+        TxResponse(
+            tx_b64=tx_b64,
+            tx_v0_b64=tx_v0_b64,
+            recent_blockhash=blockhash,
+            instructions=instrs_meta,
+        )
+    )
+
+    return MultiTxResponse(txs=txs)
+
+
+@app.post("/program/claim/test3", response_model=TxResponse)
+def claim_pack_test3(req: TestClaim3Request, db: Session = Depends(get_session)):
+    """
+    Build a single tx to claim exactly 3 cards (benchmark).
+    """
+    vault_state, pack_session, session_info, card_records = _session_and_cards(req.wallet)
+    vault_authority = vault_authority_pda(vault_state)
+    treasury = treasury_pubkey()
+
+    # Take first 3 card_records from the session
+    if len(card_records) < 3:
+        raise HTTPException(status_code=400, detail="Not enough cards to test claim3")
+    target_cards = card_records[:3]
+    core_assets: List[Pubkey] = []
+    for cr in target_cards:
+        cr_resp = sol_client.get_account_info(cr)
+        if cr_resp.value is None or cr_resp.value.data is None:
+            raise HTTPException(status_code=400, detail=f"CardRecord PDA missing on-chain: {cr}")
+        record_info = parse_card_record_account(bytes(cr_resp.value.data))
+        if not record_info:
+            raise HTTPException(status_code=400, detail=f"Could not parse CardRecord: {cr}")
+        if record_info["status"] != 1 or str(record_info["owner"]) != req.wallet:  # 1 = Reserved
+            raise HTTPException(status_code=400, detail="Cards are not reserved; please reset and reopen the pack.")
+        core_assets.append(record_info["core_asset"])
+
+    ix = build_claim_batch3_ix(
+        user=to_pubkey(req.wallet),
+        vault_state=vault_state,
+        pack_session=pack_session,
+        vault_authority=vault_authority,
+        vault_treasury=treasury,
+        card_records=target_cards,
+        core_assets=core_assets,
+    )
+    compute_ix = set_compute_unit_limit(units=400_000)
+    instructions = [compute_ix, ix]
+    blockhash = get_latest_blockhash()
+    payer = to_pubkey(req.wallet)
+    tx_b64 = message_from_instructions(instructions, payer, blockhash)
+    tx_v0_b64 = versioned_tx_b64(payer, blockhash, instructions)
+    instrs_meta = [wrap_instruction_meta(instruction_to_dict(ix_)) for ix_ in instructions]
+
+    return TxResponse(
+        tx_b64=tx_b64,
+        tx_v0_b64=tx_v0_b64,
+        recent_blockhash=blockhash,
+        instructions=instrs_meta,
+    )
+
+
+@app.post("/program/claim/batch", response_model=TxResponse)
+def claim_pack_batch(req: BatchClaimRequest, db: Session = Depends(get_session)):
+    """Claim a subset of cards to reduce CU/heap usage."""
     vault_state = vault_state_pda()
     vault_authority = vault_authority_pda(vault_state)
     pack_session = pack_session_pda(vault_state, to_pubkey(req.wallet))
@@ -876,7 +1062,73 @@ def claim_pack(req: SessionActionRequest, db: Session = Depends(get_session)):
     card_records = session_info.get("card_record_keys", [])
     if len(card_records) != PACK_CARD_COUNT:
         raise HTTPException(status_code=400, detail="Incomplete card_record_keys in session")
-    core_assets: List[Pubkey] = []
+    if not req.batch_assets:
+        raise HTTPException(status_code=400, detail="No batch assets provided")
+
+    allowed = {str(c) for c in card_records}
+    if not set(req.batch_assets).issubset(allowed):
+        raise HTTPException(status_code=400, detail="Batch assets not in session")
+
+    batch_card_records: List[Pubkey] = []
+    batch_core_assets: List[Pubkey] = []
+    for cr_str in req.batch_assets:
+        cr_pk = to_pubkey(cr_str)
+        cr_resp = sol_client.get_account_info(cr_pk)
+        if cr_resp.value is None or cr_resp.value.data is None:
+            raise HTTPException(status_code=400, detail=f"CardRecord PDA missing on-chain: {cr_pk}")
+        record_info = parse_card_record_account(bytes(cr_resp.value.data))
+        if not record_info:
+            raise HTTPException(status_code=400, detail=f"Could not parse CardRecord: {cr_pk}")
+        if record_info["status"] != 1 or str(record_info["owner"]) != req.wallet:  # 1 = Reserved
+            raise HTTPException(status_code=400, detail="Cards are not reserved; please reset and reopen the pack.")
+        batch_card_records.append(cr_pk)
+        batch_core_assets.append(record_info["core_asset"])
+
+    ix = build_claim_batch_ix(
+        user=to_pubkey(req.wallet),
+        vault_state=vault_state,
+        pack_session=pack_session,
+        vault_authority=vault_authority,
+        vault_treasury=treasury,
+        card_records=batch_card_records,
+        core_assets=batch_core_assets,
+    )
+    compute_ix = set_compute_unit_limit(units=400_000)
+    instructions = [compute_ix, ix]
+    blockhash = get_latest_blockhash()
+    tx_b64 = message_from_instructions(instructions, to_pubkey(req.wallet), blockhash)
+    tx_v0_b64 = versioned_tx_b64(to_pubkey(req.wallet), blockhash, instructions)
+    instrs_meta = [wrap_instruction_meta(instruction_to_dict(ix_)) for ix_ in instructions]
+
+    return TxResponse(
+        tx_b64=tx_b64,
+        tx_v0_b64=tx_v0_b64,
+        recent_blockhash=blockhash,
+        instructions=instrs_meta,
+    )
+
+
+@app.post("/program/claim/finalize", response_model=TxResponse)
+def finalize_claim(wallet: str, db: Session = Depends(get_session)):
+    vault_state = vault_state_pda()
+    vault_authority = vault_authority_pda(vault_state)
+    pack_session = pack_session_pda(vault_state, to_pubkey(wallet))
+
+    resp = sol_client.get_account_info(pack_session)
+    if resp.value is None or resp.value.data is None:
+        raise HTTPException(status_code=404, detail="Session not found on-chain")
+    session_info = parse_pack_session_account(bytes(resp.value.data))
+    if not session_info:
+        raise HTTPException(status_code=400, detail="Unable to parse on-chain session")
+    if session_info.get("state") != "pending":
+        raise HTTPException(status_code=400, detail=f"Session in state {session_info.get('state')}")
+    if time.time() > session_info.get("expires_at", 0):
+        raise HTTPException(status_code=400, detail="Session expired")
+
+    card_records = session_info.get("card_record_keys", [])
+    if len(card_records) != PACK_CARD_COUNT:
+        raise HTTPException(status_code=400, detail="Incomplete card_record_keys in session")
+
     for cr in card_records:
         cr_resp = sol_client.get_account_info(cr)
         if cr_resp.value is None or cr_resp.value.data is None:
@@ -884,25 +1136,26 @@ def claim_pack(req: SessionActionRequest, db: Session = Depends(get_session)):
         record_info = parse_card_record_account(bytes(cr_resp.value.data))
         if not record_info:
             raise HTTPException(status_code=400, detail=f"Could not parse CardRecord: {cr}")
-        if record_info["status"] != 1 or str(record_info["owner"]) != req.wallet:  # 1 = Reserved
-            raise HTTPException(status_code=400, detail="Cards are not reserved; please reset and reopen the pack.")
-        core_assets.append(record_info["core_asset"])
+        if record_info["status"] != 2 or str(record_info["owner"]) != wallet:  # 2 = UserOwned
+            raise HTTPException(status_code=400, detail="All cards must be user_owned before finalize.")
 
-    ix = build_claim_pack_ix(
-        user=to_pubkey(req.wallet),
+    ix = build_finalize_claim_ix(
+        user=to_pubkey(wallet),
         vault_state=vault_state,
         pack_session=pack_session,
         vault_authority=vault_authority,
-        vault_treasury=treasury,
-        card_records=card_records,
-        core_assets=core_assets,
     )
     blockhash = get_latest_blockhash()
-    tx_b64 = message_from_instructions([ix], to_pubkey(req.wallet), blockhash)
-    tx_v0_b64 = versioned_tx_b64(to_pubkey(req.wallet), blockhash, [ix])
-    instr = wrap_instruction_meta(instruction_to_dict(ix))
+    tx_b64 = message_from_instructions([ix], to_pubkey(wallet), blockhash)
+    tx_v0_b64 = versioned_tx_b64(to_pubkey(wallet), blockhash, [ix])
+    instrs_meta = [wrap_instruction_meta(instruction_to_dict(ix))]
 
-    return TxResponse(tx_b64=tx_b64, tx_v0_b64=tx_v0_b64, recent_blockhash=blockhash, instructions=[instr])
+    return TxResponse(
+        tx_b64=tx_b64,
+        tx_v0_b64=tx_v0_b64,
+        recent_blockhash=blockhash,
+        instructions=instrs_meta,
+    )
 
 
 def wait_for_confirmation(signature: str, timeout_sec: int = 30) -> bool:
