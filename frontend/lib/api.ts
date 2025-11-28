@@ -20,6 +20,8 @@ export type PendingSession = {
   provably_fair: Record<string, string>;
 };
 
+export type VirtualCard = { template_id: number; rarity: string; count: number };
+
 export async function previewPack(client_seed: string, wallet: string, pack_type: string = 'meg_web') {
   const { data } = await api.post('/program/open/preview', { client_seed, wallet, pack_type });
   return data as { server_seed_hash: string; server_nonce: string; entropy_proof: string; slots: PackSlot[] };
@@ -86,6 +88,11 @@ export async function confirmClaim(signature: string, wallet: string, action: 'c
 export async function confirmExpire(signature: string, wallet: string) {
   const { data } = await api.post('/program/v2/expire/confirm', { signature, wallet });
   return data as { state: string; assets: string[] };
+}
+
+export async function fetchVirtualCards(wallet: string) {
+  const { data } = await api.get(`/profile/${wallet}/virtual`);
+  return data as VirtualCard[];
 }
 
 export async function listCard(core_asset: string, wallet: string, price_lamports: number, currency_mint?: string) {

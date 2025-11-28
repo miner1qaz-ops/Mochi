@@ -206,6 +206,8 @@ Next steps:
 - SQLite migrated: added SessionMirror.template_ids/version plus new tables virtualcard and recyclelog.
 - Devnet Mochi token minted for recycle testing: `3gqKrJoVx3gUXLHCsNQfpyZAuVagLHQFGtYgbtY3VEsn` (decimals=6), 1,000,000 tokens minted to ATA `AHN6zuPCSfHL548fCWnF9RBNMLDMv245VxgX8Xr6V4x`; backend `.env` updated (MOCHI_TOKEN_MINT/DECIMALS/RECYCLE_RATE).
 - Legacy mint `6rPGXw2imNPgiqUpA2Rq2doVVyyEXawxepip5YRQ2Jd7` accidentally minted max supply; mark unused.
+- Backend v2 pending/resume now reads on-chain state, syncs mirrors, and returns 404 when session is not pending. Confirm open preserves full lineup and adds virtual cards. Added `/program/v2/claim/cleanup` for stuck mirrors.
+- Frontend gacha shows all 11 slots with NFT/Virtual badges; virtual inventory panel added. Profile page now shows virtual cards and recycle UI (devnet token), with denser inventory grid and sort controls.
 
 ## 2025-11-27T20:50:00+08:00 – Codex
 - Added on-chain `admin_force_close_session` instruction to forcibly close any pack_session (ignores state) and return card records to `Available`/vault ownership; redeployed `mochi_v2_vault` (sig `4pnMwuK9mZj4ZSnv3fk8QrPL5HUf7NNvgyhyrgAs2gtMsQ4yUSMQFxANBt8Lfb14D5jvV4Faw31CmHcnY5k7khgR`).

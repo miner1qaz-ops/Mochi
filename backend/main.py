@@ -407,6 +407,9 @@ class ConfirmClaimRequest(BaseModel):
     wallet: str
     action: str = "claim"
 
+class ClaimCleanupRequest(BaseModel):
+    wallet: str
+    session_id: Optional[str] = None
 
 class RecycleItem(BaseModel):
     template_id: int
@@ -1040,19 +1043,31 @@ def build_pack_v2(req: PackBuildV2Request, db: Session = Depends(get_session)):
     }
     session_id = str(pack_session)
     expires_at = time.time() + auth_settings.claim_window_seconds if hasattr(auth_settings, "claim_window_seconds") else time.time() + 3600
-    mirror = SessionMirror(
-        session_id=session_id,
-        user=req.wallet,
-        rarities=",".join(rarities),
-        asset_ids=",".join(rare_assets),
-        server_seed_hash=SERVER_SEED_HASH,
-        server_nonce=nonce,
-        state="building",
-        created_at=time.time(),
-        expires_at=expires_at,
-        template_ids=templates_to_csv(template_ids),
-        version=2,
-    )
+    mirror = db.get(SessionMirror, session_id)
+    if not mirror:
+        mirror = SessionMirror(
+            session_id=session_id,
+            user=req.wallet,
+            rarities=",".join(rarities),
+            asset_ids=",".join(rare_assets),
+            server_seed_hash=SERVER_SEED_HASH,
+            server_nonce=nonce,
+            state="building",
+            created_at=time.time(),
+            expires_at=expires_at,
+            template_ids=templates_to_csv(template_ids),
+            version=2,
+        )
+    else:
+        mirror.user = req.wallet
+        mirror.rarities = ",".join(rarities)
+        mirror.asset_ids = ",".join(rare_assets)
+        mirror.server_seed_hash = SERVER_SEED_HASH
+        mirror.server_nonce = nonce
+        mirror.state = "building"
+        mirror.expires_at = expires_at
+        mirror.template_ids = templates_to_csv(template_ids)
+        mirror.version = 2
     db.add(mirror)
     db.commit()
 
@@ -1293,15 +1308,15 @@ def confirm_open_v2(req: ConfirmOpenRequest, db: Session = Depends(get_session))
     if resp.value is None or resp.value.data is None:
         raise HTTPException(status_code=400, detail="Pack session v2 not found on-chain after confirmation")
     info = parse_pack_session_v2_account(bytes(resp.value.data))
-    if not info or info.get("state") != "pending":
-        raise HTTPException(status_code=400, detail=f"Unexpected on-chain session state {info.get('state') if info else 'unknown'}")
+    if not info:
+        raise HTTPException(status_code=400, detail="Unable to parse on-chain session")
+    if info.get("state") != "pending":
+        raise HTTPException(status_code=400, detail=f"Unexpected on-chain session state {info.get('state')}")
 
     session_id = str(pack_session)
     mirror = db.get(SessionMirror, session_id)
-    if not mirror:
-        raise HTTPException(status_code=400, detail="Missing local lineup for session; please rebuild and retry")
-    rarities = mirror.rarities.split(",")
-    template_ids = parse_templates(mirror.template_ids)
+    rarities = mirror.rarities.split(",") if mirror else []
+    template_ids = parse_templates(mirror.template_ids) if mirror else []
 
     rare_cards = info.get("rare_cards", [])
     rare_assets: List[str] = []
@@ -1324,15 +1339,31 @@ def confirm_open_v2(req: ConfirmOpenRequest, db: Session = Depends(get_session))
             rec.updated_at = now
             db.add(rec)
 
-    mirror.state = "pending"
-    mirror.asset_ids = ",".join(rare_assets)
-    mirror.expires_at = float(info.get("expires_at", mirror.expires_at))
-    mirror.server_nonce = info.get("client_seed_hash", b"").hex()
-    mirror.version = 2
+    if not mirror:
+        mirror = SessionMirror(
+            session_id=session_id,
+            user=wallet,
+            rarities=",".join(rarities),
+            asset_ids=",".join(rare_assets),
+            server_seed_hash=SERVER_SEED_HASH,
+            server_nonce=info.get("client_seed_hash", b"").hex(),
+            state="pending",
+            created_at=float(info.get("created_at", now)),
+            expires_at=float(info.get("expires_at", now + 3600)),
+            template_ids=",".join(str(t) for t in template_ids),
+            version=2,
+        )
+    else:
+        mirror.state = "pending"
+        if rarities:
+            mirror.rarities = ",".join(rarities)
+        mirror.asset_ids = ",".join(rare_assets)
+        mirror.expires_at = float(info.get("expires_at", mirror.expires_at))
+        mirror.server_nonce = info.get("client_seed_hash", b"").hex()
+        mirror.version = 2
     db.add(mirror)
     db.commit()
 
-    # Add low-tier virtual cards to the user's inventory.
     mutate_virtual_cards(wallet, low_tier_virtual_items(rarities, template_ids), db, direction=1)
     return {"state": "pending", "assets": rare_assets}
 
@@ -1385,6 +1416,33 @@ def confirm_claim_v2(req: ConfirmClaimRequest, db: Session = Depends(get_session
         db.add(mirror)
     db.commit()
     return {"state": state, "assets": assets}
+
+
+@app.post("/program/v2/claim/cleanup")
+def claim_cleanup(req: ClaimCleanupRequest, db: Session = Depends(get_session)):
+    """Best-effort cleanup if UI and on-chain get out of sync after claim/sellback/expire."""
+    wallet = req.wallet
+    vault_state = vault_state_pda()
+    pack_session = pack_session_v2_pda(vault_state, to_pubkey(wallet))
+    resp = sol_client.get_account_info(pack_session)
+    if resp.value and resp.value.data:
+        info = parse_pack_session_v2_account(bytes(resp.value.data))
+        if info and info.get("state") != "pending":
+            # Mirror to DB and let frontend reopen
+            mirror = db.get(SessionMirror, str(pack_session))
+            if mirror:
+                mirror.state = info.get("state", mirror.state)
+                mirror.expires_at = float(info.get("expires_at", mirror.expires_at))
+                mirror.version = 2
+                db.add(mirror)
+                db.commit()
+            return {"state": info.get("state"), "cleared": False}
+    # If no account or already cleared, delete mirrors
+    mirror = db.get(SessionMirror, str(pack_session))
+    if mirror:
+        db.delete(mirror)
+        db.commit()
+    return {"state": "cleared", "cleared": True}
 
 
 @app.post("/program/sellback/confirm")
@@ -1596,43 +1654,89 @@ def profile(wallet: str):
 @app.get("/program/v2/session/pending", response_model=PendingSessionResponse)
 def get_pending_session_v2(wallet: str, db: Session = Depends(get_session)):
     now = time.time()
-    stmt = select(SessionMirror).where(
-        SessionMirror.user == wallet,
-        SessionMirror.state == "pending",
-        SessionMirror.expires_at > now,
-        SessionMirror.version == 2,
-    )
-    mirror = db.exec(stmt).first()
-    if not mirror:
-        raise HTTPException(status_code=404, detail="No active v2 session")
+    vault_state = vault_state_pda()
+    pack_session = pack_session_v2_pda(vault_state, to_pubkey(wallet))
+    resp = sol_client.get_account_info(pack_session)
+    if resp.value is None or resp.value.data is None:
+        # Clear any stale mirror
+        mirror = db.get(SessionMirror, str(pack_session))
+        if mirror:
+            db.delete(mirror)
+            db.commit()
+        raise HTTPException(status_code=404, detail="No active session")
+    info = parse_pack_session_v2_account(bytes(resp.value.data))
+    if not info:
+        raise HTTPException(status_code=400, detail="Unable to parse on-chain session")
+    state = info.get("state")
+    if state != "pending":
+        # Update mirror and return 404 so UI can open again
+        mirror = db.get(SessionMirror, str(pack_session))
+        if mirror:
+            mirror.state = state
+            mirror.expires_at = float(info.get("expires_at", mirror.expires_at))
+            db.add(mirror)
+            db.commit()
+        raise HTTPException(status_code=404, detail=f"No pending session (state={state})")
 
-    assets = parse_asset_ids(mirror.asset_ids)
-    rarities = mirror.rarities.split(",") if mirror.rarities else []
-    templates = parse_templates(mirror.template_ids)
+    mirror = db.get(SessionMirror, str(pack_session))
+    # Prefer mirror for full lineup
+    rarities = mirror.rarities.split(",") if mirror and mirror.rarities else []
+    templates = parse_templates(mirror.template_ids) if mirror and mirror.template_ids else []
+    assets = parse_asset_ids(mirror.asset_ids) if mirror and mirror.asset_ids else []
+
+    # Build rare set from on-chain rare_cards
+    rare_templates = set(info.get("rare_templates", []) or [])
+    rare_indices = {idx for idx, r in enumerate(rarities) if rarity_is_rare_plus(r)}
+    # If mirror missing, fallback minimal
+    if not rarities and mirror:
+        rarities = mirror.rarities.split(",") if mirror.rarities else []
+        templates = parse_templates(mirror.template_ids) if mirror.template_ids else []
     lineup: List[PackSlot] = []
-    rare_set = set(idx for idx, r in enumerate(rarities) if rarity_is_rare_plus(r))
-    for idx in range(max(len(rarities), len(templates), PACK_CARD_COUNT)):
-        if idx >= len(rarities):
-            break
+    for idx, rarity in enumerate(rarities):
         tmpl_id = templates[idx] if idx < len(templates) else None
-        rarity = rarities[idx]
+        is_nft = rarity_is_rare_plus(rarity) or (tmpl_id in rare_templates) or (idx in rare_indices)
         lineup.append(
             PackSlot(
                 slot_index=idx,
                 rarity=rarity,
                 template_id=tmpl_id,
-                is_nft=idx in rare_set,
+                is_nft=is_nft,
             )
         )
 
-    countdown = int(max(0, mirror.expires_at - now))
+    countdown = int(max(0, info.get("expires_at", now) - now))
     provably_fair = {
-        "server_seed_hash": mirror.server_seed_hash,
-        "server_nonce": mirror.server_nonce,
-        "assets": mirror.asset_ids,
-        "rarities": mirror.rarities,
-        "templates": mirror.template_ids,
+        "server_seed_hash": SERVER_SEED_HASH,
+        "server_nonce": info.get("client_seed_hash", b"").hex(),
+        "assets": ",".join(assets),
+        "rarities": ",".join(rarities),
+        "templates": ",".join(str(t) for t in templates),
     }
+
+    # Upsert mirror to match on-chain
+    if not mirror:
+        mirror = SessionMirror(
+            session_id=str(pack_session),
+            user=wallet,
+            rarities=",".join(rarities),
+            asset_ids=",".join(assets),
+            server_seed_hash=SERVER_SEED_HASH,
+            server_nonce=info.get("client_seed_hash", b"").hex(),
+            state="pending",
+            created_at=float(info.get("created_at", now)),
+            expires_at=float(info.get("expires_at", now + 3600)),
+            template_ids=",".join(str(t) for t in templates),
+            version=2,
+        )
+    else:
+        mirror.state = "pending"
+        mirror.asset_ids = ",".join(assets)
+        mirror.rarities = ",".join(rarities)
+        mirror.template_ids = ",".join(str(t) for t in templates)
+        mirror.expires_at = float(info.get("expires_at", mirror.expires_at))
+        mirror.version = 2
+    db.add(mirror)
+    db.commit()
 
     return PendingSessionResponse(
         session_id=mirror.session_id,

@@ -4,6 +4,7 @@ import { useState, useEffect, useMemo, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useWallet } from '@solana/wallet-adapter-react';
 import {
+  api,
   buildPack,
   claimPack,
   previewPack,
@@ -14,6 +15,8 @@ import {
   confirmOpen,
   confirmClaim,
   confirmExpire,
+  fetchVirtualCards,
+  VirtualCard,
 } from '../../lib/api';
 import { buildV0Tx } from '../../lib/tx';
 import { deriveAta } from '../../lib/ata';
@@ -171,6 +174,7 @@ export default function GachaPage() {
   const [resumeLoading, setResumeLoading] = useState(false);
   const [openSignature, setOpenSignature] = useState<string | null>(null);
   const [confirmDone, setConfirmDone] = useState(false);
+  const [virtualCards, setVirtualCards] = useState<VirtualCard[]>([]);
   const packOptions = useMemo(
     () => [
       { id: 'meg_web_alt', name: 'Mega Evolutions Pack', priceSol: 0.12, priceUsdc: 12, image: '/img/pack_alt.jpg' },
@@ -321,9 +325,13 @@ export default function GachaPage() {
   useEffect(() => {
     if (!publicKey) {
       resetSessionState();
+      setVirtualCards([]);
       return;
     }
     hydrateSession();
+    fetchVirtualCards(publicKey.toBase58())
+      .then(setVirtualCards)
+      .catch(() => setVirtualCards([]));
   }, [publicKey, hydrateSession, resetSessionState]);
 
   const handlePreview = async () => {
@@ -409,6 +417,7 @@ export default function GachaPage() {
         }
         setConfirmDone(true);
         await hydrateSession({ interactive: true, fresh: true });
+        fetchVirtualCards(publicKey.toBase58()).then(setVirtualCards).catch(() => {});
         setStatusKind('info');
         setStatusMsg('Pack opened and locked. Reveal, then claim or sell back.');
       } catch (err) {
@@ -451,10 +460,13 @@ export default function GachaPage() {
       const signed = signTransaction ? await signTransaction(tx) : tx;
       setStatusMsg('Submitting claim…');
       const sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
-      await confirmClaim(sig, publicKey.toBase58(), 'claim');
+      await confirmClaim(sig, publicKey.toBase58(), 'claim').catch(async () => {
+        await api.post('/program/v2/claim/cleanup', { wallet: publicKey.toBase58() });
+      });
       setStatusMsg(`Claimed! Tx: ${sig}`);
       resetSessionState();
       hydrateSession();
+      fetchVirtualCards(publicKey.toBase58()).then(setVirtualCards).catch(() => {});
     } catch (e) {
       console.error('claim error', e);
       setStatusKind('error');
@@ -488,9 +500,12 @@ export default function GachaPage() {
       const signed = signTransaction ? await signTransaction(tx) : tx;
       setStatusMsg('Submitting sell-back transaction…');
       const sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
-      await confirmClaim(sig, publicKey.toBase58(), 'sellback');
+      await confirmClaim(sig, publicKey.toBase58(), 'sellback').catch(async () => {
+        await api.post('/program/v2/claim/cleanup', { wallet: publicKey.toBase58() });
+      });
       setStatusMsg(`Sell-back tx: ${sig}`);
       resetSessionState();
+      fetchVirtualCards(publicKey.toBase58()).then(setVirtualCards).catch(() => {});
     } catch (e) {
       console.error('sellback error', e);
       setStatusKind('error');
@@ -514,6 +529,7 @@ export default function GachaPage() {
       await confirmExpire(sig, publicKey.toBase58());
       setStatusMsg(`Expire session tx: ${sig}`);
       resetSessionState();
+      fetchVirtualCards(publicKey.toBase58()).then(setVirtualCards).catch(() => {});
     } catch (e) {
       console.error('expire error', e);
       setStatusKind('error');
@@ -557,11 +573,14 @@ export default function GachaPage() {
     return slots.map((slot, idx) => {
       const template = slot.template_id ? templateMap[slot.template_id] : undefined;
       const isRevealed = revealed[idx];
+      const isNft = !!slot.is_nft || ['rare','doublerare','ultrarare','illustrationrare','specialillustrationrare','megahyperrare'].includes((slot.rarity || '').replace(/\\s+/g,'').toLowerCase());
       return {
         ...slot,
         displayName: template?.name || `Template ${slot.template_id ?? 'TBD'}`,
         image: isRevealed ? template?.image || '/card_back.png' : '/card_back.png',
         revealed: isRevealed,
+        is_nft: isNft,
+        badge: isNft ? 'NFT' : 'Virtual',
       };
     });
   }, [slots, templatesByPack, selectedPack, revealed]);
@@ -617,8 +636,11 @@ export default function GachaPage() {
       }}
     >
       <div className={`h-full w-full rounded-2xl bg-gradient-to-br ${rarityColors[slot.rarity] || 'from-white/10 to-white/5'} flex flex-col justify-between p-2 overflow-hidden`}>
-        <div className={`text-xs uppercase text-white/60 px-2 pt-2 ${i <= revealIndex ? 'opacity-100' : 'opacity-40'}`}>
-          Slot {i + 1}
+        <div className="flex items-center justify-between px-2 pt-2 text-xs uppercase">
+          <span className={`${i <= revealIndex ? 'text-white/80' : 'text-white/40'}`}>Slot {i + 1}</span>
+          <span className={`px-2 py-1 rounded-full text-[10px] font-semibold ${slot.is_nft ? 'bg-aurora/40 text-white' : 'bg-white/20 text-white/80'}`}>
+            {slot.is_nft ? 'NFT' : 'Virtual'}
+          </span>
         </div>
         <div className="flex-1 flex items-center justify-center">
           <img
@@ -789,6 +811,24 @@ export default function GachaPage() {
           }`}
         >
           {statusMsg}
+        </div>
+      )}
+
+      {virtualCards.length > 0 && (
+        <div className="rounded-3xl border border-white/10 bg-white/5 p-4">
+          <div className="flex items-center gap-2 mb-3">
+            <div className="h-2 w-2 rounded-full bg-aurora" />
+            <p className="text-sm text-white/80 font-semibold">Your virtual cards (Commons/Uncommons/Energy)</p>
+          </div>
+          <div className="grid sm:grid-cols-2 md:grid-cols-3 gap-2">
+            {virtualCards.map((vc) => (
+              <div key={`${vc.template_id}-${vc.rarity}`} className="rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white/80 flex items-center justify-between">
+                <span>{vc.rarity} #{vc.template_id}</span>
+                <span className="font-semibold">x{vc.count}</span>
+              </div>
+            ))}
+          </div>
+          <p className="text-xs text-white/60 mt-2">Recycle coming next: trade low-tier cards for Mochi tokens.</p>
         </div>
       )}
 
