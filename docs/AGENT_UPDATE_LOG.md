@@ -203,3 +203,20 @@ Next steps:
 - Backend: new `POST /admin/sessions/force_close` that deserializes the pack_session PDA, builds the new ix with the admin keypair, and frees card records + mirrors for the target wallet.
 - Frontend admin: added wallet input + “Force close session” button calling the new endpoint.
 - After deploy, backend and frontend services restarted; DB mirrors cleared and all 400 MintRecords set to Available/owned by the vault PDA.
+
+## 2025-11-28T11:05:00+08:00 – Codex
+- Added a Compute Budget ix (`set_compute_unit_limit` to 400_000 CUs) ahead of `open_pack_start` in `/program/open/build` to stop pack opens from reverting at the 200k CU cap while reserving 11 CardRecords.
+- Restarted `mochi-backend.service` to apply the change; no API shape changes (tx now has one extra instruction before `open_pack_start`).
+
+## 2025-11-28T11:35:00+08:00 – Codex
+- Hardened gacha UX: the Buy flow now waits for wallet signature + `/program/open/confirm` success before rendering any lineup/session. If the open tx fails/reverts, local session state is cleared and the Buy button re-enables.
+- `hydrateSession` now supports `{interactive, fresh}` to differentiate resume vs new opens (fresh keeps cards face-down). Added messaging for confirmed opens.
+- Rebuilt frontend (`npm run build`) and restarted `mochi-frontend.service`.
+
+## 2025-11-28T11:55:00+08:00 – Codex
+- Backend: `wait_for_confirmation` now treats any signature with `err` as failure; `/program/open/confirm` returns “Signature not confirmed or transaction failed” instead of later “pack session not found” when the open tx reverts.
+- Restarted `mochi-backend.service` after the guard.
+
+## 2025-11-28T12:36:00+08:00 – Codex
+- Frontend: Buy flow now only calls `/program/open/confirm` after `sendTransaction` succeeds; if the send throws or returns no signature, it surfaces the error and clears local session state (no confirm call).
+- Rebuilt frontend (`npm run build`) and restarted `mochi-frontend.service`.

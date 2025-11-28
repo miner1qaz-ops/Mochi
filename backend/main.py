@@ -20,6 +20,7 @@ from solders.keypair import Keypair as SoldersKeypair
 from solders.hash import Hash
 from solders.message import MessageV0
 from solders.transaction import VersionedTransaction
+from solders.compute_budget import set_compute_unit_limit
 from solana.rpc.api import Client as SolanaClient
 from solana.rpc.types import TxOpts
 from sqlmodel import Field, Session, SQLModel, create_engine, select, func
@@ -465,7 +466,13 @@ def pick_template_ids(rng: random.Random, rarities: List[str], db: Session) -> L
     return result
 
 
-def choose_assets_for_templates(template_ids: List[Optional[int]], rarities: List[str], wallet: str, db: Session) -> List[str]:
+def choose_assets_for_templates(
+    template_ids: List[Optional[int]],
+    rarities: List[str],
+    wallet: str,
+    db: Session,
+    reserve: bool = False,
+) -> List[str]:
     asset_ids: List[str] = []
     for idx, tmpl in enumerate(template_ids):
         if tmpl is None:
@@ -475,12 +482,14 @@ def choose_assets_for_templates(template_ids: List[Optional[int]], rarities: Lis
         record = db.exec(stmt).first()
         if not record:
             raise HTTPException(status_code=400, detail=f"No available asset for template {tmpl} (slot {idx})")
-        record.status = "reserved"
-        record.owner = wallet
-        record.updated_at = time.time()
-        db.add(record)
+        if reserve:
+            record.status = "reserved"
+            record.owner = wallet
+            record.updated_at = time.time()
+            db.add(record)
         asset_ids.append(record.asset_id)
-    db.commit()
+    if reserve:
+        db.commit()
     return asset_ids
 
 
@@ -740,25 +749,14 @@ def build_pack(req: PackBuildRequest, db: Session = Depends(get_session)):
     rng = build_rng(auth_settings.server_seed, req.client_seed)
     rarities = slot_rarities(rng)
     template_ids = pick_template_ids(rng, rarities, db)
-    asset_ids = choose_assets_for_templates(template_ids, rarities, req.wallet, db)
+    # Select available assets but DO NOT reserve or mirror until on-chain confirm succeeds.
+    asset_ids = choose_assets_for_templates(template_ids, rarities, req.wallet, db, reserve=False)
 
     if "" in asset_ids:
         missing_idx = asset_ids.index("")
         raise HTTPException(status_code=400, detail=f"Missing asset for slot {missing_idx}")
 
     session_id = str(uuid.uuid4())
-    mirror = SessionMirror(
-        session_id=session_id,
-        user=req.wallet,
-        rarities=",".join(rarities),
-        asset_ids=",".join(asset_ids),
-        server_seed_hash=SERVER_SEED_HASH,
-        server_nonce=nonce,
-        state="pending",
-        expires_at=time.time() + 3600,
-    )
-    db.add(mirror)
-    db.commit()
 
     vault_authority = vault_authority_pda(vault_state)
     treasury = treasury_pubkey()
@@ -785,7 +783,9 @@ def build_pack(req: PackBuildRequest, db: Session = Depends(get_session)):
         user_currency_token=user_token_account,
         vault_currency_token=vault_token_account,
     )
-    instructions = [open_ix]
+    # Increase compute to avoid hitting the 200k CU cap when reserving 11 cards.
+    compute_ix = set_compute_unit_limit(units=400_000)
+    instructions = [compute_ix, open_ix]
     blockhash = get_latest_blockhash()
     tx_b64 = message_from_instructions(instructions, to_pubkey(req.wallet), blockhash)
     tx_v0_b64 = versioned_tx_b64(to_pubkey(req.wallet), blockhash, instructions)
@@ -913,8 +913,12 @@ def wait_for_confirmation(signature: str, timeout_sec: int = 30) -> bool:
         sig_obj = signature  # fallback to raw string
     while time.time() - start < timeout_sec:
         resp = sol_client.get_signature_statuses([sig_obj])
-        if resp.value and resp.value[0] and resp.value[0].confirmation_status:
-            return True
+        if resp.value and resp.value[0]:
+            status = resp.value[0]
+            if status.err is not None:
+                return False
+            if status.confirmation_status:
+                return True
         time.sleep(0.8)
     return False
 
@@ -990,7 +994,7 @@ def confirm_open(req: ConfirmOpenRequest, db: Session = Depends(get_session)):
     signature = req.signature
     wallet = req.wallet
     if not wait_for_confirmation(signature):
-        raise HTTPException(status_code=400, detail="Signature not confirmed")
+        raise HTTPException(status_code=400, detail="Signature not confirmed or transaction failed")
     # Verify on-chain session is pending and cards are reserved for the user.
     vault_state = vault_state_pda()
     pack_session = pack_session_pda(vault_state, to_pubkey(wallet))
@@ -1005,6 +1009,7 @@ def confirm_open(req: ConfirmOpenRequest, db: Session = Depends(get_session)):
         raise HTTPException(status_code=400, detail="Incomplete card_record_keys in pack_session")
     now = time.time()
     assets: list[str] = []
+    rarities: list[str] = []
     for cr in card_records:
         cr_resp = sol_client.get_account_info(cr)
         if cr_resp.value is None or cr_resp.value.data is None:
@@ -1015,6 +1020,7 @@ def confirm_open(req: ConfirmOpenRequest, db: Session = Depends(get_session)):
         if record_info["status"] != 1 or str(record_info["owner"]) != wallet:  # 1 = Reserved
             raise HTTPException(status_code=400, detail="Cards are not reserved; please reset and reopen the pack.")
         assets.append(str(record_info["core_asset"]))
+        rarities.append(record_info["rarity"])
         # Update mirror/status in DB
         rec = db.get(MintRecord, str(record_info["core_asset"]))
         if rec:
@@ -1029,7 +1035,7 @@ def confirm_open(req: ConfirmOpenRequest, db: Session = Depends(get_session)):
         mirror = SessionMirror(
             session_id=session_id,
             user=wallet,
-            rarities="",
+            rarities=",".join(rarities),
             asset_ids=",".join(assets),
             server_seed_hash=SERVER_SEED_HASH,
             server_nonce=info.get("client_seed_hash", b"").hex(),
@@ -1040,6 +1046,7 @@ def confirm_open(req: ConfirmOpenRequest, db: Session = Depends(get_session)):
     else:
         mirror.state = "pending"
         mirror.asset_ids = ",".join(assets)
+        mirror.rarities = ",".join(rarities) or mirror.rarities
         mirror.expires_at = float(info.get("expires_at", mirror.expires_at))
     db.add(mirror)
     db.commit()

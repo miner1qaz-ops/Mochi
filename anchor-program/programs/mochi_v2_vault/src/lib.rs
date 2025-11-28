@@ -65,6 +65,10 @@ mod mochi_v2_vault {
 
         let (card_accounts, _asset_accounts, extra_accounts) =
             partition_pack_accounts(&ctx.remaining_accounts)?;
+        msg!("open_pack_start rem len {}", ctx.remaining_accounts.len());
+        for (i, ai) in ctx.remaining_accounts.iter().enumerate() {
+            msg!("  rem[{}] = {}", i, ai.key);
+        }
         let mut user_token: Option<Account<'info, TokenAccount>> = None;
         let mut vault_token: Option<Account<'info, TokenAccount>> = None;
         if currency == Currency::Token {
@@ -119,19 +123,6 @@ mod mochi_v2_vault {
         }
 
         let mut card_record_keys: [Pubkey; PACK_CARD_COUNT] = [Pubkey::default(); PACK_CARD_COUNT];
-        for (idx, acc_info) in card_accounts.iter().enumerate() {
-            let card_record: Account<CardRecord> = Account::try_from(acc_info)?;
-            require_keys_eq!(
-                card_record.vault_state,
-                ctx.accounts.vault_state.key(),
-                MochiError::VaultMismatch
-            );
-            require!(
-                card_record.status == CardStatus::Available,
-                MochiError::CardNotAvailable
-            );
-            card_record_keys[idx] = acc_info.key();
-        }
 
         let session = &mut ctx.accounts.pack_session;
         require!(
@@ -157,12 +148,21 @@ mod mochi_v2_vault {
         session.client_seed_hash = client_seed_hash;
         session.rarity_prices = rarity_prices;
 
-        // Mark CardRecords as Reserved and set owner = user
-        for acc_info in card_accounts.iter() {
+        // Validate + Reserve CardRecords in one pass
+        for (idx, acc_info) in card_accounts.iter().enumerate() {
             let mut card_record: Account<CardRecord> = Account::try_from(acc_info)?;
+            require_keys_eq!(
+                card_record.vault_state,
+                ctx.accounts.vault_state.key(),
+                MochiError::VaultMismatch
+            );
+            require!(
+                card_record.status == CardStatus::Available,
+                MochiError::CardNotAvailable
+            );
+            card_record_keys[idx] = acc_info.key();
             card_record.status = CardStatus::Reserved;
             card_record.owner = ctx.accounts.user.key();
-            // Custody remains in vault_authority; no transfer here
         }
         Ok(())
     }

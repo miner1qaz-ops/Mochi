@@ -268,7 +268,7 @@ export default function GachaPage() {
   }, []);
 
   const hydrateSession = useCallback(
-    async (interactive = false) => {
+    async ({ interactive = false, fresh = false }: { interactive?: boolean; fresh?: boolean } = {}) => {
       if (!publicKey) return;
       if (interactive) {
         setResumeLoading(true);
@@ -278,10 +278,10 @@ export default function GachaPage() {
         const pending = await fetchActiveSession(publicKey.toBase58());
         setSessionId(pending.session_id);
         setSlots(pending.lineup);
-        setRevealed(Array(pending.lineup.length).fill(true));
-        setRevealIndex(pending.lineup.length - 1);
-        setModalFaceBack(false);
-        setShowOneModal(false);
+        setRevealed(Array(pending.lineup.length).fill(fresh ? false : true));
+        setRevealIndex(fresh ? 0 : pending.lineup.length - 1);
+        setModalFaceBack(fresh ? true : false);
+        setShowOneModal(fresh ? revealMode === 'one' : false);
         setPackStage('reveal');
         setCountdown(pending.countdown_seconds);
         const fair = pending.provably_fair || {};
@@ -291,10 +291,10 @@ export default function GachaPage() {
           entropy_proof: fair.entropy_proof || fair.assets || '',
         });
         setClientProofSeed('');
-        setConfirmDone(true); // resuming implies session already exists on-chain; allow claim/sell
+        setConfirmDone(true); // session exists on-chain; allow claim/sell
         if (interactive) {
           setStatusKind('info');
-          setStatusMsg('Resumed your pending pack session. Claim or sell back before the timer ends.');
+          setStatusMsg(fresh ? 'Pack opened and locked. Reveal, then claim or sell back.' : 'Resumed your pending pack session. Claim or sell back before the timer ends.');
         }
       } catch (err) {
         const axiosErr = err as AxiosError;
@@ -315,7 +315,7 @@ export default function GachaPage() {
         }
       }
     },
-    [publicKey, resetSessionState],
+    [publicKey, resetSessionState, revealMode],
   );
 
   useEffect(() => {
@@ -323,7 +323,7 @@ export default function GachaPage() {
       resetSessionState();
       return;
     }
-    hydrateSession(false);
+    hydrateSession();
   }, [publicKey, hydrateSession, resetSessionState]);
 
   const handlePreview = async () => {
@@ -363,7 +363,7 @@ export default function GachaPage() {
         vaultToken = vaultAta.toBase58();
         currencyMint = usdcMint.toBase58();
       }
-      const res = await buildPack(
+      const buildRes = await buildPack(
         clientSeed || crypto.randomUUID(),
         publicKey.toBase58(),
         useUsdc ? 'USDC' : 'SOL',
@@ -372,22 +372,9 @@ export default function GachaPage() {
         currencyMint,
         selectedPack === 'meg_web_alt' ? 'meg_web' : selectedPack
       );
-      setSlots(res.lineup);
-      setRevealed(Array(res.lineup.length).fill(false));
-      setRevealIndex(0);
-      setModalFaceBack(true);
-      if (revealMode === 'one') setShowOneModal(true);
-      setSessionId(res.session_id);
-      setCountdown(3600);
-      setProof({
-        server_seed_hash: res.provably_fair.server_seed_hash,
-        server_nonce: res.provably_fair.server_nonce,
-        entropy_proof: res.provably_fair.entropy_proof,
-      });
-      setClientProofSeed(clientSeed || '');
-      setPackStage('reveal');
+      // Do not render lineup/session yet; wait for on-chain confirmation.
       // Sign and send open pack transaction
-      const tx = buildV0Tx(publicKey, res.recent_blockhash, res.instructions);
+      const tx = buildV0Tx(publicKey, buildRes.recent_blockhash, buildRes.instructions);
       if (!signTransaction) {
         throw new Error('Wallet is not ready to sign transactions.');
       }
@@ -395,24 +382,42 @@ export default function GachaPage() {
       setStatusMsg('Awaiting wallet signature…');
       const signed = await signTransaction(tx);
       setStatusMsg('Submitting transaction…');
-      const sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
-      setStatusMsg(`Pack opened tx: ${sig}. Verifying cards…`);
+      let sig: string | null = null;
+      try {
+        sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
+      } catch (sendErr) {
+        console.error('sendTransaction failed', sendErr);
+        setStatusKind('error');
+        setStatusMsg(extractErrorMessage(sendErr));
+        resetSessionState();
+        return;
+      }
+      if (!sig) {
+        setStatusKind('error');
+        setStatusMsg('Transaction not submitted. Please try again.');
+        resetSessionState();
+        return;
+      }
       setOpenSignature(sig);
       setConfirmDone(false);
       // Auto-confirm immediately
       try {
         setConfirmLoading(true);
         setStatusMsg('Verifying on-chain session and locking cards…');
-        const res = await confirmOpen(sig, publicKey.toBase58());
-        if (!res || !res.state) {
+        const confirmRes = await confirmOpen(sig, publicKey.toBase58());
+        if (!confirmRes || !confirmRes.state) {
           throw new Error('Confirm failed – no state returned.');
         }
         setConfirmDone(true);
-        setStatusMsg(`Cards locked. State: ${res.state}. You can now claim or sell back.`);
+        await hydrateSession({ interactive: true, fresh: true });
+        setStatusKind('info');
+        setStatusMsg('Pack opened and locked. Reveal, then claim or sell back.');
       } catch (err) {
         console.error('confirm open error', err);
         setStatusKind('error');
         setStatusMsg(`${extractErrorMessage(err)}. If stuck, click Reset session then reopen.`);
+        // Clear any local session state to avoid ghost sessions.
+        resetSessionState();
       } finally {
         setConfirmLoading(false);
       }
@@ -420,6 +425,7 @@ export default function GachaPage() {
       console.error(e);
       setStatusKind('error');
       setStatusMsg(extractErrorMessage(e));
+      resetSessionState();
     } finally {
       setOpenLoading(false);
     }
@@ -754,7 +760,7 @@ export default function GachaPage() {
         <div className="flex gap-3">
           <button
             type="button"
-            onClick={() => hydrateSession(true)}
+            onClick={() => hydrateSession({ interactive: true })}
             className="px-4 py-2 rounded-xl bg-white/10 border border-white/10 text-sm disabled:opacity-50 disabled:cursor-not-allowed"
             disabled={resumeLoading || !publicKey}
           >
