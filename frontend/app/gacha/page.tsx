@@ -12,7 +12,8 @@ import {
   PackSlot,
   fetchActiveSession,
   confirmOpen,
-  resetPack,
+  confirmClaim,
+  confirmExpire,
 } from '../../lib/api';
 import { buildV0Tx } from '../../lib/tx';
 import { deriveAta } from '../../lib/ata';
@@ -152,7 +153,6 @@ export default function GachaPage() {
   const [sellbackLoading, setSellbackLoading] = useState(false);
   const [expireLoading, setExpireLoading] = useState(false);
   const [confirmLoading, setConfirmLoading] = useState(false);
-  const [resetLoading, setResetLoading] = useState(false);
   const [countdown, setCountdown] = useState<number | null>(null);
   const [proof, setProof] = useState<{ server_seed_hash: string; server_nonce: string; entropy_proof: string } | null>(null);
   const [clientProofSeed, setClientProofSeed] = useState<string>('');
@@ -369,8 +369,7 @@ export default function GachaPage() {
         useUsdc ? 'USDC' : 'SOL',
         userToken,
         vaultToken,
-        currencyMint,
-        selectedPack === 'meg_web_alt' ? 'meg_web' : selectedPack
+        currencyMint
       );
       // Do not render lineup/session yet; wait for on-chain confirmation.
       // Sign and send open pack transaction
@@ -415,7 +414,7 @@ export default function GachaPage() {
       } catch (err) {
         console.error('confirm open error', err);
         setStatusKind('error');
-        setStatusMsg(`${extractErrorMessage(err)}. If stuck, click Reset session then reopen.`);
+        setStatusMsg(`${extractErrorMessage(err)}. If stuck, try Sell Back or wait for expiry.`);
         // Clear any local session state to avoid ghost sessions.
         resetSessionState();
       } finally {
@@ -432,28 +431,12 @@ export default function GachaPage() {
   };
 
   const handleReset = async () => {
-    if (!publicKey || resetLoading) return;
-    setResetLoading(true);
-    try {
-      setStatusKind('info');
-      setStatusMsg('Resetting session… please sign reset tx.');
-      const res = await resetPack(publicKey.toBase58());
-      const tx = buildV0Tx(publicKey, res.recent_blockhash, res.instructions);
-      const signed = signTransaction ? await signTransaction(tx) : tx;
-      const sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
-      setStatusMsg(`Session reset tx: ${sig}. You may open a new pack.`);
-      resetSessionState();
-    } catch (e) {
-      console.error('reset error', e);
-      setStatusKind('error');
-      setStatusMsg(extractErrorMessage(e));
-    } finally {
-      setResetLoading(false);
-    }
+    setStatusKind('error');
+    setStatusMsg('Reset is disabled (v1 removed). If stuck, wait for expiry or use sell back.');
   };
 
   const handleClaim = async () => {
-    if (!sessionId || !publicKey || claimLoading) return;
+    if (!publicKey || claimLoading) return;
     if (!confirmDone) {
       setStatusKind('error');
       setStatusMsg('Please confirm cards before claiming.');
@@ -462,27 +445,16 @@ export default function GachaPage() {
     setClaimLoading(true);
     try {
       setStatusKind('info');
-      setStatusMsg('Building per-card claim transactions…');
-      // batch_flow returns an ordered list of txs (per-card or small batch) + finalize
-      const res = await fetch('/api/program/claim/batch_flow', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ wallet: publicKey.toBase58(), session_id: sessionId }),
-      }).then((r) => r.json());
-      if (!res?.txs || !Array.isArray(res.txs)) {
-        throw new Error(res?.detail || 'Failed to build claim batch');
-      }
-      // Send sequentially to avoid nonce reuse and to surface any failure early
-      for (let i = 0; i < res.txs.length; i += 1) {
-        const txResp = res.txs[i];
-        const tx = buildV0Tx(publicKey, txResp.recent_blockhash, txResp.instructions);
-        const signed = signTransaction ? await signTransaction(tx) : tx;
-        setStatusMsg(`Submitting claim ${i + 1}/${res.txs.length}…`);
-        const sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
-        console.log('claim chunk sig', sig);
-      }
-      setStatusMsg('All claim txs submitted. Finalizing…');
+      setStatusMsg('Building claim transaction…');
+      const res = await claimPack(publicKey.toBase58());
+      const tx = buildV0Tx(publicKey, res.recent_blockhash, res.instructions);
+      const signed = signTransaction ? await signTransaction(tx) : tx;
+      setStatusMsg('Submitting claim…');
+      const sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
+      await confirmClaim(sig, publicKey.toBase58(), 'claim');
+      setStatusMsg(`Claimed! Tx: ${sig}`);
       resetSessionState();
+      hydrateSession();
     } catch (e) {
       console.error('claim error', e);
       setStatusKind('error');
@@ -492,34 +464,8 @@ export default function GachaPage() {
     }
   };
 
-  // Test button: claim exactly 3 NFTs in one tx for benchmarking
-  const handleClaim3 = async () => {
-    if (!sessionId || !publicKey || claimLoading) return;
-    setClaimLoading(true);
-    try {
-      setStatusKind('info');
-      setStatusMsg('Building 3-NFT claim test tx…');
-      const res = await fetch('/api/program/claim/test3', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ wallet: publicKey.toBase58() }),
-      }).then((r) => r.json());
-      const tx = buildV0Tx(publicKey, res.recent_blockhash, res.instructions);
-      const signed = signTransaction ? await signTransaction(tx) : tx;
-      setStatusMsg('Submitting 3-NFT claim test…');
-      const sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
-      setStatusMsg(`3-NFT claim test tx: ${sig}`);
-    } catch (e) {
-      console.error('claim3 error', e);
-      setStatusKind('error');
-      setStatusMsg(extractErrorMessage(e));
-    } finally {
-      setClaimLoading(false);
-    }
-  };
-
   const handleSellback = async () => {
-    if (!sessionId || !publicKey || sellbackLoading) return;
+    if (!publicKey || sellbackLoading) return;
     if (!confirmDone) {
       setStatusKind('error');
       setStatusMsg('Please confirm cards before sell-back.');
@@ -529,11 +475,20 @@ export default function GachaPage() {
     try {
       setStatusKind('info');
       setStatusMsg('Building sell-back transaction…');
-      const res = await sellbackPack(sessionId, publicKey.toBase58());
+      let userToken: string | undefined;
+      let vaultToken: string | undefined;
+      if (useUsdc && usdcMint) {
+        const userAta = await deriveAta(publicKey, usdcMint);
+        const vaultAta = await deriveAta(vaultAuthorityPk(), usdcMint);
+        userToken = userAta.toBase58();
+        vaultToken = vaultAta.toBase58();
+      }
+      const res = await sellbackPack(publicKey.toBase58(), userToken, vaultToken);
       const tx = buildV0Tx(publicKey, res.recent_blockhash, res.instructions);
       const signed = signTransaction ? await signTransaction(tx) : tx;
       setStatusMsg('Submitting sell-back transaction…');
       const sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
+      await confirmClaim(sig, publicKey.toBase58(), 'sellback');
       setStatusMsg(`Sell-back tx: ${sig}`);
       resetSessionState();
     } catch (e) {
@@ -546,16 +501,17 @@ export default function GachaPage() {
   };
 
   const handleExpire = async () => {
-    if (!sessionId || !publicKey || expireLoading) return;
+    if (!publicKey || expireLoading) return;
     setExpireLoading(true);
     try {
       setStatusKind('info');
       setStatusMsg('Building expire transaction…');
-      const res = await expirePack(sessionId, publicKey.toBase58());
+      const res = await expirePack(publicKey.toBase58());
       const tx = buildV0Tx(publicKey, res.recent_blockhash, res.instructions);
       const signed = signTransaction ? await signTransaction(tx) : tx;
       setStatusMsg('Submitting expire transaction…');
       const sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
+      await confirmExpire(sig, publicKey.toBase58());
       setStatusMsg(`Expire session tx: ${sig}`);
       resetSessionState();
     } catch (e) {
@@ -819,24 +775,8 @@ export default function GachaPage() {
               Time left: <span className="font-semibold text-white">{countdown}s</span>
             </div>
           )}
-          <div className="text-white/60">Cards auto-verify after purchase. Reset if stuck.</div>
-        </div>
-      )}
-      {sessionId && (
-        <div className="flex flex-wrap gap-3">
-          <button
-            type="button"
-            onClick={handleReset}
-            disabled={resetLoading}
-            className="px-4 py-2 rounded-xl bg-white/10 border border-white/20 text-white disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            {resetLoading ? 'Resetting…' : 'Reset session'}
-          </button>
-          {openSignature && (
-            <span className="text-xs text-white/60 break-all">
-              Open tx: {openSignature}
-            </span>
-          )}
+          <div className="text-white/60">Cards auto-verify after purchase. If stuck, use Sell Back or wait for expiry.</div>
+          {openSignature && <span className="text-xs text-white/60 break-all">Open tx: {openSignature}</span>}
           {confirmLoading && <span className="text-xs text-white/60">Verifying cards…</span>}
         </div>
       )}
@@ -990,13 +930,6 @@ export default function GachaPage() {
           className="px-5 py-3 rounded-xl bg-aurora text-ink font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {claimLoading ? 'Claiming…' : confirmDone ? 'Keep cards' : 'Confirm cards first'}
-        </button>
-        <button
-          onClick={handleClaim3}
-          disabled={!sessionId || claimLoading || !confirmDone}
-          className="px-5 py-3 rounded-xl border border-white/20 text-white disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          {claimLoading ? 'Running test…' : 'Test claim 3 NFTs'}
         </button>
         <button
           onClick={handleSellback}

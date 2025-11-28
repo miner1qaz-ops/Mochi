@@ -9,7 +9,7 @@ crate-type = ["cdylib", "lib"]
 name = "mochi_v2_vault"
 
 [dependencies]
-anchor-lang = { workspace = true }
+anchor-lang = { workspace = true, features = ["init-if-needed"] }
 anchor-spl = { workspace = true, features = ["token", "associated_token"] }
 solana-program = { workspace = true }
 mpl-core = { workspace = true }

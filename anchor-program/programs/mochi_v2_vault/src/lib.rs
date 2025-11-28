@@ -57,8 +57,8 @@ mod mochi_v2_vault {
 
     /// New lightweight open: only Rare+ CardRecords are reserved on-chain (max 3).
     /// remaining_accounts: [rare_card_records...]
-    pub fn open_pack(
-        ctx: Context<OpenPackV2>,
+    pub fn open_pack<'info>(
+        ctx: Context<'_, '_, 'info, 'info, OpenPackV2<'info>>,
         currency: Currency,
         client_seed_hash: [u8; 32],
         rare_templates: Vec<u32>,
@@ -162,7 +162,7 @@ mod mochi_v2_vault {
         session.rare_card_keys = rare_keys;
         session.rare_templates = rare_templates;
         session.total_slots = PACK_CARD_COUNT as u8;
-        session.bump = ctx.bumps.get("pack_session").copied().unwrap_or_default();
+        session.bump = ctx.bumps.pack_session;
         Ok(())
     }
 

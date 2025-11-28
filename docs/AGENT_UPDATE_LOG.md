@@ -203,6 +203,9 @@ Next steps:
 - Tx builder now supports v2 layouts/signatures and derives the new PDA; added builders for open/claim/sellback/expire/admin v2 instructions.
 - Backend scaffolding for the hybrid inventory: VirtualCard/RecycleLog tables, v2 open/build/confirm + claim/sellback/expire endpoints using Rare+ CardRecords only, virtual low-tier tracking, and recycle build endpoint to mint Mochi tokens via admin mint authority.
 - Pack lineup slots now mark NFT vs virtual cards, SessionMirror stores template_ids/version, and admin rarity inventory aggregates virtual counts.
+- SQLite migrated: added SessionMirror.template_ids/version plus new tables virtualcard and recyclelog.
+- Devnet Mochi token minted for recycle testing: `3gqKrJoVx3gUXLHCsNQfpyZAuVagLHQFGtYgbtY3VEsn` (decimals=6), 1,000,000 tokens minted to ATA `AHN6zuPCSfHL548fCWnF9RBNMLDMv245VxgX8Xr6V4x`; backend `.env` updated (MOCHI_TOKEN_MINT/DECIMALS/RECYCLE_RATE).
+- Legacy mint `6rPGXw2imNPgiqUpA2Rq2doVVyyEXawxepip5YRQ2Jd7` accidentally minted max supply; mark unused.
 
 ## 2025-11-27T20:50:00+08:00 – Codex
 - Added on-chain `admin_force_close_session` instruction to forcibly close any pack_session (ignores state) and return card records to `Available`/vault ownership; redeployed `mochi_v2_vault` (sig `4pnMwuK9mZj4ZSnv3fk8QrPL5HUf7NNvgyhyrgAs2gtMsQ4yUSMQFxANBt8Lfb14D5jvV4Faw31CmHcnY5k7khgR`).
