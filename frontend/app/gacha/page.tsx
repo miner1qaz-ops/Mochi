@@ -174,6 +174,7 @@ export default function GachaPage() {
   const [resumeLoading, setResumeLoading] = useState(false);
   const [openSignature, setOpenSignature] = useState<string | null>(null);
   const [confirmDone, setConfirmDone] = useState(false);
+  const [opening, setOpening] = useState(false);
   const [virtualCards, setVirtualCards] = useState<VirtualCard[]>([]);
   const packOptions = useMemo(
     () => [
@@ -357,6 +358,7 @@ export default function GachaPage() {
     }
     setOpenSignature(null);
     setConfirmDone(false);
+    setOpening(true);
     setOpenLoading(true);
     try {
       setStatusMsg(null);
@@ -385,10 +387,10 @@ export default function GachaPage() {
       if (!signTransaction) {
         throw new Error('Wallet is not ready to sign transactions.');
       }
-      setStatusKind('info');
-      setStatusMsg('Awaiting wallet signature…');
-      const signed = await signTransaction(tx);
-      setStatusMsg('Submitting transaction…');
+        setStatusKind('info');
+        setStatusMsg('Awaiting wallet signature…');
+        const signed = await signTransaction(tx);
+        setStatusMsg('Submitting transaction…');
       let sig: string | null = null;
       try {
         sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
@@ -436,6 +438,7 @@ export default function GachaPage() {
       resetSessionState();
     } finally {
       setOpenLoading(false);
+      setOpening(false);
     }
   };
 
