@@ -672,6 +672,14 @@ export default function GachaPage() {
 
   return (
     <div className="space-y-8">
+      {opening && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
+          <div className="rounded-2xl border border-white/10 bg-white/10 px-6 py-4 text-white space-y-2">
+            <p className="text-lg font-semibold">Opening pack…</p>
+            <p className="text-sm text-white/70">Waiting for the transaction to confirm on-chain.</p>
+          </div>
+        </div>
+      )}
       <div className="card-blur rounded-3xl p-6 border border-white/5 grid lg:grid-cols-[1.1fr,0.9fr] gap-6 items-center">
         <div className="space-y-3">
           <div className="flex items-center gap-3">

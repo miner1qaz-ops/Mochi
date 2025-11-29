@@ -179,6 +179,7 @@ PACK_STATE_LABELS = [
     "rejected",
     "expired",
 ]
+LISTING_STATUS_LABELS = ["active", "filled", "cancelled", "burned", "deprecated"]
 CARD_STATUS_LABELS = [
     "available",
     "reserved",
@@ -778,6 +779,39 @@ def parse_pack_session_v2_account(data: bytes) -> Optional[dict]:
     }
 
 
+def parse_listing_account(data: bytes) -> Optional[dict]:
+    if len(data) < 8:
+        return None
+    offset = 8
+    min_len = offset + 32 * 3 + 8 + 1 + 1
+    if len(data) < min_len:
+        return None
+    vault_state = Pubkey.from_bytes(data[offset : offset + 32])
+    offset += 32
+    seller = Pubkey.from_bytes(data[offset : offset + 32])
+    offset += 32
+    core_asset = Pubkey.from_bytes(data[offset : offset + 32])
+    offset += 32
+    price_lamports = int.from_bytes(data[offset : offset + 8], "little")
+    offset += 8
+    currency_present = data[offset]
+    offset += 1
+    currency_mint = None
+    if currency_present == 1 and len(data) >= offset + 32:
+        currency_mint = Pubkey.from_bytes(data[offset : offset + 32])
+        offset += 32
+    status_idx = data[offset] if offset < len(data) else 0
+    status = LISTING_STATUS_LABELS[status_idx] if 0 <= status_idx < len(LISTING_STATUS_LABELS) else str(status_idx)
+    return {
+        "vault_state": vault_state,
+        "seller": seller,
+        "core_asset": core_asset,
+        "price_lamports": price_lamports,
+        "currency_mint": currency_mint,
+        "status": status,
+    }
+
+
 def templates_to_csv(templates: List[Optional[int]]) -> str:
     return ",".join("" if t is None else str(t) for t in templates)
 
@@ -1365,9 +1399,8 @@ def confirm_open_v2(req: ConfirmOpenRequest, db: Session = Depends(get_session))
     db.add(mirror)
     db.commit()
 
-    # Add low-tier virtuals on open; guard against double-add by checking mirror state
-    if not mirror or mirror.state != "pending":
-        mutate_virtual_cards(wallet, low_tier_virtual_items(rarities, template_ids), db, direction=1)
+    # Add low-tier virtuals on open
+    mutate_virtual_cards(wallet, low_tier_virtual_items(rarities, template_ids), db, direction=1)
     return {"state": on_state, "assets": rare_assets}
 
 
@@ -1827,16 +1860,31 @@ def recycle_build(req: RecycleBuildRequest, db: Session = Depends(get_session)):
 def marketplace_listings(db: Session = Depends(get_session)):
     stmt = select(MintRecord).where(MintRecord.status == "listed")
     rows = db.exec(stmt).all()
-    return [
-        ListingView(
-            core_asset=row.asset_id,
-            price_lamports=0,
-            seller=row.owner,
-            status=row.status,
-            currency_mint=None,
+    vault_state = vault_state_pda()
+    results: List[ListingView] = []
+    for row in rows:
+        listing_key = listing_pda(vault_state, to_pubkey(row.asset_id))
+        listing_info = None
+        try:
+            resp = sol_client.get_account_info(listing_key)
+            if resp.value and resp.value.data:
+                listing_info = parse_listing_account(bytes(resp.value.data))
+        except Exception:
+            listing_info = None
+        price = listing_info["price_lamports"] if listing_info else 0
+        seller = listing_info["seller"] if listing_info and listing_info.get("seller") else row.owner
+        status = listing_info["status"] if listing_info and listing_info.get("status") else row.status
+        currency_mint = listing_info.get("currency_mint") if listing_info else None
+        results.append(
+            ListingView(
+                core_asset=row.asset_id,
+                price_lamports=price,
+                seller=str(seller) if seller else row.owner,
+                status=status,
+                currency_mint=str(currency_mint) if currency_mint else None,
+            )
         )
-        for row in rows
-    ]
+    return results
 
 
 @app.post("/marketplace/list/build", response_model=TxResponse)
@@ -1845,25 +1893,41 @@ def marketplace_list(req: ListRequest, db: Session = Depends(get_session)):
     vault_authority = vault_authority_pda(vault_state)
     card_record = card_record_pda(vault_state, to_pubkey(req.core_asset))
     listing = listing_pda(vault_state, to_pubkey(req.core_asset))
+    core_asset = to_pubkey(req.core_asset)
     if not pda_exists(card_record):
-        raise HTTPException(status_code=400, detail="CardRecord PDA missing on-chain; deposit first")
+        # With deposit-on-list we can initialize card_record on the fly, but we still require a known template/rarity.
+        pass
+
+    stmt = select(MintRecord).where(MintRecord.asset_id == req.core_asset)
+    record = db.exec(stmt).first()
+    if not record or record.template_id is None or not record.rarity:
+        raise HTTPException(status_code=400, detail="Missing template/rarity metadata for this asset")
+    def rarity_index(val: str) -> int:
+        norm = normalized_rarity(val)
+        for idx, label in enumerate(RARITY_LABELS):
+            if normalized_rarity(label) == norm:
+                return idx
+        raise HTTPException(status_code=400, detail=f"Unsupported rarity {val}")
+    rarity_tag = rarity_index(record.rarity)
 
     ix = build_list_card_ix(
         seller=to_pubkey(req.wallet),
         vault_state=vault_state,
         card_record=card_record,
+        core_asset=core_asset,
         listing=listing,
         vault_authority=vault_authority,
         price_lamports=req.price_lamports,
         currency_mint=req.currency_mint,
+        template_id=record.template_id,
+        rarity_tag=rarity_tag,
     )
     blockhash = get_latest_blockhash()
     tx_b64 = message_from_instructions([ix], to_pubkey(req.wallet), blockhash)
+    tx_v0_b64 = versioned_tx_b64(to_pubkey(req.wallet), blockhash, [ix])
     instr = wrap_instruction_meta(instruction_to_dict(ix))
 
     # Mirror listing status
-    stmt = select(MintRecord).where(MintRecord.asset_id == req.core_asset)
-    record = db.exec(stmt).first()
     if record:
         record.status = "listed"
         record.owner = req.wallet
