@@ -198,6 +198,12 @@ Next steps:
 - Fixed both the user and admin force-expire flows by marking `vault_authority` writable in the CPI builders, and updated the resume/backfill logic so pending sessions with missing DB rows are re-created automatically.
 - Rebuilt the frontend and restarted both services after the changes.
 
+## 2025-11-29 – Codex
+- Marketplace list endpoint now returns a versioned tx (fixed undefined `tx_v0_b64`) and parses on-chain Listing PDAs so price/currency/seller/status reflect reality instead of zeros.
+- Added `scripts/test-listing.ts` to POST listing payloads against the API for fast debugging without the UI.
+- Rebuilt `/marketplace` into a live feed with framer-motion entrance, 3D tilt/foil cards, particle bursts on success, auto-refresh ticker, and SOL/USDC toggle for listing.
+- Added deposit-on-list: `list_card` now accepts `template_id`/`rarity`, can init `card_record` on the fly, and pulls the Core asset from the seller wallet into vault custody before marking the Listing active. Backend builder populates template/rarity from MintRecord and enforces rarity tag; CardRecord PDA seeds/listing seeds updated accordingly.
+
 ## 2025-11-28 – Codex
 - Introduced gacha v2 on-chain flow: new `PackSessionV2` PDA (`pack_session_v2` seed), Rare+ only reservations (max 3), and streamlined instructions `open_pack`, `claim_pack_v2`, `sellback_pack_v2`, `expire_session_v2`, and `admin_force_close_v2`. Added helper utilities and error codes for Rare+ validation.
 - Tx builder now supports v2 layouts/signatures and derives the new PDA; added builders for open/claim/sellback/expire/admin v2 instructions.
@@ -209,6 +215,7 @@ Next steps:
 - Backend v2 pending/resume now reads on-chain state, syncs mirrors, and returns 404 when the session is not pending. Confirm-open accepts pending/accepted states and preserves full lineup; added `/program/v2/claim/cleanup` for stuck mirrors. Treasury airdropped for sell-back tests.
 - Frontend gacha shows all 11 slots with NFT/Virtual badges, virtual inventory panel, and an explicit “Opening…” state after buy/confirm. Claim/sell-back/expire call cleanup on mismatch.
 - Profile page: virtual cards panel + recycle UI (devnet Mochi mint), name search, rarity/name sort, totals for NFTs/virtuals, denser grid, and per-NFT list button (builds list tx via backend). 
+- Always add virtual cards on confirm-open, even if mirror already pending; added gacha opening overlay and pushed fixes to avoid “accept” errors blocking flow.
 - Backend v2 pending/resume now reads on-chain state, syncs mirrors, and returns 404 when session is not pending. Confirm open preserves full lineup and adds virtual cards. Added `/program/v2/claim/cleanup` for stuck mirrors.
 - Frontend gacha shows all 11 slots with NFT/Virtual badges; virtual inventory panel added. Profile page now shows virtual cards and recycle UI (devnet token), with denser inventory grid and sort controls.
 
