@@ -20,7 +20,142 @@ export type PendingSession = {
   provably_fair: Record<string, string>;
 };
 
-export type VirtualCard = { template_id: number; rarity: string; count: number };
+export type VirtualCard = { template_id: number; rarity: string; count: number; name?: string; image_url?: string; is_energy?: boolean };
+export type Listing = {
+  core_asset: string;
+  price_lamports: number;
+  seller?: string;
+  status: string;
+  currency_mint?: string;
+  template_id?: number;
+  rarity?: string;
+  name?: string;
+  image_url?: string;
+};
+
+export type GarbageListing = {
+  listing: string;
+  vault_state: string;
+  seller: string;
+  core_asset: string;
+  price_lamports?: number;
+  status?: string;
+};
+
+export type SeedSaleState = {
+  sale: string;
+  authority: string;
+  mint: string;
+  seed_vault: string;
+  vault_authority: string;
+  treasury: string;
+  start_ts: number;
+  end_ts: number;
+  price_tokens_per_sol: number;
+  token_cap: number;
+  sol_cap_lamports: number;
+  sold_tokens: number;
+  raised_lamports: number;
+  is_canceled: boolean;
+  vault_balance?: number | null;
+  treasury_balance?: number | null;
+  contributor_count?: number | null;
+  tokens_remaining?: number | null;
+  sol_remaining?: number | null;
+  token_decimals: number;
+  user_contribution?: {
+    buyer: string;
+    contributed_lamports: number;
+    tokens_owed: number;
+    claimed: boolean;
+    pda: string;
+  } | null;
+};
+
+export type SeedContributeBuild = {
+  tx_b64: string;
+  tx_v0_b64: string;
+  recent_blockhash: string;
+  instructions: InstructionMeta[];
+  lamports: number;
+  tokens_owed: number;
+  sale: string;
+  mint: string;
+  start_ts: number;
+  end_ts: number;
+  contribution_pda: string;
+};
+
+export type SeedClaimBuild = {
+  tx_b64: string;
+  tx_v0_b64: string;
+  recent_blockhash: string;
+  instructions: InstructionMeta[];
+  claimable_tokens: number;
+  sale: string;
+  mint: string;
+  user_ata: string;
+  contribution_pda: string;
+};
+
+export type PricingSearchResult = {
+  template_id: number;
+  name: string;
+  set_name?: string | null;
+  rarity?: string | null;
+  image_url?: string | null;
+  mid_price?: number | null;
+  low_price?: number | null;
+  high_price?: number | null;
+  collected_at?: number | null;
+  display_price?: number | null;
+  fair_value?: number | null;
+  price_confidence?: string | null;
+  confidence_score?: string | null;
+  sparkline?: PricingHistoryPoint[];
+};
+
+export type PricingCardDetail = {
+  template_id: number;
+  source: string;
+  currency: string;
+  mid_price: number;
+  low_price: number;
+  high_price: number;
+  collected_at: number;
+  display_price: number;
+   fair_value: number;
+  avg_7d: number;
+  avg_30d: number;
+  spread_ratio?: number | null;
+  price_confidence: string;
+  confidence_score?: string | null;
+};
+
+export type PricingHistoryPoint = {
+  mid_price: number;
+  low_price: number;
+  high_price: number;
+  collected_at: number;
+  fair_value: number;
+};
+
+export type PricingPortfolioBreakdown = {
+  template_id: number;
+  name?: string | null;
+  count: number;
+  mid_price: number;
+  fair_value: number;
+  confidence_score?: string | null;
+  total_value_usd: number;
+};
+
+export type PricingStats = {
+  portfolio_total: number;
+  change_24h?: number | null;
+  last_valuation_at: number;
+  breakdown: PricingPortfolioBreakdown[];
+};
 
 export async function previewPack(client_seed: string, wallet: string, pack_type: string = 'meg_web') {
   const { data } = await api.post('/program/open/preview', { client_seed, wallet, pack_type });
@@ -74,8 +209,14 @@ export async function fetchActiveSession(wallet: string) {
   return data as PendingSession;
 }
 
-export async function confirmOpen(signature: string, wallet: string) {
-  const { data } = await api.post('/program/v2/open/confirm', { signature, wallet });
+export async function confirmOpen(
+  signature: string,
+  wallet: string,
+  rarities?: string[],
+  template_ids?: Array<number | null>,
+  server_nonce?: string,
+) {
+  const { data } = await api.post('/program/v2/open/confirm', { signature, wallet, rarities, template_ids, server_nonce });
   return data as { state: string; assets: string[] };
 }
 
@@ -113,4 +254,78 @@ export async function fillListing(core_asset: string, wallet: string) {
 export async function cancelListing(core_asset: string, wallet: string) {
   const { data } = await api.post('/marketplace/cancel/build', { core_asset, wallet });
   return data as { tx_b64: string; tx_v0_b64: string; recent_blockhash: string; instructions: InstructionMeta[] };
+}
+
+export async function fetchGarbageListings() {
+  const { data } = await api.get('/admin/marketplace/garbage');
+  return data as GarbageListing[];
+}
+
+export async function forceCancelGarbage(assets: string[], vault_state?: string) {
+  const { data } = await api.post('/admin/marketplace/force_cancel', { assets, vault_state });
+  return data as { ok: Array<{ asset: string; signature: string }>; errors: Array<{ asset: string; error: string }> };
+}
+
+export async function fetchListings() {
+  const { data } = await api.get('/marketplace/listings');
+  return data as Listing[];
+}
+
+export async function fetchPricesMock() {
+  const { data } = await api.post('/pricing/fetch', {});
+  return data as { ok: boolean; snapshots: number; source: string };
+}
+
+export async function searchPrices(query: string, limit: number = 20) {
+  const { data } = await api.get('/pricing/search', { params: { q: query, limit } });
+  return data as PricingSearchResult[];
+}
+
+export async function fetchPricingBySet(setName: string, limit: number = 200) {
+  const { data } = await api.get('/pricing/set', { params: { set_name: setName, limit } });
+  return data as PricingSearchResult[];
+}
+
+export async function fetchPricingSets() {
+  const { data } = await api.get('/pricing/sets');
+  return data as string[];
+}
+
+export async function fetchPricingCard(templateId: number) {
+  const { data } = await api.get(`/pricing/card/${templateId}`);
+  return data as PricingCardDetail;
+}
+
+export async function fetchPricingHistory(templateId: number) {
+  const { data } = await api.get(`/pricing/card/${templateId}/history`);
+  return data as PricingHistoryPoint[];
+}
+
+export async function fetchPricingSparklines(templateIds: number[], points: number = 30) {
+  const ids = templateIds.join(',');
+  const { data } = await api.get('/pricing/sparklines', { params: { template_ids: ids, points } });
+  return data as { template_id: number; points: PricingHistoryPoint[] }[];
+}
+
+export async function fetchPricingStats(wallet: string) {
+  const { data } = await api.get('/pricing/stats', { params: { wallet } });
+  return data as PricingStats;
+}
+
+export async function fetchSeedSaleState(wallet?: string) {
+  const { data } = await api.get('/seed_sale/state', { params: wallet ? { wallet } : undefined });
+  return data as SeedSaleState;
+}
+
+export async function buildSeedContribute(wallet: string, lamports?: number, sol?: number) {
+  const payload: any = { wallet };
+  if (lamports !== undefined) payload.lamports = lamports;
+  if (sol !== undefined) payload.sol = sol;
+  const { data } = await api.post('/seed_sale/contribute/build', payload);
+  return data as SeedContributeBuild;
+}
+
+export async function buildSeedClaim(wallet: string, user_token_account?: string) {
+  const { data } = await api.post('/seed_sale/claim/build', { wallet, user_token_account });
+  return data as SeedClaimBuild;
 }

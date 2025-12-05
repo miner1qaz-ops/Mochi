@@ -7,7 +7,7 @@ import os
 import random
 import time
 import uuid
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import requests
 from fastapi import Depends, FastAPI, HTTPException
@@ -23,7 +23,8 @@ from solders.message import MessageV0
 from solders.transaction import VersionedTransaction
 from solders.compute_budget import set_compute_unit_limit
 from solana.rpc.api import Client as SolanaClient
-from solana.rpc.types import TxOpts
+from solana.rpc.types import TxOpts, MemcmpOpts
+from sqlalchemy import Index, text
 from sqlmodel import Field, Session, SQLModel, create_engine, select, func
 
 from tx_builder import (
@@ -31,6 +32,8 @@ from tx_builder import (
     build_admin_force_close_session_ix,
     build_admin_force_close_v2_ix,
     build_admin_reset_session_ix,
+    build_admin_force_cancel_listing_ix,
+    build_admin_prune_listing_ix,
     build_user_reset_session_ix,
     build_expire_session_ix,
     build_expire_session_v2_ix,
@@ -38,23 +41,31 @@ from tx_builder import (
     build_claim_pack_v2_ix,
     build_fill_listing_ix,
     build_list_card_ix,
+    build_cancel_listing_ix,
     build_open_pack_ix,
     build_open_pack_v2_ix,
     build_sellback_pack_ix,
     build_sellback_pack_v2_ix,
-    build_expire_session_v2_ix,
-    build_admin_force_close_v2_ix,
+    build_seed_claim_ix,
+    build_seed_contribute_ix,
     card_record_pda,
     instruction_to_dict,
     listing_pda,
     message_from_instructions,
     pack_session_pda,
     pack_session_v2_pda,
+    seed_contribution_pda,
+    seed_sale_pda,
+    seed_vault_authority_pda,
+    seed_vault_token_pda,
+    PROGRAM_ID,
+    SEED_SALE_PROGRAM_ID,
     TOKEN_PROGRAM_ID,
     to_pubkey,
     vault_authority_pda,
     vault_state_pda,
     versioned_tx_b64,
+    build_system_transfer_ix,
 )
 
 
@@ -70,6 +81,11 @@ class Settings(BaseSettings):
     usdc_mint: Optional[str] = None
     mochi_token_mint: Optional[str] = None
     mochi_token_decimals: int = 6
+    listing_fee_mochi: int = 0  # raw smallest-unit amount
+    official_collections: Optional[str] = None  # comma-separated list of collection mints treated as official
+    seed_sale_authority: Optional[str] = None
+    seed_sale_mint: Optional[str] = None
+    seed_sale_treasury: Optional[str] = None
     recycle_rate: int = 10
     claim_window_seconds: int = 3600
     server_seed: str = os.environ.get("SERVER_SEED", "dev-server-seed")
@@ -86,6 +102,8 @@ auth_settings = Settings()
 engine = create_engine(auth_settings.database_url)
 sol_client = SolanaClient(auth_settings.solana_rpc)
 ADMIN_KEYPAIR: Optional[SoldersKeypair] = None
+ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_string("ATokenGPvR93dZczYEdiH7kXe1JgRQ1d2Cdu9pfAFu7h")
+SYSVAR_RENT_PUBKEY = Pubkey.from_string("SysvarRent111111111111111111111111111111111")
 
 
 class CardTemplate(SQLModel, table=True):
@@ -108,6 +126,7 @@ class MintRecord(SQLModel, table=True):
     status: str = Field(default="available")
     owner: Optional[str] = None
     updated_at: float = Field(default_factory=lambda: time.time())
+    is_fake: bool = Field(default=False)
 
 
 class SessionMirror(SQLModel, table=True):
@@ -141,8 +160,44 @@ class RecycleLog(SQLModel, table=True):
     created_at: float = Field(default_factory=lambda: time.time())
 
 
+class PriceSnapshot(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    template_id: int = Field(index=True)
+    source: str = Field(default="pokespider_tcgplayer")
+    currency: str = Field(default="USD")
+    market_price: float = Field(default=0)  # recent sales
+    direct_low: float = Field(default=0)  # lowest listing
+    mid_price: float = Field(default=0)
+    low_price: float = Field(default=0)
+    high_price: float = Field(default=0)
+    collected_at: float = Field(default_factory=lambda: time.time())
+
+    __table_args__ = (Index("idx_price_snapshot_template_ts", "template_id", "collected_at"),)
+
+
+def ensure_price_snapshot_schema():
+    """Lightweight migration helper for new pricing fields/indexes."""
+    with engine.begin() as conn:
+        existing_cols = set()
+        try:
+            rows = conn.execute(text("PRAGMA table_info('PriceSnapshot')")).fetchall()
+            existing_cols = {row[1] for row in rows}
+        except Exception:
+            existing_cols = set()
+        alters: List[Tuple[str, str]] = []
+        if "market_price" not in existing_cols:
+            alters.append(("ADD COLUMN market_price FLOAT DEFAULT 0", "market_price"))
+        if "direct_low" not in existing_cols:
+            alters.append(("ADD COLUMN direct_low FLOAT DEFAULT 0", "direct_low"))
+        for clause, col in alters:
+            conn.execute(text(f"ALTER TABLE PriceSnapshot {clause}"))
+        # ensure composite index for high-frequency inserts/reads
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_price_snapshot_template_ts ON PriceSnapshot (template_id, collected_at DESC)"))
+
+
 def init_db():
     SQLModel.metadata.create_all(engine)
+    ensure_price_snapshot_schema()
 
 
 def get_session():
@@ -227,6 +282,10 @@ RARITY_PRICE_LAMPORTS = {
     "Energy": 1_000_000,
 }
 
+# Seed sale constants
+MIN_SEED_CONTRIB_LAMPORTS = 10_000_000  # 0.01 SOL
+SEED_CONTRIBUTION_DISCRIMINATOR = bytes.fromhex("b6bb0e6f48a7f2d4")
+
 
 class PackPreviewRequest(BaseModel):
     pack_type: str = "meg_web"
@@ -302,6 +361,10 @@ class TestClaim3Request(BaseModel):
 class AdminResetRequest(BaseModel):
     wallet: str
 
+class AdminForceCancelListings(BaseModel):
+    assets: List[str]
+    vault_state: Optional[str] = None
+
 
 class PendingSessionResponse(BaseModel):
     session_id: str
@@ -334,6 +397,136 @@ class TxResponse(BaseModel):
     tx_v0_b64: str
     recent_blockhash: str
     instructions: List[InstructionMeta]
+
+
+class PricingCardResponse(BaseModel):
+    template_id: int
+    source: str
+    currency: str
+    mid_price: float
+    low_price: float
+    high_price: float
+    collected_at: float
+    display_price: float
+    fair_value: float
+    avg_7d: float
+    avg_30d: float
+    spread_ratio: Optional[float] = None
+    price_confidence: str
+    confidence_score: Optional[str] = None
+
+
+class PricingHistoryPoint(BaseModel):
+    mid_price: float
+    low_price: float
+    high_price: float
+    collected_at: float
+    fair_value: float
+
+
+class PricingPortfolioBreakdown(BaseModel):
+    template_id: int
+    name: Optional[str] = None
+    count: int
+    mid_price: float
+    fair_value: float
+    confidence_score: Optional[str] = None
+    total_value_usd: float
+
+
+class PricingPortfolioResponse(BaseModel):
+    total_value_usd: float
+    breakdown: List[PricingPortfolioBreakdown]
+
+
+class PricingStatsResponse(BaseModel):
+    portfolio_total: float
+    change_24h: Optional[float] = None
+    last_valuation_at: float
+    breakdown: List[PricingPortfolioBreakdown]
+
+
+class PricingSearchItem(BaseModel):
+    template_id: int
+    name: str
+    set_name: Optional[str] = None
+    rarity: Optional[str] = None
+    image_url: Optional[str] = None
+    mid_price: Optional[float] = None
+    low_price: Optional[float] = None
+    high_price: Optional[float] = None
+    collected_at: Optional[float] = None
+    display_price: Optional[float] = None
+    price_confidence: Optional[str] = None
+    confidence_score: Optional[str] = None
+    fair_value: Optional[float] = None
+    sparkline: Optional[List[PricingHistoryPoint]] = None
+
+
+class PricingSparkline(BaseModel):
+    template_id: int
+    points: List[PricingHistoryPoint]
+
+
+class SeedContributionView(BaseModel):
+    buyer: str
+    contributed_lamports: int
+    tokens_owed: int
+    claimed: bool
+    pda: str
+
+
+class SeedSaleStateResponse(BaseModel):
+    sale: str
+    authority: str
+    mint: str
+    seed_vault: str
+    vault_authority: str
+    treasury: str
+    start_ts: int
+    end_ts: int
+    price_tokens_per_sol: int
+    token_cap: int
+    sol_cap_lamports: int
+    sold_tokens: int
+    raised_lamports: int
+    is_canceled: bool
+    vault_balance: Optional[int] = None
+    treasury_balance: Optional[int] = None
+    contributor_count: Optional[int] = None
+    tokens_remaining: Optional[int] = None
+    sol_remaining: Optional[int] = None
+    token_decimals: int = 0
+    user_contribution: Optional[SeedContributionView] = None
+
+
+class SeedContributeRequest(BaseModel):
+    wallet: str
+    lamports: Optional[int] = None
+    sol: Optional[float] = None
+
+
+class SeedContributeBuildResponse(TxResponse):
+    lamports: int
+    tokens_owed: int
+    sale: str
+    mint: str
+    start_ts: int
+    end_ts: int
+    contribution_pda: str
+
+
+class SeedClaimRequest(BaseModel):
+    wallet: str
+    user_token_account: Optional[str] = None
+
+
+class SeedClaimBuildResponse(TxResponse):
+    claimable_tokens: int
+    sale: str
+    mint: str
+    user_ata: str
+    contribution_pda: str
 
 
 class AssetStatusView(BaseModel):
@@ -371,6 +564,14 @@ class ListingView(BaseModel):
     seller: Optional[str] = None
     status: str
     currency_mint: Optional[str] = None
+    template_id: Optional[int] = None
+    rarity: Optional[str] = None
+    name: Optional[str] = None
+    image_url: Optional[str] = None
+    is_fake: bool = False
+    current_mid: Optional[float] = None
+    high_90d: Optional[float] = None
+    low_90d: Optional[float] = None
 
 
 class AssetView(BaseModel):
@@ -401,6 +602,9 @@ class InventoryRefreshResponse(BaseModel):
 class ConfirmOpenRequest(BaseModel):
     signature: str
     wallet: str
+    rarities: Optional[List[str]] = None
+    template_ids: Optional[List[Optional[int]]] = None
+    server_nonce: Optional[str] = None
 
 
 class ConfirmClaimRequest(BaseModel):
@@ -428,6 +632,9 @@ class VirtualCardView(BaseModel):
     template_id: int
     rarity: str
     count: int
+    name: Optional[str] = None
+    image_url: Optional[str] = None
+    is_energy: Optional[bool] = None
 
 
 def hash_seed(seed: str) -> str:
@@ -448,6 +655,201 @@ def wrap_instruction_meta(raw: dict) -> InstructionMeta:
         keys=[KeyMeta(**k) for k in raw["keys"]],
         data=raw["data"],
     )
+
+
+def seed_sale_config() -> Dict[str, Pubkey]:
+    authority = auth_settings.seed_sale_authority or auth_settings.admin_address or auth_settings.platform_wallet
+    mint = auth_settings.seed_sale_mint or auth_settings.mochi_token_mint
+    treasury = auth_settings.seed_sale_treasury or auth_settings.treasury_wallet or auth_settings.platform_wallet
+    if not authority or not mint or not treasury:
+        raise HTTPException(status_code=500, detail="Seed sale authority/mint/treasury not configured")
+    authority_pk = to_pubkey(authority)
+    mint_pk = to_pubkey(mint)
+    treasury_pk = to_pubkey(treasury)
+    sale = seed_sale_pda(authority_pk, mint_pk)
+    vault_auth = seed_vault_authority_pda(sale)
+    seed_vault = seed_vault_token_pda(sale)
+    return {
+        "authority": authority_pk,
+        "mint": mint_pk,
+        "treasury": treasury_pk,
+        "sale": sale,
+        "vault_authority": vault_auth,
+        "seed_vault": seed_vault,
+    }
+
+
+def parse_seed_sale_account(data: bytes) -> Optional[dict]:
+    if len(data) < 8 + 220:
+        return None
+    o = 8  # skip discriminator
+
+    def read_pubkey() -> Pubkey:
+        nonlocal o
+        pk = Pubkey.from_bytes(data[o : o + 32])
+        o += 32
+        return pk
+
+    def read_i64() -> int:
+        nonlocal o
+        val = int.from_bytes(data[o : o + 8], "little", signed=True)
+        o += 8
+        return val
+
+    def read_u64() -> int:
+        nonlocal o
+        val = int.from_bytes(data[o : o + 8], "little", signed=False)
+        o += 8
+        return val
+
+    authority = read_pubkey()
+    mint = read_pubkey()
+    seed_vault = read_pubkey()
+    vault_authority = read_pubkey()
+    treasury = read_pubkey()
+    start_ts = read_i64()
+    end_ts = read_i64()
+    price_tokens_per_sol = read_u64()
+    token_cap = read_u64()
+    sol_cap_lamports = read_u64()
+    sold_tokens = read_u64()
+    raised_lamports = read_u64()
+    is_canceled = data[o] == 1
+    o += 1
+    bump = data[o] if o < len(data) else 0
+    o += 1
+    vault_bump = data[o] if o < len(data) else 0
+    o += 1
+    vault_token_bump = data[o] if o < len(data) else 0
+    return {
+        "authority": authority,
+        "mint": mint,
+        "seed_vault": seed_vault,
+        "vault_authority": vault_authority,
+        "treasury": treasury,
+        "start_ts": start_ts,
+        "end_ts": end_ts,
+        "price_tokens_per_sol": price_tokens_per_sol,
+        "token_cap": token_cap,
+        "sol_cap_lamports": sol_cap_lamports,
+        "sold_tokens": sold_tokens,
+        "raised_lamports": raised_lamports,
+        "is_canceled": is_canceled,
+        "bump": bump,
+        "vault_bump": vault_bump,
+        "vault_token_bump": vault_token_bump,
+    }
+
+
+def parse_seed_contribution_account(data: bytes) -> Optional[dict]:
+    if len(data) < 8 + 32 * 2 + 8 * 2 + 2:
+        return None
+    o = 8
+
+    def read_pubkey() -> Pubkey:
+        nonlocal o
+        pk = Pubkey.from_bytes(data[o : o + 32])
+        o += 32
+        return pk
+
+    def read_u64() -> int:
+        nonlocal o
+        val = int.from_bytes(data[o : o + 8], "little", signed=False)
+        o += 8
+        return val
+
+    sale = read_pubkey()
+    buyer = read_pubkey()
+    contributed_lamports = read_u64()
+    tokens_owed = read_u64()
+    claimed = data[o] == 1
+    o += 1
+    bump = data[o] if o < len(data) else 0
+    return {
+        "sale": sale,
+        "buyer": buyer,
+        "contributed_lamports": contributed_lamports,
+        "tokens_owed": tokens_owed,
+        "claimed": claimed,
+        "bump": bump,
+    }
+
+
+def derive_ata(owner: Pubkey, mint: Pubkey) -> Pubkey:
+    return Pubkey.find_program_address(
+        [owner.to_bytes(), TOKEN_PROGRAM_ID.to_bytes(), mint.to_bytes()], ASSOCIATED_TOKEN_PROGRAM_ID
+    )[0]
+
+
+def build_create_ata_ix(payer: Pubkey, owner: Pubkey, mint: Pubkey) -> Instruction:
+    ata = derive_ata(owner, mint)
+    system_program = Pubkey.from_string("11111111111111111111111111111111")
+    accounts = [
+        AccountMeta(payer, is_signer=True, is_writable=True),
+        AccountMeta(ata, is_signer=False, is_writable=True),
+        AccountMeta(owner, is_signer=False, is_writable=False),
+        AccountMeta(mint, is_signer=False, is_writable=False),
+        AccountMeta(system_program, is_signer=False, is_writable=False),
+        AccountMeta(TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
+        AccountMeta(SYSVAR_RENT_PUBKEY, is_signer=False, is_writable=False),
+    ]
+    return Instruction(ASSOCIATED_TOKEN_PROGRAM_ID, b"", accounts)
+
+
+def fetch_contributor_count(sale: Pubkey) -> Optional[int]:
+    payload = {
+        "jsonrpc": "2.0",
+        "id": "contrib_count",
+        "method": "getProgramAccounts",
+        "params": [
+            str(SEED_SALE_PROGRAM_ID),
+            {
+                "encoding": "base64",
+                "filters": [
+                    {"memcmp": {"offset": 0, "bytes": base64.b64encode(SEED_CONTRIBUTION_DISCRIMINATOR).decode()}},
+                    {"memcmp": {"offset": 8, "bytes": str(sale)}},
+                ],
+            },
+        ],
+    }
+    try:
+        resp = requests.post(auth_settings.solana_rpc, json=payload, timeout=10)
+        resp.raise_for_status()
+        result = resp.json().get("result", [])
+        if isinstance(result, list):
+            return len(result)
+    except Exception:
+        return None
+    return None
+
+
+def load_seed_sale_state() -> Dict[str, object]:
+    cfg = seed_sale_config()
+    resp = sol_client.get_account_info(cfg["sale"])
+    if resp.value is None or resp.value.data is None:
+        raise HTTPException(status_code=404, detail="Seed sale PDA not found on-chain")
+    parsed = parse_seed_sale_account(bytes(resp.value.data))
+    if not parsed:
+        raise HTTPException(status_code=500, detail="Unable to parse seed sale account")
+    if parsed["authority"] != cfg["authority"] or parsed["mint"] != cfg["mint"]:
+        raise HTTPException(status_code=400, detail="Seed sale config mismatch (authority/mint)")
+    parsed["pda"] = cfg["sale"]
+    parsed["vault_authority"] = cfg["vault_authority"]
+    parsed["seed_vault"] = cfg["seed_vault"]
+    parsed["treasury"] = cfg["treasury"]
+    return parsed
+
+
+def load_seed_contribution(sale: Pubkey, buyer: Pubkey) -> Optional[dict]:
+    contrib_pda = seed_contribution_pda(sale, buyer)
+    resp = sol_client.get_account_info(contrib_pda)
+    if resp.value is None or resp.value.data is None:
+        return None
+    parsed = parse_seed_contribution_account(bytes(resp.value.data))
+    if not parsed:
+        return None
+    parsed["pda"] = contrib_pda
+    return parsed
 
 
 def build_rng(server_seed: str, client_seed: str) -> random.Random:
@@ -474,6 +876,192 @@ def treasury_pubkey() -> Pubkey:
     if not target:
         raise HTTPException(status_code=500, detail="Treasury wallet not configured")
     return to_pubkey(target)
+
+
+def get_latest_price_snapshot(template_id: int, db: Session) -> Optional[PriceSnapshot]:
+    stmt = select(PriceSnapshot).where(PriceSnapshot.template_id == template_id).order_by(PriceSnapshot.collected_at.desc())
+    return db.exec(stmt).first()
+
+
+def fair_value_from_snapshot(snap: PriceSnapshot) -> float:
+    """Apply fair-value priority: market_price -> direct_low -> mid -> low -> high -> 0."""
+    for candidate in [snap.market_price, snap.direct_low, snap.mid_price, snap.low_price, snap.high_price]:
+        if candidate and float(candidate) > 0:
+            return float(candidate)
+    return 0.0
+
+
+def confidence_score_from_snapshot(snap: PriceSnapshot, now_ts: Optional[float] = None) -> str:
+    now_val = now_ts or time.time()
+    confidence = "high"
+    spread_ratio = None
+    if snap.low_price and snap.low_price > 0 and snap.high_price:
+        spread_ratio = (float(snap.high_price) - float(snap.low_price)) / float(snap.low_price)
+        if spread_ratio > 0.5:
+            confidence = "low"
+        elif spread_ratio > 0.25:
+            confidence = "medium"
+    staleness_hours = (now_val - snap.collected_at) / 3600
+    if staleness_hours > 72:
+        confidence = "low"
+    elif staleness_hours > 24 and confidence == "high":
+        confidence = "medium"
+    return confidence
+
+
+def fetch_history_points(template_id: int, db: Session, limit: int = 30, min_ts: Optional[float] = None) -> List[PricingHistoryPoint]:
+    stmt = (
+        select(PriceSnapshot)
+        .where(PriceSnapshot.template_id == template_id)
+        .order_by(PriceSnapshot.collected_at.desc())
+        .limit(limit)
+    )
+    if min_ts:
+        stmt = stmt.where(PriceSnapshot.collected_at >= min_ts)
+    snaps = db.exec(stmt).all()
+    points: List[PricingHistoryPoint] = []
+    for s in snaps:
+        points.append(
+            PricingHistoryPoint(
+                mid_price=float(s.mid_price),
+                low_price=float(s.low_price),
+                high_price=float(s.high_price),
+                collected_at=float(s.collected_at),
+                fair_value=fair_value_from_snapshot(s),
+            )
+        )
+    return points
+
+
+def compute_price_view(template_id: int, db: Session):
+    """Derive display price, averages, and confidence from PriceSnapshot history."""
+    latest = get_latest_price_snapshot(template_id, db)
+    if not latest:
+        return None
+    now = time.time()
+    cutoff_30d = now - 30 * 24 * 3600
+    cutoff_7d = now - 7 * 24 * 3600
+    snaps = db.exec(
+        select(PriceSnapshot)
+        .where(PriceSnapshot.template_id == template_id)
+        .where(PriceSnapshot.collected_at >= cutoff_30d)
+        .order_by(PriceSnapshot.collected_at.desc())
+    ).all()
+
+    def avg(values: Sequence[float]) -> float:
+        return float(sum(values) / len(values)) if values else 0.0
+
+    fair_values = [fair_value_from_snapshot(s) for s in snaps]
+    mid_30d = avg([fv for fv, snap in zip(fair_values, snaps) if snap.collected_at >= cutoff_30d])
+    mid_7d = avg([fv for fv, snap in zip(fair_values, snaps) if snap.collected_at >= cutoff_7d])
+    latest_fair = fair_value_from_snapshot(latest)
+    if mid_7d == 0:
+        mid_7d = latest_fair
+    if mid_30d == 0:
+        mid_30d = latest_fair
+    display = latest_fair
+    spread_ratio = None
+    if latest.low_price and latest.low_price > 0 and latest.high_price:
+        spread_ratio = float(latest.high_price - latest.low_price) / float(latest.low_price)
+    confidence = confidence_score_from_snapshot(latest, now_ts=now)
+    return {
+        "latest": latest,
+        "display_price": float(display),
+        "avg_7d": float(mid_7d),
+        "avg_30d": float(mid_30d),
+        "spread_ratio": spread_ratio,
+        "confidence": confidence,
+        "fair_value": latest_fair,
+    }
+
+
+def get_sol_price() -> float:
+    """Mock SOL price in USD; replace with Pyth/Chainlink later."""
+    return 150.0
+
+
+def build_portfolio_breakdown(wallet: str, db: Session) -> Tuple[List[PricingPortfolioBreakdown], float]:
+    breakdown: List[PricingPortfolioBreakdown] = []
+    total_value = 0.0
+    templates = {t.template_id: t for t in db.exec(select(CardTemplate)).all()}
+
+    def add_position(template_id: int, count: int):
+        nonlocal total_value
+        snap = get_latest_price_snapshot(template_id, db)
+        if not snap:
+            return
+        fair_value = fair_value_from_snapshot(snap)
+        if fair_value <= 0:
+            return
+        confidence = confidence_score_from_snapshot(snap)
+        value = fair_value * count
+        total_value += value
+        tmpl = templates.get(template_id)
+        breakdown.append(
+            PricingPortfolioBreakdown(
+                template_id=template_id,
+                name=tmpl.card_name if tmpl else None,
+                count=count,
+                mid_price=float(snap.mid_price),
+                fair_value=fair_value,
+                confidence_score=confidence,
+                total_value_usd=value,
+            )
+        )
+
+    # Virtual cards
+    virtuals = db.exec(select(VirtualCard).where(VirtualCard.wallet == wallet)).all()
+    for vc in virtuals:
+        add_position(vc.template_id, vc.count)
+
+    # NFTs (MintRecords) owned by wallet
+    nfts = db.exec(select(MintRecord).where(MintRecord.owner == wallet)).all()
+    counts: Dict[int, int] = {}
+    for n in nfts:
+        counts[n.template_id] = counts.get(n.template_id, 0) + 1
+    for template_id, count in counts.items():
+        add_position(template_id, count)
+
+    return breakdown, total_value
+
+
+def get_snapshot_as_of(template_id: int, as_of_ts: float, db: Session) -> Optional[PriceSnapshot]:
+    stmt = (
+        select(PriceSnapshot)
+        .where(PriceSnapshot.template_id == template_id)
+        .where(PriceSnapshot.collected_at <= as_of_ts)
+        .order_by(PriceSnapshot.collected_at.desc())
+        .limit(1)
+    )
+    return db.exec(stmt).first()
+
+
+@app.post("/pricing/fetch", response_model=dict)
+def pricing_fetch(db: Session = Depends(get_session)):
+    """Mock price fetcher for testing; assigns random USD prices to all CardTemplates."""
+    rng = random.Random(time.time())
+    templates = db.exec(select(CardTemplate)).all()
+    now = time.time()
+    created = 0
+    for tmpl in templates:
+        mid = round(rng.uniform(5, 150), 2)
+        low = round(mid * 0.85, 2)
+        high = round(mid * 1.15, 2)
+        snap = PriceSnapshot(
+            template_id=tmpl.template_id,
+            source="mock_pricing",
+            currency="USD",
+            market_price=mid,
+            direct_low=low,
+            mid_price=mid,
+            low_price=low,
+            high_price=high,
+            collected_at=now,
+        )
+        db.add(snap)
+        created += 1
+    db.commit()
+    return {"ok": True, "snapshots": created, "source": "mock_pricing"}
 
 
 def load_admin_keypair() -> SoldersKeypair:
@@ -841,6 +1429,36 @@ def build_mint_to_ix(mint: Pubkey, destination: Pubkey, authority: Pubkey, amoun
     return Instruction(program_id=TOKEN_PROGRAM_ID, data=data, accounts=metas)
 
 
+def derive_ata(owner: Pubkey, mint: Pubkey) -> Pubkey:
+    return Pubkey.find_program_address(
+        [bytes(owner), bytes(TOKEN_PROGRAM_ID), bytes(mint)],
+        ASSOCIATED_TOKEN_PROGRAM_ID,
+    )[0]
+
+
+def build_create_ata_ix(payer: Pubkey, owner: Pubkey, mint: Pubkey, ata: Pubkey) -> Instruction:
+    # Associated token account creation ix (instruction 0)
+    metas = [
+        AccountMeta(pubkey=payer, is_signer=True, is_writable=True),
+        AccountMeta(pubkey=ata, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=owner, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=mint, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=SYS_PROGRAM_ID, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
+    ]
+    return Instruction(program_id=ASSOCIATED_TOKEN_PROGRAM_ID, data=bytes([0]), accounts=metas)
+
+
+def build_spl_transfer_ix(source: Pubkey, dest: Pubkey, owner: Pubkey, amount: int) -> Instruction:
+    data = bytes([3]) + amount.to_bytes(8, "little")
+    metas = [
+        AccountMeta(pubkey=source, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=dest, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=owner, is_signer=True, is_writable=False),
+    ]
+    return Instruction(program_id=TOKEN_PROGRAM_ID, data=data, accounts=metas)
+
+
 def parse_card_record_account(data: bytes) -> Optional[dict]:
     if len(data) < 8:
         return None
@@ -978,6 +1596,193 @@ def startup_event():
 @app.get("/health")
 def health():
     return {"status": "ok", "server_seed_hash": SERVER_SEED_HASH}
+
+
+@app.get("/seed_sale/state", response_model=SeedSaleStateResponse)
+def seed_sale_state(wallet: Optional[str] = None):
+    sale_info = load_seed_sale_state()
+    contributor_count = fetch_contributor_count(sale_info["pda"])
+    vault_balance = None
+    treasury_balance = None
+    try:
+        balance_resp = sol_client.get_token_account_balance(sale_info["seed_vault"])
+        if balance_resp.value is not None:
+            vault_balance = int(balance_resp.value.amount)
+    except Exception:
+        vault_balance = None
+    try:
+        bal = sol_client.get_balance(sale_info["treasury"])
+        treasury_balance = bal.value if bal is not None else None
+    except Exception:
+        treasury_balance = None
+
+    tokens_remaining = None
+    if sale_info["token_cap"] > 0:
+        tokens_remaining = max(sale_info["token_cap"] - sale_info["sold_tokens"], 0)
+    sol_remaining = None
+    if sale_info["sol_cap_lamports"] > 0:
+        sol_remaining = max(sale_info["sol_cap_lamports"] - sale_info["raised_lamports"], 0)
+
+    user_contribution: Optional[SeedContributionView] = None
+    if wallet:
+        try:
+            contrib = load_seed_contribution(sale_info["pda"], to_pubkey(wallet))
+            if contrib:
+                user_contribution = SeedContributionView(
+                    buyer=str(contrib["buyer"]),
+                    contributed_lamports=contrib["contributed_lamports"],
+                    tokens_owed=contrib["tokens_owed"],
+                    claimed=contrib["claimed"],
+                    pda=str(contrib["pda"]),
+                )
+        except Exception:
+            user_contribution = None
+
+    return SeedSaleStateResponse(
+        sale=str(sale_info["pda"]),
+        authority=str(sale_info["authority"]),
+        mint=str(sale_info["mint"]),
+        seed_vault=str(sale_info["seed_vault"]),
+        vault_authority=str(sale_info["vault_authority"]),
+        treasury=str(sale_info["treasury"]),
+        start_ts=sale_info["start_ts"],
+        end_ts=sale_info["end_ts"],
+        price_tokens_per_sol=sale_info["price_tokens_per_sol"],
+        token_cap=sale_info["token_cap"],
+        sol_cap_lamports=sale_info["sol_cap_lamports"],
+        sold_tokens=sale_info["sold_tokens"],
+        raised_lamports=sale_info["raised_lamports"],
+        is_canceled=sale_info["is_canceled"],
+        vault_balance=vault_balance,
+        treasury_balance=treasury_balance,
+        contributor_count=contributor_count,
+        tokens_remaining=tokens_remaining,
+        sol_remaining=sol_remaining,
+        token_decimals=auth_settings.mochi_token_decimals,
+        user_contribution=user_contribution,
+    )
+
+
+@app.post("/seed_sale/contribute/build", response_model=SeedContributeBuildResponse)
+def seed_sale_contribute(req: SeedContributeRequest):
+    sale_info = load_seed_sale_state()
+    now = int(time.time())
+    if sale_info["is_canceled"]:
+        raise HTTPException(status_code=400, detail="Seed sale is canceled")
+    if now < sale_info["start_ts"]:
+        raise HTTPException(status_code=400, detail="Seed sale not started")
+    if now > sale_info["end_ts"]:
+        raise HTTPException(status_code=400, detail="Seed sale ended")
+
+    lamports = req.lamports
+    if lamports is None and req.sol is not None:
+        lamports = int(req.sol * 1_000_000_000)
+    if lamports is None:
+        raise HTTPException(status_code=400, detail="lamports or sol amount is required")
+    if lamports <= 0 or lamports < MIN_SEED_CONTRIB_LAMPORTS:
+        raise HTTPException(status_code=400, detail="Contribution too small (min 0.01 SOL)")
+
+    tokens_owed = lamports * sale_info["price_tokens_per_sol"]
+    if sale_info["token_cap"] > 0 and sale_info["sold_tokens"] + tokens_owed > sale_info["token_cap"]:
+        raise HTTPException(status_code=400, detail="Token cap would be exceeded by this contribution")
+    if sale_info["sol_cap_lamports"] > 0 and sale_info["raised_lamports"] + lamports > sale_info["sol_cap_lamports"]:
+        raise HTTPException(status_code=400, detail="SOL cap would be exceeded by this contribution")
+
+    try:
+        buyer = to_pubkey(req.wallet)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Invalid wallet: {exc}") from exc
+    ix = build_seed_contribute_ix(
+        buyer=buyer,
+        authority=sale_info["authority"],
+        mint=sale_info["mint"],
+        treasury=sale_info["treasury"],
+        lamports=lamports,
+    )
+    instructions = [ix]
+    blockhash = get_latest_blockhash()
+    payer = buyer
+    instrs_meta = [wrap_instruction_meta(instruction_to_dict(ix_)) for ix_ in instructions]
+    return SeedContributeBuildResponse(
+        tx_b64=message_from_instructions(instructions, payer, blockhash),
+        tx_v0_b64=versioned_tx_b64(payer, blockhash, instructions),
+        recent_blockhash=blockhash,
+        instructions=instrs_meta,
+        lamports=lamports,
+        tokens_owed=tokens_owed,
+        sale=str(sale_info["pda"]),
+        mint=str(sale_info["mint"]),
+        start_ts=sale_info["start_ts"],
+        end_ts=sale_info["end_ts"],
+        contribution_pda=str(seed_contribution_pda(sale_info["pda"], buyer)),
+    )
+
+
+@app.post("/seed_sale/claim/build", response_model=SeedClaimBuildResponse)
+def seed_sale_claim(req: SeedClaimRequest):
+    sale_info = load_seed_sale_state()
+    now = int(time.time())
+    if sale_info["is_canceled"]:
+        raise HTTPException(status_code=400, detail="Seed sale is canceled")
+    if now <= sale_info["end_ts"]:
+        raise HTTPException(status_code=400, detail="Seed sale not ended yet")
+
+    try:
+        buyer = to_pubkey(req.wallet)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Invalid wallet: {exc}") from exc
+    contrib = load_seed_contribution(sale_info["pda"], buyer)
+    if not contrib:
+        raise HTTPException(status_code=404, detail="No contribution found for this wallet")
+    if contrib["claimed"]:
+        raise HTTPException(status_code=400, detail="Contribution already claimed")
+    claimable = contrib["tokens_owed"]
+    if claimable <= 0:
+        raise HTTPException(status_code=400, detail="Nothing to claim")
+
+    user_ata = to_pubkey(req.user_token_account) if req.user_token_account else derive_ata(buyer, sale_info["mint"])
+    needs_ata = False
+    try:
+        ata_info = sol_client.get_account_info(user_ata)
+        needs_ata = ata_info.value is None
+    except Exception:
+        needs_ata = False
+
+    instructions: List[Instruction] = []
+    if needs_ata:
+        instructions.append(build_create_ata_ix(payer=buyer, owner=buyer, mint=sale_info["mint"]))
+    try:
+        vault_balance_resp = sol_client.get_token_account_balance(sale_info["seed_vault"])
+        if vault_balance_resp.value is not None:
+            available = int(vault_balance_resp.value.amount)
+            if available < claimable:
+                raise HTTPException(status_code=400, detail="Seed vault balance is insufficient for claim")
+    except HTTPException:
+        raise
+    except Exception:
+        # skip balance check if RPC fails
+        pass
+
+    claim_ix = build_seed_claim_ix(
+        buyer=buyer,
+        authority=sale_info["authority"],
+        mint=sale_info["mint"],
+        user_ata=user_ata,
+    )
+    instructions.append(claim_ix)
+    blockhash = get_latest_blockhash()
+    instrs_meta = [wrap_instruction_meta(instruction_to_dict(ix_)) for ix_ in instructions]
+    return SeedClaimBuildResponse(
+        tx_b64=message_from_instructions(instructions, buyer, blockhash),
+        tx_v0_b64=versioned_tx_b64(buyer, blockhash, instructions),
+        recent_blockhash=blockhash,
+        instructions=instrs_meta,
+        claimable_tokens=claimable,
+        sale=str(sale_info["pda"]),
+        mint=str(sale_info["mint"]),
+        user_ata=str(user_ata),
+        contribution_pda=str(contrib["pda"]),
+    )
 
 
 @app.post("/program/open/preview", response_model=PackPreviewResponse)
@@ -1338,20 +2143,33 @@ def confirm_open_v2(req: ConfirmOpenRequest, db: Session = Depends(get_session))
 
     vault_state = vault_state_pda()
     pack_session = pack_session_v2_pda(vault_state, to_pubkey(wallet))
-    resp = sol_client.get_account_info(pack_session)
-    if resp.value is None or resp.value.data is None:
-        raise HTTPException(status_code=400, detail="Pack session v2 not found on-chain after confirmation")
-    info = parse_pack_session_v2_account(bytes(resp.value.data))
+    info = None
+    # Retry briefly to avoid flakiness right after confirmation.
+    for _ in range(5):
+        resp = sol_client.get_account_info(pack_session)
+        if resp.value and resp.value.data:
+            info = parse_pack_session_v2_account(bytes(resp.value.data))
+            if info:
+                break
+        time.sleep(0.5)
     if not info:
-        raise HTTPException(status_code=400, detail="Unable to parse on-chain session")
+        raise HTTPException(status_code=400, detail="Pack session v2 not found or unparsable after confirmation")
     on_state = info.get("state")
     if on_state not in ["pending", "accepted"]:
         raise HTTPException(status_code=400, detail=f"Unexpected on-chain session state {on_state}")
 
     session_id = str(pack_session)
     mirror = db.get(SessionMirror, session_id)
-    rarities = mirror.rarities.split(",") if mirror else []
-    template_ids = parse_templates(mirror.template_ids) if mirror else []
+    rarities = mirror.rarities.split(",") if mirror and mirror.rarities else []
+    template_ids = parse_templates(mirror.template_ids) if mirror and mirror.template_ids else []
+    client_rarities = req.rarities or []
+    client_templates = req.template_ids or []
+    if not rarities and client_rarities:
+        rarities = client_rarities
+    if not template_ids and client_templates:
+        template_ids = client_templates
+    if rarities and template_ids and len(template_ids) < len(rarities):
+        template_ids = list(template_ids) + [None] * (len(rarities) - len(template_ids))
 
     rare_cards = info.get("rare_cards", [])
     rare_assets: List[str] = []
@@ -1363,7 +2181,7 @@ def confirm_open_v2(req: ConfirmOpenRequest, db: Session = Depends(get_session))
         record_info = parse_card_record_account(bytes(cr_resp.value.data))
         if not record_info:
             raise HTTPException(status_code=400, detail=f"Could not parse CardRecord: {cr}")
-        if record_info["status"] != 1 or str(record_info["owner"]) != wallet:
+        if record_info["status"] not in [1, 2] or str(record_info["owner"]) != wallet:
             raise HTTPException(status_code=400, detail="Cards are not reserved; please reset and reopen the pack.")
         asset_id = str(record_info["core_asset"])
         rare_assets.append(asset_id)
@@ -1374,6 +2192,7 @@ def confirm_open_v2(req: ConfirmOpenRequest, db: Session = Depends(get_session))
             rec.updated_at = now
             db.add(rec)
 
+    nonce_hex = req.server_nonce or info.get("client_seed_hash", b"").hex()
     if not mirror:
         mirror = SessionMirror(
             session_id=session_id,
@@ -1381,26 +2200,29 @@ def confirm_open_v2(req: ConfirmOpenRequest, db: Session = Depends(get_session))
             rarities=",".join(rarities),
             asset_ids=",".join(rare_assets),
             server_seed_hash=SERVER_SEED_HASH,
-            server_nonce=info.get("client_seed_hash", b"").hex(),
-            state="pending",
+            server_nonce=nonce_hex,
+            state=on_state or "pending",
             created_at=float(info.get("created_at", now)),
             expires_at=float(info.get("expires_at", now + 3600)),
-            template_ids=",".join(str(t) for t in template_ids),
+            template_ids=",".join("" if t is None else str(t) for t in template_ids),
             version=2,
         )
     else:
-        mirror.state = "pending"
+        mirror.state = on_state or "pending"
         if rarities:
             mirror.rarities = ",".join(rarities)
+        if template_ids:
+            mirror.template_ids = ",".join("" if t is None else str(t) for t in template_ids)
         mirror.asset_ids = ",".join(rare_assets)
         mirror.expires_at = float(info.get("expires_at", mirror.expires_at))
-        mirror.server_nonce = info.get("client_seed_hash", b"").hex()
+        mirror.server_nonce = nonce_hex
         mirror.version = 2
     db.add(mirror)
     db.commit()
 
-    # Add low-tier virtuals on open
-    mutate_virtual_cards(wallet, low_tier_virtual_items(rarities, template_ids), db, direction=1)
+    # Add low-tier virtuals on open (only if we have a usable lineup).
+    if rarities and template_ids:
+        mutate_virtual_cards(wallet, low_tier_virtual_items(rarities, template_ids), db, direction=1)
     return {"state": on_state, "assets": rare_assets}
 
 
@@ -1791,11 +2613,15 @@ def profile_virtual(wallet: str, db: Session = Depends(get_session)):
     rows = db.exec(stmt).all()
     result: List[VirtualCardView] = []
     for row in rows:
+        tmpl = db.get(CardTemplate, row.template_id) if row.template_id is not None else None
         result.append(
             VirtualCardView(
                 template_id=row.template_id,
                 rarity=row.rarity,
                 count=row.count,
+                name=tmpl.card_name if tmpl else None,
+                image_url=tmpl.image_url if tmpl else None,
+                is_energy=tmpl.is_energy if tmpl else None,
             )
         )
     return result
@@ -1858,57 +2684,181 @@ def recycle_build(req: RecycleBuildRequest, db: Session = Depends(get_session)):
 
 @app.get("/marketplace/listings", response_model=List[ListingView])
 def marketplace_listings(db: Session = Depends(get_session)):
-    stmt = select(MintRecord).where(MintRecord.status == "listed")
-    rows = db.exec(stmt).all()
+    """
+    Fall back to on-chain listing PDAs so drifted DB status won't hide items.
+    Keep this light: no price snapshot aggregation to avoid DB pool exhaustion.
+    """
     vault_state = vault_state_pda()
+    # Listing account discriminator
+    listing_disc = hashlib.sha256(b"account:Listing").digest()[:8]
+    memcmp = MemcmpOpts(offset=0, bytes=listing_disc)
+    try:
+        resp = sol_client.get_program_accounts(
+            PROGRAM_ID,
+            encoding="base64",
+            filters=[memcmp],
+        )
+        accounts = resp.value or []
+    except Exception:
+        accounts = []
+
     results: List[ListingView] = []
-    for row in rows:
-        listing_key = listing_pda(vault_state, to_pubkey(row.asset_id))
-        listing_info = None
+    seen: set[str] = set()
+
+    for acc in accounts:
+        info = acc.account
+        if not info or info.owner != PROGRAM_ID:
+            continue
+        listing_data = None
         try:
-            resp = sol_client.get_account_info(listing_key)
-            if resp.value and resp.value.data:
-                listing_info = parse_listing_account(bytes(resp.value.data))
+            listing_data = parse_listing_account(bytes(info.data))
         except Exception:
-            listing_info = None
-        price = listing_info["price_lamports"] if listing_info else 0
-        seller = listing_info["seller"] if listing_info and listing_info.get("seller") else row.owner
-        status = listing_info["status"] if listing_info and listing_info.get("status") else row.status
-        currency_mint = listing_info.get("currency_mint") if listing_info else None
+            listing_data = None
+        if not listing_data:
+            continue
+        # Ignore junk listings from other vaults or corrupted data.
+        if str(listing_data.get("vault_state")) != str(vault_state):
+            continue
+        status = (listing_data.get("status") or "").lower()
+        if status and status != "active":
+            continue
+        core_asset = str(listing_data.get("core_asset"))
+        if core_asset in seen:
+            continue
+        seen.add(core_asset)
+
+        row = db.exec(select(MintRecord).where(MintRecord.asset_id == core_asset)).first()
+        card_meta = db.get(CardTemplate, row.template_id) if row and row.template_id else None
         results.append(
             ListingView(
-                core_asset=row.asset_id,
-                price_lamports=price,
-                seller=str(seller) if seller else row.owner,
-                status=status,
-                currency_mint=str(currency_mint) if currency_mint else None,
+                core_asset=core_asset,
+                price_lamports=listing_data.get("price_lamports", 0),
+                seller=str(listing_data.get("seller")),
+                status=listing_data.get("status") or "active",
+                currency_mint=str(listing_data.get("currency_mint")) if listing_data.get("currency_mint") else None,
+                template_id=row.template_id if row else None,
+                rarity=row.rarity if row else None,
+                name=card_meta.card_name if card_meta else None,
+                image_url=card_meta.image_url if card_meta else None,
+                is_fake=bool(getattr(row, "is_fake", False)) if row else False,
+                current_mid=None,
+                high_90d=None,
+                low_90d=None,
             )
         )
     return results
 
 
+@app.get("/admin/marketplace/garbage")
+def admin_garbage_listings():
+    """
+    Surface listing PDAs that are pointing at the wrong vault_state so we can clean them up.
+    Only returns entries whose vault_state != the canonical vault_state_pda().
+    """
+    canonical = vault_state_pda()
+    listing_disc = hashlib.sha256(b"account:Listing").digest()[:8]
+    memcmp = MemcmpOpts(offset=0, bytes=listing_disc)
+    try:
+        resp = sol_client.get_program_accounts(
+            PROGRAM_ID,
+            encoding="base64",
+            filters=[memcmp],
+        )
+        accounts = resp.value or []
+    except Exception:
+        accounts = []
+
+    garbage: List[dict] = []
+    for acc in accounts:
+        info = acc.account
+        if not info or info.owner != PROGRAM_ID:
+            continue
+        listing_data = None
+        try:
+            listing_data = parse_listing_account(bytes(info.data))
+        except Exception:
+            listing_data = None
+        if not listing_data:
+            continue
+        if str(listing_data.get("vault_state")) == str(canonical):
+            continue
+        garbage.append(
+            {
+                "listing": str(acc.pubkey),
+                "vault_state": str(listing_data.get("vault_state")),
+                "seller": str(listing_data.get("seller")),
+                "core_asset": str(listing_data.get("core_asset")),
+                "price_lamports": listing_data.get("price_lamports"),
+                "status": listing_data.get("status"),
+            }
+        )
+    return garbage
+
+
 @app.post("/marketplace/list/build", response_model=TxResponse)
 def marketplace_list(req: ListRequest, db: Session = Depends(get_session)):
     vault_state = vault_state_pda()
+    canonical_vault = vault_state_pda()
     vault_authority = vault_authority_pda(vault_state)
     card_record = card_record_pda(vault_state, to_pubkey(req.core_asset))
     listing = listing_pda(vault_state, to_pubkey(req.core_asset))
     core_asset = to_pubkey(req.core_asset)
+
+    # Hard guard: only allow listings against the canonical vault PDA.
+    if str(vault_state) != str(canonical_vault):
+        raise HTTPException(status_code=400, detail="Invalid vault_state; please reload and try again.")
     if not pda_exists(card_record):
         # With deposit-on-list we can initialize card_record on the fly, but we still require a known template/rarity.
         pass
 
     stmt = select(MintRecord).where(MintRecord.asset_id == req.core_asset)
     record = db.exec(stmt).first()
-    if not record or record.template_id is None or not record.rarity:
-        raise HTTPException(status_code=400, detail="Missing template/rarity metadata for this asset")
+    is_fake = False
+    template_id = None
+    rarity_val = None
+    if record:
+        is_fake = bool(getattr(record, "is_fake", False))
+        template_id = record.template_id
+        rarity_val = record.rarity
+    else:
+        # Unknown NFT: allow list but mark fake and use placeholders
+        is_fake = True
+        template_id = 0
+        rarity_val = "Unknown"
+        record = MintRecord(
+            asset_id=req.core_asset,
+            template_id=template_id,
+            rarity=rarity_val,
+            status="listed",
+            owner=req.wallet,
+            is_fake=True,
+        )
+
     def rarity_index(val: str) -> int:
         norm = normalized_rarity(val)
         for idx, label in enumerate(RARITY_LABELS):
             if normalized_rarity(label) == norm:
                 return idx
-        raise HTTPException(status_code=400, detail=f"Unsupported rarity {val}")
-    rarity_tag = rarity_index(record.rarity)
+        return 0  # default to Common
+
+    rarity_tag = rarity_index(rarity_val or "Common")
+
+    instructions = []
+
+    # Optional MOCHI listing fee
+    fee_amount = getattr(auth_settings, "listing_fee_mochi", 0) or 0
+    mochi_mint_str = getattr(auth_settings, "mochi_token_mint", None)
+    if fee_amount and mochi_mint_str:
+        mint = to_pubkey(mochi_mint_str)
+        seller_pk = to_pubkey(req.wallet)
+        treasury_pk = treasury_pubkey()
+        seller_ata = derive_ata(seller_pk, mint)
+        treasury_ata = derive_ata(treasury_pk, mint)
+        if not pda_exists(seller_ata):
+            instructions.append(build_create_ata_ix(seller_pk, seller_pk, mint, seller_ata))
+        if not pda_exists(treasury_ata):
+            instructions.append(build_create_ata_ix(seller_pk, treasury_pk, mint, treasury_ata))
+        instructions.append(build_spl_transfer_ix(seller_ata, treasury_ata, seller_pk, fee_amount))
 
     ix = build_list_card_ix(
         seller=to_pubkey(req.wallet),
@@ -1919,23 +2869,26 @@ def marketplace_list(req: ListRequest, db: Session = Depends(get_session)):
         vault_authority=vault_authority,
         price_lamports=req.price_lamports,
         currency_mint=req.currency_mint,
-        template_id=record.template_id,
+        template_id=template_id or 0,
         rarity_tag=rarity_tag,
     )
+    instructions.append(ix)
+
     blockhash = get_latest_blockhash()
-    tx_b64 = message_from_instructions([ix], to_pubkey(req.wallet), blockhash)
-    tx_v0_b64 = versioned_tx_b64(to_pubkey(req.wallet), blockhash, [ix])
-    instr = wrap_instruction_meta(instruction_to_dict(ix))
+    payer = to_pubkey(req.wallet)
+    tx_b64 = message_from_instructions(instructions, payer, blockhash)
+    tx_v0_b64 = versioned_tx_b64(payer, blockhash, instructions)
+    instrs_meta = [wrap_instruction_meta(instruction_to_dict(ix_)) for ix_ in instructions]
 
     # Mirror listing status
-    if record:
-        record.status = "listed"
-        record.owner = req.wallet
-        record.updated_at = time.time()
-        db.add(record)
-        db.commit()
+    record.status = "listed"
+    record.owner = req.wallet
+    record.updated_at = time.time()
+    record.is_fake = is_fake
+    db.add(record)
+    db.commit()
 
-    return TxResponse(tx_b64=tx_b64, tx_v0_b64=tx_v0_b64, recent_blockhash=blockhash, instructions=[instr])
+    return TxResponse(tx_b64=tx_b64, tx_v0_b64=tx_v0_b64, recent_blockhash=blockhash, instructions=instrs_meta)
 
 
 @app.post("/marketplace/fill/build", response_model=TxResponse)
@@ -1947,12 +2900,31 @@ def marketplace_fill(req: MarketplaceActionRequest, db: Session = Depends(get_se
     treasury = treasury_pubkey()
     if not pda_exists(card_record):
         raise HTTPException(status_code=400, detail="CardRecord PDA missing on-chain")
+    resp_listing = sol_client.get_account_info(listing)
+    if resp_listing.value is None:
+        raise HTTPException(status_code=400, detail="Listing PDA missing on-chain; please relist")
+    if str(resp_listing.value.owner) != str(PROGRAM_ID):
+        raise HTTPException(
+            status_code=400,
+            detail="Listing PDA owned by wrong program; please relist to repair",
+        )
+    listing_info = None
+    try:
+        listing_info = parse_listing_account(bytes(resp_listing.value.data))
+    except Exception:
+        listing_info = None
+    if not listing_info:
+        raise HTTPException(status_code=400, detail="Unable to parse listing account")
+    if listing_info.get("status") and listing_info["status"].lower() != "active":
+        raise HTTPException(status_code=400, detail="Listing not active; please relist")
+    price = listing_info.get("price_lamports", 0)
+    if price <= 0:
+        raise HTTPException(status_code=400, detail="Listing price invalid; please relist")
 
     stmt = select(MintRecord).where(MintRecord.asset_id == req.core_asset)
     record = db.exec(stmt).first()
-    seller_pubkey = listing_owner_from_chain(vault_state, to_pubkey(req.core_asset)) or treasury
-    if record and record.owner:
-        seller_pubkey = to_pubkey(record.owner)
+    seller_pubkey = listing_info.get("seller") or (listing_owner_from_chain(vault_state, to_pubkey(req.core_asset)) or treasury)
+    seller_pubkey = to_pubkey(str(seller_pubkey))
 
     ix = build_fill_listing_ix(
         buyer=to_pubkey(req.wallet),
@@ -1965,43 +2937,36 @@ def marketplace_fill(req: MarketplaceActionRequest, db: Session = Depends(get_se
     )
     blockhash = get_latest_blockhash()
     tx_b64 = message_from_instructions([ix], to_pubkey(req.wallet), blockhash)
-    instr = wrap_instruction_meta(instruction_to_dict(ix))
-
-    if record:
-        record.status = "user_owned"
-        record.owner = req.wallet
-        record.updated_at = time.time()
-        db.add(record)
-        db.commit()
+    instr_fill = wrap_instruction_meta(instruction_to_dict(ix))
 
     tx_v0_b64 = versioned_tx_b64(to_pubkey(req.wallet), blockhash, [ix])
-    return TxResponse(tx_b64=tx_b64, tx_v0_b64=tx_v0_b64, recent_blockhash=blockhash, instructions=[instr])
+    return TxResponse(
+        tx_b64=tx_b64,
+        tx_v0_b64=tx_v0_b64,
+        recent_blockhash=blockhash,
+        instructions=[instr_fill],
+    )
 
 
 @app.post("/marketplace/cancel/build", response_model=TxResponse)
 def marketplace_cancel(req: MarketplaceActionRequest, db: Session = Depends(get_session)):
     vault_state = vault_state_pda()
+    vault_authority = vault_authority_pda(vault_state)
     card_record = card_record_pda(vault_state, to_pubkey(req.core_asset))
     listing = listing_pda(vault_state, to_pubkey(req.core_asset))
+    core_asset = to_pubkey(req.core_asset)
 
     ix = build_cancel_listing_ix(
         seller=to_pubkey(req.wallet),
         vault_state=vault_state,
         card_record=card_record,
+        core_asset=core_asset,
         listing=listing,
+        vault_authority=vault_authority,
     )
     blockhash = get_latest_blockhash()
     tx_b64 = message_from_instructions([ix], to_pubkey(req.wallet), blockhash)
     instr = wrap_instruction_meta(instruction_to_dict(ix))
-
-    stmt = select(MintRecord).where(MintRecord.asset_id == req.core_asset)
-    record = db.exec(stmt).first()
-    if record:
-        record.status = "user_owned"
-        record.owner = req.wallet
-        record.updated_at = time.time()
-        db.add(record)
-        db.commit()
 
     tx_v0_b64 = versioned_tx_b64(to_pubkey(req.wallet), blockhash, [ix])
     return TxResponse(tx_b64=tx_b64, tx_v0_b64=tx_v0_b64, recent_blockhash=blockhash, instructions=[instr])
@@ -2024,6 +2989,190 @@ def admin_inventory(db: Session = Depends(get_session)):
 @app.get("/pricing/rarity")
 def pricing_rarity():
     return RARITY_PRICE_LAMPORTS
+
+
+@app.get("/pricing/search", response_model=List[PricingSearchItem])
+def pricing_search(q: str, limit: int = 20, db: Session = Depends(get_session)):
+    if not q or len(q.strip()) < 2:
+        raise HTTPException(status_code=400, detail="Query too short")
+    limit = max(1, min(limit, 50))
+    q_norm = f"%{q.strip().lower()}%"
+    stmt = (
+        select(CardTemplate)
+        .where(func.lower(CardTemplate.card_name).like(q_norm))
+        .limit(limit * 3)
+    )
+    templates = db.exec(stmt).all()
+    results: List[PricingSearchItem] = []
+    for tmpl in templates:
+        pv = compute_price_view(tmpl.template_id, db)
+        if not pv:
+            continue
+        snap = pv["latest"]
+        history_points = fetch_history_points(tmpl.template_id, db, limit=30)
+        results.append(
+            PricingSearchItem(
+                template_id=tmpl.template_id,
+                name=tmpl.card_name,
+                set_name=tmpl.set_name,
+                rarity=tmpl.rarity,
+                image_url=tmpl.image_url,
+                mid_price=float(snap.mid_price),
+                low_price=float(snap.low_price),
+                high_price=float(snap.high_price),
+                collected_at=float(snap.collected_at),
+                display_price=pv["display_price"],
+                fair_value=pv["fair_value"],
+                price_confidence=pv["confidence"],
+                confidence_score=pv["confidence"],
+                sparkline=history_points,
+            )
+        )
+        if len(results) >= limit:
+            break
+    return results
+
+
+@app.get("/pricing/set", response_model=List[PricingSearchItem])
+def pricing_set(set_name: str, limit: int = 200, db: Session = Depends(get_session)):
+    if not set_name or len(set_name.strip()) < 2:
+        raise HTTPException(status_code=400, detail="Set name too short")
+    limit = max(1, min(limit, 500))
+    stmt = (
+        select(CardTemplate)
+        .where(func.lower(CardTemplate.set_name) == set_name.strip().lower())
+        .order_by(CardTemplate.card_name.asc())
+        .limit(limit * 2)
+    )
+    templates = db.exec(stmt).all()
+    results: List[PricingSearchItem] = []
+    for tmpl in templates:
+        pv = compute_price_view(tmpl.template_id, db)
+        if not pv:
+            continue
+        snap = pv["latest"]
+        history_points = fetch_history_points(tmpl.template_id, db, limit=30)
+        results.append(
+            PricingSearchItem(
+                template_id=tmpl.template_id,
+                name=tmpl.card_name,
+                set_name=tmpl.set_name,
+                rarity=tmpl.rarity,
+                image_url=tmpl.image_url,
+                mid_price=float(snap.mid_price),
+                low_price=float(snap.low_price),
+                high_price=float(snap.high_price),
+                collected_at=float(snap.collected_at),
+                display_price=pv["display_price"],
+                fair_value=pv["fair_value"],
+                price_confidence=pv["confidence"],
+                confidence_score=pv["confidence"],
+                sparkline=history_points,
+            )
+        )
+        if len(results) >= limit:
+            break
+    return results
+
+
+@app.get("/pricing/sets", response_model=List[str])
+def pricing_sets(db: Session = Depends(get_session)):
+    stmt = (
+        select(CardTemplate.set_name)
+        .join(PriceSnapshot, PriceSnapshot.template_id == CardTemplate.template_id)
+        .where(CardTemplate.set_name.isnot(None))
+        .group_by(CardTemplate.set_name)
+    )
+    rows = db.exec(stmt).all()
+    names = [r for r in rows if r]
+    # ensure uniqueness and stable order
+    seen = set()
+    ordered = []
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            ordered.append(name)
+    return ordered
+
+
+@app.get("/pricing/card/{template_id}", response_model=PricingCardResponse)
+def pricing_card(template_id: int, db: Session = Depends(get_session)):
+    pv = compute_price_view(template_id, db)
+    if not pv:
+        raise HTTPException(status_code=404, detail="No price snapshot found")
+    snap = pv["latest"]
+    return PricingCardResponse(
+        template_id=template_id,
+        source=snap.source,
+        currency=snap.currency,
+        mid_price=float(snap.mid_price),
+        low_price=float(snap.low_price),
+        high_price=float(snap.high_price),
+        collected_at=float(snap.collected_at),
+        display_price=pv["display_price"],
+        fair_value=pv["fair_value"],
+        avg_7d=pv["avg_7d"],
+        avg_30d=pv["avg_30d"],
+        spread_ratio=pv["spread_ratio"],
+        price_confidence=pv["confidence"],
+        confidence_score=pv["confidence"],
+    )
+
+
+@app.get("/pricing/card/{template_id}/history", response_model=List[PricingHistoryPoint])
+def pricing_card_history(template_id: int, points: int = 30, db: Session = Depends(get_session)):
+    safe_points = max(1, min(points, 90))
+    return fetch_history_points(template_id, db, limit=safe_points)
+
+
+@app.get("/pricing/sparklines", response_model=List[PricingSparkline])
+def pricing_sparklines(template_ids: str, points: int = 30, db: Session = Depends(get_session)):
+    if not template_ids:
+        raise HTTPException(status_code=400, detail="template_ids required")
+    safe_points = max(1, min(points, 90))
+    deduped: List[int] = []
+    for tid_str in template_ids.split(","):
+        tid_str = tid_str.strip()
+        if not tid_str:
+            continue
+        try:
+            tid_val = int(tid_str)
+        except ValueError:
+            continue
+        if tid_val not in deduped:
+            deduped.append(tid_val)
+    items: List[PricingSparkline] = []
+    for tid in deduped:
+        points_list = fetch_history_points(tid, db, limit=safe_points)
+        items.append(PricingSparkline(template_id=tid, points=points_list))
+    return items
+
+
+@app.get("/pricing/portfolio", response_model=PricingPortfolioResponse)
+def pricing_portfolio(wallet: str, db: Session = Depends(get_session)):
+    breakdown, total_value = build_portfolio_breakdown(wallet, db)
+    return PricingPortfolioResponse(total_value_usd=total_value, breakdown=breakdown)
+
+
+@app.get("/pricing/stats", response_model=PricingStatsResponse)
+def pricing_stats(wallet: str, db: Session = Depends(get_session)):
+    breakdown, total_value = build_portfolio_breakdown(wallet, db)
+    now_ts = time.time()
+    cutoff_24h = now_ts - 24 * 3600
+    previous_total = 0.0
+    for item in breakdown:
+        snap_prev = get_snapshot_as_of(item.template_id, cutoff_24h, db)
+        if snap_prev:
+            previous_total += fair_value_from_snapshot(snap_prev) * item.count
+        else:
+            previous_total += item.fair_value * item.count
+    change_pct = 0.0 if previous_total == 0 else ((total_value - previous_total) / previous_total) * 100.0
+    return PricingStatsResponse(
+        portfolio_total=total_value,
+        change_24h=change_pct,
+        last_valuation_at=now_ts,
+        breakdown=breakdown,
+    )
 
 
 @app.get("/admin/sessions")
@@ -2272,6 +3421,81 @@ def admin_force_close(req: AdminResetRequest, db: Session = Depends(get_session)
                 db.add(rec)
     db.commit()
     return {"reset": True, "signature": sig_str}
+
+
+@app.post("/admin/marketplace/force_cancel")
+def admin_force_cancel_listings(req: AdminForceCancelListings):
+    admin_keypair = load_admin_keypair()
+    admin_pub = admin_keypair.pubkey()
+    if auth_settings.admin_address and auth_settings.admin_address != str(admin_pub):
+        raise HTTPException(status_code=400, detail="Admin keypair does not match ADMIN_ADDRESS")
+
+    ok = []
+    errors = []
+    canonical_vault = vault_state_pda() if not req.vault_state else to_pubkey(req.vault_state)
+    for asset in req.assets:
+        try:
+            core = to_pubkey(asset)
+            vault_state = canonical_vault
+            vault_authority = vault_authority_pda(vault_state)
+            card_record = card_record_pda(vault_state, core)
+            listing = listing_pda(vault_state, core)
+            resp = sol_client.get_account_info(listing)
+            listing_info = None
+            listing_account_pk = listing
+
+            # Fallback: if derived listing missing, try treating the provided asset as the listing PDA itself
+            if resp.value is None or resp.value.data is None:
+                alt = sol_client.get_account_info(core)
+                if alt.value is not None and alt.value.owner == PROGRAM_ID and alt.value.data is not None:
+                    listing_account_pk = core
+                    try:
+                        listing_info = parse_listing_account(bytes(alt.value.data))
+                        core = to_pubkey(str(listing_info.get("core_asset"))) if listing_info and listing_info.get("core_asset") else core
+                    except Exception:
+                        listing_info = None
+                if listing_info is None:
+                    # force prune using whatever account we have (derived or provided)
+                    listing_info = {"vault_state": str(canonical_vault), "seller": str(admin_pub), "core_asset": asset}
+            else:
+                listing_info = parse_listing_account(bytes(resp.value.data))
+
+            if not listing_info or not listing_info.get("seller"):
+                # fallback to prune
+                listing_info = {"vault_state": str(canonical_vault), "seller": str(admin_pub), "core_asset": asset}
+
+            # If the listing was created under a different vault_state, switch to that so seeds match
+            if listing_info.get("vault_state"):
+                vault_state = to_pubkey(str(listing_info["vault_state"]))
+                vault_authority = vault_authority_pda(vault_state)
+                card_record = card_record_pda(vault_state, core)
+                if listing_account_pk == listing:
+                    listing_account_pk = listing_pda(vault_state, core)
+            seller = listing_info["seller"]
+            if not pda_exists(vault_state):
+                ix = build_admin_prune_listing_ix(
+                    admin=admin_pub,
+                    vault_state=canonical_vault,
+                    listing=listing_account_pk,
+                )
+            else:
+                ix = build_admin_force_cancel_listing_ix(
+                    admin=admin_pub,
+                    vault_state=vault_state,
+                    card_record=card_record,
+                    core_asset=core,
+                    listing=listing_account_pk,
+                    vault_authority=vault_authority,
+                    seller=seller,
+                )
+            blockhash = get_latest_blockhash()
+            message = MessageV0.try_compile(admin_pub, [ix], [], Hash.from_string(blockhash))
+            tx = VersionedTransaction(message, [admin_keypair])
+            sig = sol_client.send_raw_transaction(bytes(tx), opts=TxOpts(skip_preflight=False))
+            ok.append({"asset": asset, "signature": sig.get("result") if isinstance(sig, dict) else str(sig)})
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"asset": asset, "error": str(exc)})
+    return {"ok": ok, "errors": errors}
 
 
 @app.post("/admin/reconcile")

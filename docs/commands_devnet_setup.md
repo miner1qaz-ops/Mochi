@@ -86,3 +86,19 @@ NEXT_PUBLIC_PROGRAM_ID=Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx
 ```
 
 Note: Metaplex Core CPI custody/burn wiring is still TODO in the program; after adding it, rebuild/deploy and re-run initialize + deposit.
+
+## Docker toolchain (clean Anchor builds)
+- Build the image once (from repo root): `docker build -f Dockerfile.anchor -t anchor-dev .`
+- Run with project + keys mounted:
+```
+docker run --rm -it \
+  -v /root/mochi:/workspace \
+  -v /root/mochi/anchor-program/keys:/root/.config/solana \
+  -w /workspace/anchor-program \
+  anchor-dev bash
+```
+- Inside the container:
+  - `anchor clean`
+  - `anchor build --program-name mochi_seed_sale --arch sbf`
+  - `anchor deploy --program-name mochi_seed_sale --provider.cluster devnet`
+- Versions baked into the image: `solana-cli 1.18.20`, `anchor-cli 0.30.1`, `rustc/cargo 1.91.1`. Use this container for all future builds/deploys to avoid host toolchain drift.

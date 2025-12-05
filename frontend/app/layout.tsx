@@ -7,8 +7,18 @@ import { Header } from '../components/Header';
 const space = Space_Grotesk({ subsets: ['latin'], weight: ['400', '500', '600', '700'] });
 
 export const metadata: Metadata = {
-  title: 'Mochi v2 - RWA Pokémon Vault',
-  description: 'Tokenized graded Pokémon cards on Solana with gacha packs and marketplace.',
+  title: 'Mochi – Phygital Pokémon Cards on Solana',
+  description:
+    'Mochi is a Web3 “Real World Asset” platform on Solana that bridges physical Pokémon cards with digital NFTs to create a phygital marketplace and gaming ecosystem.',
+  openGraph: {
+    title: 'Mochi – Phygital Pokémon Cards on Solana',
+    description:
+      'Bridge physical Pokémon cards with digital NFTs. Open packs, list on the marketplace, and redeem physical cards via Mochi on Solana.',
+    url: 'https://getmochi.fun',
+    siteName: 'Mochi',
+    type: 'website',
+  },
+  metadataBase: new URL('https://getmochi.fun'),
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
@@ -16,6 +26,19 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="en">
       <head>
         <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+        <script
+          type="application/ld+json"
+          dangerouslySetInnerHTML={{
+            __html: JSON.stringify({
+              '@context': 'https://schema.org',
+              '@type': 'Organization',
+              name: 'Mochi',
+              url: 'https://getmochi.fun',
+              description:
+                'Mochi is a Web3 RWA platform on Solana bridging physical Pokémon cards with digital NFTs to create a phygital marketplace and gaming ecosystem.',
+            }),
+          }}
+        />
       </head>
       <body className={space.className}>
         <WalletProvider>

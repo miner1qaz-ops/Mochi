@@ -1,5 +1,5 @@
 [workspace]
-members = ["programs/mochi_v2_vault"]
+members = ["programs/mochi_v2_vault", "programs/mochi_seed_sale"]
 resolver = "2"
 
 [profile.release]
@@ -15,3 +15,10 @@ proc-macro2 = { version = "1.0.86", features = ["span-locations"] }
 
 [patch.crates-io]
 anchor-syn = { path = "patches/anchor-syn" }
+toml_datetime = { path = "patches/toml_datetime" }
+toml_edit = { path = "patches/toml_edit" }
+toml_parser = { path = "patches/toml_parser" }
+toml_write = { path = "patches/toml_write" }
+indexmap = { path = "patches/indexmap" }
+borsh = { path = "patches/borsh_1_6_0" }
+borsh-derive = { path = "patches/borsh-derive_1_6_0" }

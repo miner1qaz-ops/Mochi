@@ -15,8 +15,6 @@ import {
   confirmOpen,
   confirmClaim,
   confirmExpire,
-  fetchVirtualCards,
-  VirtualCard,
 } from '../../lib/api';
 import { buildV0Tx } from '../../lib/tx';
 import { deriveAta } from '../../lib/ata';
@@ -43,7 +41,13 @@ const extractErrorMessage = (err: unknown): string => {
     const detail =
       (data && (data.detail || data.message)) ||
       (Array.isArray(data?.detail) ? data.detail.map((d: any) => d.msg || JSON.stringify(d)).join('; ') : null);
-    if (detail) return String(detail);
+    if (detail) {
+      const msg = String(detail);
+      if (msg.toLowerCase().includes('cardnotavailable') || msg.toLowerCase().includes('card not available') || msg.includes('6004') || msg.includes('0x1774')) {
+        return 'Pack inventory busy. Please try again in a moment (we are refreshing the vault cards).';
+      }
+      return msg;
+    }
     if ('message' in err && typeof (err as { message?: string }).message === 'string') {
       return (err as { message?: string }).message as string;
     }
@@ -61,6 +65,23 @@ const rarityColors: Record<string, string> = {
   SpecialIllustrationRare: 'from-sakura/90 to-aurora/80',
   MegaHyperRare: 'from-red-400 to-purple-500',
   Energy: 'from-white/20 to-aurora/20',
+};
+
+const rarityGlowClass = (rarity?: string | null) => {
+  if (!rarity) return 'rarity-glow rarity-glow--common';
+  const key = rarity.toLowerCase().replace(/[^a-z]/g, '');
+  const map: Record<string, string> = {
+    common: 'rarity-glow rarity-glow--common',
+    uncommon: 'rarity-glow rarity-glow--uncommon',
+    rare: 'rarity-glow rarity-glow--rare',
+    doublerare: 'rarity-glow rarity-glow--doublerare',
+    ultrarare: 'rarity-glow rarity-glow--ultrarare',
+    illustrationrare: 'rarity-glow rarity-glow--illustrationrare',
+    specialillustrationrare: 'rarity-glow rarity-glow--specialillustrationrare',
+    megahyperrare: 'rarity-glow rarity-glow--megahyperrare',
+    energy: 'rarity-glow rarity-glow--energy',
+  };
+  return map[key] || 'rarity-glow rarity-glow--common';
 };
 
 const FlipModalCard = ({
@@ -166,7 +187,7 @@ export default function GachaPage() {
   const usdcMint = process.env.NEXT_PUBLIC_USDC_MINT ? new PublicKey(process.env.NEXT_PUBLIC_USDC_MINT) : null;
   const [packStage, setPackStage] = useState<'idle' | 'swing' | 'tear' | 'reveal'>('idle');
   const [revealIndex, setRevealIndex] = useState<number>(-1);
-  const [revealMode, setRevealMode] = useState<'fast' | 'one'>('fast');
+  const [revealMode, setRevealMode] = useState<'fast' | 'one'>('one'); // fast mode temporarily disabled in UI
   const [showOneModal, setShowOneModal] = useState(false);
   const [templatesByPack, setTemplatesByPack] = useState<Record<string, Record<number, { name: string; image: string; rarity: string }>>>({});
   const [revealed, setRevealed] = useState<boolean[]>([]);
@@ -175,7 +196,6 @@ export default function GachaPage() {
   const [openSignature, setOpenSignature] = useState<string | null>(null);
   const [confirmDone, setConfirmDone] = useState(false);
   const [opening, setOpening] = useState(false);
-  const [virtualCards, setVirtualCards] = useState<VirtualCard[]>([]);
   const packOptions = useMemo(
     () => [
       { id: 'meg_web_alt', name: 'Mega Evolutions Pack', priceSol: 0.12, priceUsdc: 12, image: '/img/pack_alt.jpg' },
@@ -323,16 +343,32 @@ export default function GachaPage() {
     [publicKey, resetSessionState, revealMode],
   );
 
+  const waitForSession = useCallback(
+    async (attempts: number = 8, delayMs: number = 1200) => {
+      if (!publicKey) return null;
+      for (let i = 0; i < attempts; i += 1) {
+        try {
+          const pending = await fetchActiveSession(publicKey.toBase58());
+          return pending;
+        } catch (err) {
+          const axiosErr = err as AxiosError;
+          if (axiosErr?.response?.status !== 404) {
+            throw err;
+          }
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
+      }
+      return null;
+    },
+    [publicKey],
+  );
+
   useEffect(() => {
     if (!publicKey) {
       resetSessionState();
-      setVirtualCards([]);
       return;
     }
     hydrateSession();
-    fetchVirtualCards(publicKey.toBase58())
-      .then(setVirtualCards)
-      .catch(() => setVirtualCards([]));
   }, [publicKey, hydrateSession, resetSessionState]);
 
   const handlePreview = async () => {
@@ -381,6 +417,9 @@ export default function GachaPage() {
         vaultToken,
         currencyMint
       );
+      const raritiesForConfirm = buildRes.lineup.map((s) => s.rarity);
+      const templateIdsForConfirm = buildRes.lineup.map((s) => (s.template_id === undefined ? null : s.template_id));
+      const serverNonceForConfirm = buildRes.provably_fair?.server_nonce;
       // Do not render lineup/session yet; wait for on-chain confirmation.
       // Sign and send open pack transaction
       const tx = buildV0Tx(publicKey, buildRes.recent_blockhash, buildRes.instructions);
@@ -412,22 +451,53 @@ export default function GachaPage() {
       // Auto-confirm immediately
       try {
         setConfirmLoading(true);
-        setStatusMsg('Verifying on-chain session and locking cards…');
-        const confirmRes = await confirmOpen(sig, publicKey.toBase58());
+        setStatusMsg('Waiting for your pack to finalize on-chain…');
+        const confirmRes = await confirmOpen(
+          sig,
+          publicKey.toBase58(),
+          raritiesForConfirm,
+          templateIdsForConfirm,
+          serverNonceForConfirm,
+        );
         if (!confirmRes || !confirmRes.state) {
           throw new Error('Confirm failed – no state returned.');
         }
         setConfirmDone(true);
         await hydrateSession({ interactive: true, fresh: true });
-        fetchVirtualCards(publicKey.toBase58()).then(setVirtualCards).catch(() => {});
         setStatusKind('info');
         setStatusMsg('Pack opened and locked. Reveal, then claim or sell back.');
       } catch (err) {
         console.error('confirm open error', err);
-        setStatusKind('error');
-        setStatusMsg(`${extractErrorMessage(err)}. If stuck, try Sell Back or wait for expiry.`);
-        // Clear any local session state to avoid ghost sessions.
-        resetSessionState();
+        setStatusKind('info');
+        setStatusMsg('Finalizing pack on-chain… this can take a few seconds. Auto-resuming.');
+        try {
+          const pending = await waitForSession();
+          if (!pending) {
+            throw err;
+          }
+          setSessionId(pending.session_id);
+          setSlots(pending.lineup);
+          setRevealed(Array(pending.lineup.length).fill(true));
+          setRevealIndex(pending.lineup.length - 1);
+          setModalFaceBack(false);
+          setShowOneModal(false);
+          setPackStage('reveal');
+          setCountdown(pending.countdown_seconds);
+          const fair = pending.provably_fair || {};
+          setProof({
+            server_seed_hash: fair.server_seed_hash || '',
+            server_nonce: fair.server_nonce || '',
+            entropy_proof: fair.entropy_proof || fair.assets || '',
+          });
+          setConfirmDone(true);
+          setStatusKind('info');
+          setStatusMsg('Session detected on-chain. Reveal, then claim or sell back.');
+        } catch (resumeErr) {
+          console.error('auto-resume after confirm failure', resumeErr);
+          // Clear any local session state to avoid ghost sessions.
+          resetSessionState();
+          setStatusMsg(`${extractErrorMessage(err)}. If stuck, try Sell Back or wait for expiry.`);
+        }
       } finally {
         setConfirmLoading(false);
       }
@@ -469,7 +539,6 @@ export default function GachaPage() {
       setStatusMsg(`Claimed! Tx: ${sig}`);
       resetSessionState();
       hydrateSession();
-      fetchVirtualCards(publicKey.toBase58()).then(setVirtualCards).catch(() => {});
     } catch (e) {
       console.error('claim error', e);
       setStatusKind('error');
@@ -508,7 +577,6 @@ export default function GachaPage() {
       });
       setStatusMsg(`Sell-back tx: ${sig}`);
       resetSessionState();
-      fetchVirtualCards(publicKey.toBase58()).then(setVirtualCards).catch(() => {});
     } catch (e) {
       console.error('sellback error', e);
       setStatusKind('error');
@@ -532,7 +600,6 @@ export default function GachaPage() {
       await confirmExpire(sig, publicKey.toBase58());
       setStatusMsg(`Expire session tx: ${sig}`);
       resetSessionState();
-      fetchVirtualCards(publicKey.toBase58()).then(setVirtualCards).catch(() => {});
     } catch (e) {
       console.error('expire error', e);
       setStatusKind('error');
@@ -638,7 +705,7 @@ export default function GachaPage() {
         setRevealIndex(i);
       }}
     >
-      <div className={`h-full w-full rounded-2xl bg-gradient-to-br ${rarityColors[slot.rarity] || 'from-white/10 to-white/5'} flex flex-col justify-between p-2 overflow-hidden`}>
+      <div className={`h-full w-full rounded-2xl bg-gradient-to-br ${rarityColors[slot.rarity] || 'from-white/10 to-white/5'} flex flex-col justify-between p-2 overflow-hidden ${rarityGlowClass(slot.rarity)}`}>
         <div className="flex items-center justify-between px-2 pt-2 text-xs uppercase">
           <span className={`${i <= revealIndex ? 'text-white/80' : 'text-white/40'}`}>Slot {i + 1}</span>
           <span className={`px-2 py-1 rounded-full text-[10px] font-semibold ${slot.is_nft ? 'bg-aurora/40 text-white' : 'bg-white/20 text-white/80'}`}>
@@ -685,8 +752,8 @@ export default function GachaPage() {
           <div className="flex items-center gap-3">
             <img src="/mochi_icon.png" alt="Mochi icon" className="h-10 w-10 rounded-full" />
             <div>
-              <p className="text-sm uppercase text-white/60 tracking-[0.2em]">Mochi Great Pack</p>
-              <p className="text-xl font-semibold">11 cards • 60 minute decision window</p>
+              <p className="text-sm uppercase text-white/60 tracking-[0.2em]">Mega Evolutions Pack</p>
+              <p className="text-xl font-semibold">11 cards</p>
             </div>
           </div>
           <div className="flex flex-wrap gap-3">
@@ -825,35 +892,14 @@ export default function GachaPage() {
         </div>
       )}
 
-      {virtualCards.length > 0 && (
-        <div className="rounded-3xl border border-white/10 bg-white/5 p-4">
-          <div className="flex items-center gap-2 mb-3">
-            <div className="h-2 w-2 rounded-full bg-aurora" />
-            <p className="text-sm text-white/80 font-semibold">Your virtual cards (Commons/Uncommons/Energy)</p>
-          </div>
-          <div className="grid sm:grid-cols-2 md:grid-cols-3 gap-2">
-            {virtualCards.map((vc) => (
-              <div key={`${vc.template_id}-${vc.rarity}`} className="rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-white/80 flex items-center justify-between">
-                <span>{vc.rarity} #{vc.template_id}</span>
-                <span className="font-semibold">x{vc.count}</span>
-              </div>
-            ))}
-          </div>
-          <p className="text-xs text-white/60 mt-2">Recycle coming next: trade low-tier cards for Mochi tokens.</p>
-        </div>
-      )}
-
       <div className="flex flex-wrap items-center gap-3">
         <span className="text-sm text-white/70">Reveal mode:</span>
         <button
           type="button"
-          className={`px-4 py-2 rounded-xl border ${revealMode === 'fast' ? 'bg-aurora/30 border-aurora/50 text-white' : 'bg-white/5 border-white/10 text-white/70'}`}
-          onClick={() => {
-            setRevealMode('fast');
-            setShowOneModal(false);
-          }}
+          className="px-4 py-2 rounded-xl border bg-white/5 border-white/10 text-white/40 cursor-not-allowed"
+          disabled
         >
-          Fast mode (grid)
+          Fast mode (coming soon)
         </button>
         <button
           type="button"
@@ -987,7 +1033,7 @@ export default function GachaPage() {
           disabled={!sessionId || sellbackLoading || !confirmDone}
           className="px-5 py-3 rounded-xl border border-white/20 hover:border-sakura text-white disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          {sellbackLoading ? 'Processing…' : confirmDone ? 'Instant sell-back (90%)' : 'Confirm cards first'}
+          {sellbackLoading ? 'Processing…' : 'Instant sell-back (90%)'}
         </button>
         <button
           onClick={handleExpire}

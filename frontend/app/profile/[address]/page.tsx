@@ -4,7 +4,18 @@ import { useEffect, useMemo, useState } from 'react';
 import { useParams } from 'next/navigation';
 import { useConnection, useWallet } from '@solana/wallet-adapter-react';
 import { PublicKey } from '@solana/web3.js';
-import { api, fetchVirtualCards, listCard, VirtualCard } from '../../../lib/api';
+import {
+  api,
+  fetchVirtualCards,
+  fetchListings,
+  listCard,
+  cancelListing,
+  fetchGarbageListings,
+  forceCancelGarbage,
+  VirtualCard,
+  Listing,
+  GarbageListing,
+} from '../../../lib/api';
 import { deriveAta } from '../../../lib/ata';
 import { buildV0Tx } from '../../../lib/tx';
 
@@ -13,24 +24,110 @@ export default function ProfilePage() {
   const address = params?.address as string;
   const [assets, setAssets] = useState<any[]>([]);
   const [virtualCards, setVirtualCards] = useState<VirtualCard[]>([]);
+  const [listedCards, setListedCards] = useState<Listing[]>([]);
+  const [garbageListings, setGarbageListings] = useState<GarbageListing[]>([]);
   const [selected, setSelected] = useState<Record<number, number>>({});
   const [recycleStatus, setRecycleStatus] = useState<string | null>(null);
   const [recycleLoading, setRecycleLoading] = useState(false);
+  const [listingId, setListingId] = useState<string | null>(null);
+  const [cancellingId, setCancellingId] = useState<string | null>(null);
+  const [cleaningId, setCleaningId] = useState<string | null>(null);
   const [sortKey, setSortKey] = useState<'rarity' | 'name'>('rarity');
-  const [filterVirtual, setFilterVirtual] = useState<'all' | 'nft' | 'virtual'>('all');
+  const [viewTab, setViewTab] = useState<'nft' | 'listed' | 'virtual' | 'garbage'>('nft');
   const [searchTerm, setSearchTerm] = useState('');
   const [priceInputs, setPriceInputs] = useState<Record<string, number>>({});
-  const { publicKey, signTransaction } = useWallet();
+  const { publicKey, signTransaction, sendTransaction } = useWallet();
   const { connection } = useConnection();
   const mochiMint = useMemo(
     () => new PublicKey(process.env.NEXT_PUBLIC_MOCHI_TOKEN_MINT || '3gqKrJoVx3gUXLHCsNQfpyZAuVagLHQFGtYgbtY3VEsn'),
     []
   );
+  const [assetImages, setAssetImages] = useState<Record<string, string>>({});
+
+  const normalizeImage = (src?: string | null) => {
+    if (!src) return undefined;
+    let url = src;
+    if (url.startsWith('ipfs://')) {
+      url = url.replace('ipfs://', 'https://ipfs.io/ipfs/');
+    }
+    // Legacy assets still point to mochims.fun; swap to the live, valid cert on getmochi.fun
+    url = url.replace('mochims.fun', 'getmochi.fun');
+    return url;
+  };
+
+  const formatName = (name?: string | null, templateId?: number | null) => {
+    if (!templateId) return name || '';
+    if (name && name.includes('#')) return name;
+    return name ? `${name} #${templateId}` : `Card #${templateId}`;
+  };
+
+  const hasInlineImage = (asset: any) =>
+    !!(
+      asset?.content?.links?.image ||
+      asset?.content?.metadata?.image ||
+      asset?.content?.files?.[0]?.uri ||
+      asset?.content?.metadata?.properties?.files?.[0]?.uri
+    );
+
+  useEffect(() => {
+    // Fetch metadata for assets missing inline image
+    const missing = assets.filter((a) => !hasInlineImage(a));
+    if (!missing.length) return;
+    missing.forEach(async (a) => {
+      const candidates = [
+        a.content?.json_uri,
+        a.content?.metadata_uri,
+        a.content?.uri,
+      ]
+        .map((u: string | undefined) => normalizeImage(u))
+        .filter(Boolean) as string[];
+      for (const uri of candidates) {
+        try {
+          const res = await fetch(uri, { cache: 'no-store' });
+          if (!res.ok) continue;
+          const meta = await res.json();
+          const img =
+            normalizeImage(meta?.image) ||
+            normalizeImage(meta?.properties?.image) ||
+            normalizeImage(meta?.properties?.files?.[0]?.uri);
+          if (img) {
+            setAssetImages((prev) => (prev[a.id] ? prev : { ...prev, [a.id]: img }));
+            break;
+          }
+        } catch {
+          /* ignore and try next candidate */
+        }
+      }
+    });
+  }, [assets]);
+
+  const rarityGlowClass = (rarity?: string | null) => {
+    if (!rarity) return 'rarity-glow rarity-glow--common';
+    const key = rarity.toLowerCase().replace(/[^a-z]/g, '');
+    const map: Record<string, string> = {
+      common: 'rarity-glow rarity-glow--common',
+      uncommon: 'rarity-glow rarity-glow--uncommon',
+      rare: 'rarity-glow rarity-glow--rare',
+      doublerare: 'rarity-glow rarity-glow--doublerare',
+      ultrarare: 'rarity-glow rarity-glow--ultrarare',
+      illustrationrare: 'rarity-glow rarity-glow--illustrationrare',
+      specialillustrationrare: 'rarity-glow rarity-glow--specialillustrationrare',
+      megahyperrare: 'rarity-glow rarity-glow--megahyperrare',
+      energy: 'rarity-glow rarity-glow--energy',
+    };
+    return map[key] || 'rarity-glow rarity-glow--common';
+  };
 
   useEffect(() => {
     if (!address) return;
     api.get(`/profile/${address}`).then((res) => setAssets(res.data.assets || [])).catch(console.error);
     fetchVirtualCards(address).then(setVirtualCards).catch(() => setVirtualCards([]));
+    fetchListings()
+      .then((items) => setListedCards(items.filter((l) => (l.seller || '').toLowerCase() === address.toLowerCase())))
+      .catch(() => setListedCards([]));
+    fetchGarbageListings()
+      .then((items) => setGarbageListings(items || []))
+      .catch(() => setGarbageListings([]));
   }, [address]);
 
   const rarityOrder: Record<string, number> = {
@@ -71,7 +168,25 @@ export default function ProfilePage() {
     });
   }, [sortedAssets, searchTerm]);
 
+  const filteredListings = useMemo(() => {
+    return (listedCards || []).filter((item) => {
+      const name = (item.name || '').toLowerCase();
+      const matchesSearch = searchTerm ? name.includes(searchTerm.toLowerCase()) : true;
+      return matchesSearch;
+    });
+  }, [listedCards, searchTerm]);
+
+  const filteredGarbage = useMemo(() => {
+    return (garbageListings || []).filter((item) => {
+      const core = (item.core_asset || '').toLowerCase();
+      const matchesSearch = searchTerm ? core.includes(searchTerm.toLowerCase()) : true;
+      return matchesSearch;
+    });
+  }, [garbageListings, searchTerm]);
+
   const totalVirtual = virtualCards.reduce((sum, v) => sum + v.count, 0);
+  const totalNfts = filteredAssets.length;
+  const totalListed = filteredListings.length;
 
   const recycleItems = Object.entries(selected)
     .filter(([, cnt]) => cnt > 0)
@@ -112,112 +227,346 @@ export default function ProfilePage() {
     }
   };
 
+  const refreshProfile = () => {
+    if (!address) return;
+    api.get(`/profile/${address}`).then((res) => setAssets(res.data.assets || [])).catch(console.error);
+    fetchListings()
+      .then((items) => setListedCards(items.filter((l) => (l.seller || '').toLowerCase() === address.toLowerCase())))
+      .catch(() => setListedCards([]));
+    fetchVirtualCards(address).then(setVirtualCards).catch(() => setVirtualCards([]));
+    fetchGarbageListings()
+      .then((items) => setGarbageListings(items || []))
+      .catch(() => setGarbageListings([]));
+  };
+
+  const handleList = async (assetId: string) => {
+    if (!publicKey) return;
+    const priceLamports = priceInputs[assetId];
+    if (!priceLamports || priceLamports <= 0) {
+      setRecycleStatus('Enter a price greater than 0.');
+      return;
+    }
+    setListingId(assetId);
+    setRecycleStatus('Listing…');
+    try {
+      const res = await listCard(assetId, publicKey.toBase58(), Math.floor(priceLamports * 1_000_000_000));
+      const tx = buildV0Tx(publicKey, res.recent_blockhash, res.instructions);
+      const signed = signTransaction ? await signTransaction(tx) : tx;
+      const sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
+      setRecycleStatus(`Listed. Tx: ${sig}`);
+      await connection.confirmTransaction(sig, 'confirmed');
+      refreshProfile();
+      setTimeout(() => window.location.reload(), 300);
+    } catch (e) {
+      console.error('list error', e);
+      setRecycleStatus(`Listing failed. ${(e as Error)?.message || ''}`.trim() || 'Listing failed. Check balance/ownership and try again.');
+    }
+    setListingId(null);
+  };
+
+  const handleCancel = async (assetId: string) => {
+    if (!publicKey) return;
+    try {
+      setCancellingId(assetId);
+      setRecycleStatus('Cancelling listing…');
+      const res = await cancelListing(assetId, publicKey.toBase58());
+      const tx = buildV0Tx(publicKey, res.recent_blockhash, res.instructions);
+      // Pre-flight simulate to surface errors in UI
+      try {
+        const sim = await connection.simulateTransaction(tx, { sigVerify: false });
+        if (sim.value.err) {
+          setRecycleStatus(`Cancel failed (sim): ${JSON.stringify(sim.value.err)} logs=${sim.value.logs?.join(' | ')}`);
+          setCancellingId(null);
+          return;
+        }
+      } catch (simErr) {
+        console.error('simulate cancel error', simErr);
+      }
+      let sig: string;
+      if (sendTransaction) {
+        sig = await sendTransaction(tx, connection, { maxRetries: 3, skipPreflight: false });
+      } else if (signTransaction) {
+        const signed = await signTransaction(tx);
+        sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
+      } else {
+        setRecycleStatus('Connect a wallet that can sign transactions.');
+        return;
+      }
+      setRecycleStatus(`Cancelled. Tx: ${sig}`);
+      await connection.confirmTransaction(sig, 'confirmed');
+      refreshProfile();
+      // Hard refresh so the removal is obvious to the user right after a successful cancel.
+      setTimeout(() => window.location.reload(), 250);
+    } catch (e) {
+      console.error('cancel error', e);
+      setRecycleStatus(`Cancel failed. ${(e as Error)?.message || ''}`.trim());
+    } finally {
+      setCancellingId(null);
+    }
+  };
+
+  const handleForceCancelGarbage = async (item: GarbageListing) => {
+    setCleaningId(item.core_asset);
+    setRecycleStatus('Force cancelling (admin)…');
+    try {
+      const res = await forceCancelGarbage([item.core_asset], item.vault_state);
+      if (res.errors && res.errors.length) {
+        setRecycleStatus(`Force cancel failed: ${res.errors[0].error}`);
+      } else {
+        setRecycleStatus('Force cancelled. Refreshing…');
+        refreshProfile();
+        setTimeout(() => window.location.reload(), 300);
+      }
+    } catch (e) {
+      setRecycleStatus(`Force cancel failed. ${(e as Error)?.message || ''}`.trim());
+    } finally {
+      setCleaningId(null);
+    }
+  };
+
   return (
     <div className="space-y-6">
       <div>
         <h1 className="text-3xl font-semibold">Profile</h1>
         <p className="text-white/60">{address}</p>
       </div>
-      <div className="flex flex-wrap items-center gap-3 text-sm text-white/70">
-        <div className="flex items-center gap-2">
-          <span>Sort by:</span>
-          <select
-            value={sortKey}
-            onChange={(e) => setSortKey(e.target.value as any)}
-            className="bg-black/40 border border-white/10 rounded-lg px-2 py-1"
+      {recycleStatus && (
+        <div className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-white/80">
+          {recycleStatus}
+        </div>
+      )}
+      <div className="card-blur rounded-2xl border border-white/5 p-4 space-y-3">
+        <div className="grid grid-cols-3 gap-3 text-sm text-white">
+          <div className="rounded-xl bg-white/5 border border-white/10 p-3">
+            <p className="text-xs text-white/60">Owned NFTs</p>
+            <p className="text-lg font-semibold">{totalNfts}</p>
+          </div>
+          <div className="rounded-xl bg-white/5 border border-white/10 p-3">
+            <p className="text-xs text-white/60">Listed</p>
+            <p className="text-lg font-semibold">{totalListed}</p>
+          </div>
+          <div className="rounded-xl bg-white/5 border border-white/10 p-3">
+            <p className="text-xs text-white/60">Virtual cards</p>
+            <p className="text-lg font-semibold">{totalVirtual}</p>
+          </div>
+        </div>
+        <div className="flex gap-2 text-sm flex-wrap">
+          <button
+            type="button"
+            className={viewTab === 'nft' ? 'cta-primary' : 'cta-ghost'}
+            data-tone={viewTab === 'nft' ? 'sakura' : undefined}
+            onClick={() => setViewTab('nft')}
           >
-            <option value="rarity">Rarity</option>
-            <option value="name">Name</option>
-          </select>
+            Owned NFTs
+          </button>
+          <button
+            type="button"
+            className={viewTab === 'listed' ? 'cta-primary' : 'cta-ghost'}
+            data-tone={viewTab === 'listed' ? 'aurora' : undefined}
+            onClick={() => setViewTab('listed')}
+          >
+            Listed NFTs
+          </button>
+          <button
+            type="button"
+            className={viewTab === 'virtual' ? 'cta-primary' : 'cta-ghost'}
+            data-tone={viewTab === 'virtual' ? 'lime' : undefined}
+            onClick={() => setViewTab('virtual')}
+          >
+            Virtual cards
+          </button>
+          <button
+            type="button"
+            className={viewTab === 'garbage' ? 'cta-primary' : 'cta-ghost'}
+            data-tone={viewTab === 'garbage' ? 'amber' : undefined}
+            onClick={() => setViewTab('garbage')}
+          >
+            Garbage listings
+          </button>
         </div>
-        <div className="flex items-center gap-2">
-          <span>Search:</span>
-          <input
-            value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
-            className="bg-black/40 border border-white/10 rounded-lg px-2 py-1 text-white"
-            placeholder="Pokémon name"
-          />
-        </div>
-        <div className="flex items-center gap-2">
-          <span>Total virtual:</span>
-          <span className="font-semibold text-white">{totalVirtual}</span>
-        </div>
-        <div className="flex items-center gap-2">
-          <span>Total NFTs:</span>
-          <span className="font-semibold text-white">{filteredAssets.length}</span>
+        <div className="flex flex-wrap items-center gap-3 text-sm text-white/70">
+          <div className="flex items-center gap-2">
+            <span>Sort by:</span>
+            <select
+              value={sortKey}
+              onChange={(e) => setSortKey(e.target.value as any)}
+              className="bg-black/40 border border-white/10 rounded-lg px-2 py-1"
+            >
+              <option value="rarity">Rarity</option>
+              <option value="name">Name</option>
+            </select>
+          </div>
+          <div className="flex items-center gap-2">
+            <span>Search:</span>
+            <input
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              className="bg-black/40 border border-white/10 rounded-lg px-2 py-1 text-white"
+              placeholder="Pokémon name"
+            />
+          </div>
         </div>
       </div>
 
-      <div className="grid sm:grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-3">
-        {filteredAssets.map((asset) => {
-          const name = asset.content?.metadata?.name || 'Core asset';
-          const image = asset.content?.links?.image || asset.content?.metadata?.image || '';
-          return (
-            <div key={asset.id} className="card-blur rounded-2xl p-3 border border-white/5 space-y-3">
-              <div className="relative aspect-[3/4] rounded-xl overflow-hidden border border-white/10 bg-black/20">
-                {image ? (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img src={image} alt={name} className="w-full h-full object-cover" loading="lazy" />
-                ) : (
-                  <div className="w-full h-full bg-gradient-to-br from-white/10 to-white/5 flex items-center justify-center text-xs text-white/50">
-                    No image
+      {viewTab === 'nft' && (
+        <div className="grid sm:grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-3">
+          {filteredAssets.map((asset) => {
+            const name = asset.content?.metadata?.name || 'Core asset';
+            const templateAttr = asset.content?.metadata?.attributes?.find(
+              (attr: any) => (attr.trait_type || '').toLowerCase() === 'template_id'
+            )?.value;
+            const templateId = typeof templateAttr === 'number' ? templateAttr : Number(templateAttr) || asset.template_id;
+            const rawImage =
+              asset.content?.links?.image ||
+              asset.content?.metadata?.image ||
+              asset.content?.files?.[0]?.uri ||
+              asset.content?.metadata?.properties?.files?.[0]?.uri ||
+              asset.content?.json_uri;
+            const fallbackTemplate =
+              templateId && Number.isFinite(templateId)
+                ? `https://assets.tcgdex.net/en/me/me01/${templateId}/high.png`
+                : undefined;
+            const image = assetImages[asset.id] || normalizeImage(rawImage) || fallbackTemplate || '/card_back.png';
+            const rarityVal =
+              asset.content?.metadata?.attributes?.find((attr: any) => (attr.trait_type || '').toLowerCase() === 'rarity')
+                ?.value || '';
+            return (
+              <div key={asset.id} className={`card-blur rounded-2xl p-3 border border-white/5 space-y-3 ${rarityGlowClass(rarityVal)}`}>
+                <div className="relative aspect-[3/4] rounded-xl overflow-hidden border border-white/5 bg-black/20">
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={image}
+                    alt={name}
+                    className="w-full h-full object-cover"
+                    loading="lazy"
+                    onError={(e) => {
+                      (e.target as HTMLImageElement).src = fallbackTemplate || '/card_back.png';
+                    }}
+                  />
+                </div>
+                <div className="space-y-1 text-sm">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="font-semibold truncate">{name}</p>
+                    <span className="glass-chip glass-chip--tiny">{rarityVal || '—'}</span>
                   </div>
-                )}
+                  <p className="text-xs text-white/60 break-all">{asset.id}</p>
+                  {publicKey?.toBase58() === address && (
+                    <div className="flex items-center gap-2 mt-2">
+                      <input
+                        type="number"
+                        min={0}
+                        step="0.01"
+                        value={priceInputs[asset.id] ?? ''}
+                        disabled={!!listingId}
+                        onChange={(e) =>
+                          setPriceInputs((prev) => ({
+                            ...prev,
+                            [asset.id]: parseFloat(e.target.value || '0'),
+                          }))
+                        }
+                        className="w-24 px-2 py-1 rounded-lg bg-white/10 border border-white/10 text-xs"
+                        placeholder="Price SOL"
+                      />
+                      <button
+                        type="button"
+                        className={`px-2 py-1 rounded-lg bg-aurora text-ink text-xs font-semibold transition ${
+                          listingId ? 'opacity-50 cursor-not-allowed' : 'hover:brightness-110'
+                        }`}
+                        disabled={!!listingId}
+                        onClick={() => handleList(asset.id)}
+                      >
+                        {listingId === asset.id ? 'Listing…' : 'List'}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+          {!assets.length && <p className="text-white/60">No assets found.</p>}
+        </div>
+      )}
+
+      {viewTab === 'listed' && (
+        <div className="grid sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+          {filteredListings.map((item) => (
+            <div key={item.core_asset} className={`card-blur rounded-2xl p-3 border border-white/5 space-y-3 ${rarityGlowClass(item.rarity)}`}>
+              <div className="relative aspect-[3/4] rounded-xl overflow-hidden border border-white/5 bg-black/20">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={normalizeImage(item.image_url) || '/card_back.png'}
+                  alt={item.name || item.core_asset}
+                  className="w-full h-full object-cover"
+                  loading="lazy"
+                  onError={(e) => {
+                    (e.target as HTMLImageElement).src = '/card_back.png';
+                  }}
+                />
               </div>
               <div className="space-y-1 text-sm">
-                <p className="font-semibold">{name}</p>
-                <p className="text-xs text-white/60 break-all">{asset.id}</p>
+                <p className="font-semibold">
+                  {formatName(item.name, item.template_id) || 'Listed NFT'}
+                </p>
+                <p className="text-xs text-white/60 break-all">{item.core_asset}</p>
+                <p className="text-xs text-aurora font-semibold">
+                  {item.price_lamports / 1_000_000_000} {item.currency_mint ? 'Token' : 'SOL'}
+                </p>
+                <p className="text-xs text-white/60">Status: {item.status}</p>
                 {publicKey?.toBase58() === address && (
-                  <div className="flex items-center gap-2 mt-2">
-                    <input
-                      type="number"
-                      min={0}
-                      step="0.01"
-                      value={priceInputs[asset.id] ?? ''}
-                      onChange={(e) =>
-                        setPriceInputs((prev) => ({
-                          ...prev,
-                          [asset.id]: parseFloat(e.target.value || '0'),
-                        }))
-                      }
-                      className="w-24 px-2 py-1 rounded-lg bg-white/10 border border-white/10 text-xs"
-                      placeholder="Price SOL"
-                    />
-                    <button
-                      type="button"
-                      className="px-2 py-1 rounded-lg bg-aurora text-ink text-xs font-semibold"
-                      onClick={async () => {
-                        const price = priceInputs[asset.id];
-                        if (!price || price <= 0) return;
-                        const lamports = Math.floor(price * 1_000_000_000);
-                        try {
-                          const { data } = await api.post('/marketplace/list/build', {
-                            core_asset: asset.id,
-                            wallet: address,
-                            price_lamports: lamports,
-                          });
-                          const tx = buildV0Tx(new PublicKey(address), data.recent_blockhash, data.instructions);
-                          const signed = signTransaction ? await signTransaction(tx) : tx;
-                          const sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
-                          setRecycleStatus(`Listed ${name} at ${price} SOL. Tx: ${sig}`);
-                        } catch (err) {
-                          console.error('list error', err);
-                          setRecycleStatus('Listing failed. Ensure you own the NFT and try again.');
-                        }
-                      }}
-                    >
-                      List
-                    </button>
-                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleCancel(item.core_asset)}
+                    disabled={!!cancellingId}
+                    className={`mt-2 w-full rounded-lg border border-white/20 px-3 py-1.5 text-xs font-semibold transition ${
+                      cancellingId
+                        ? 'bg-white/5 text-white/40 cursor-not-allowed'
+                        : 'bg-white/5 hover:border-amber-400/60 hover:text-amber-200'
+                    }`}
+                  >
+                    {cancellingId === item.core_asset ? 'Cancelling…' : 'Cancel listing'}
+                  </button>
                 )}
               </div>
             </div>
-          );
-        })}
-        {!assets.length && <p className="text-white/60">No assets found.</p>}
-      </div>
+          ))}
+          {!filteredListings.length && <p className="text-white/60">No listed NFTs for this wallet.</p>}
+        </div>
+      )}
 
+      {viewTab === 'garbage' && (
+        <div className="grid sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+          {filteredGarbage.map((item) => (
+            <div key={item.listing} className="card-blur rounded-2xl p-3 border border-amber-300/30 space-y-3">
+              <div className="space-y-1 text-sm">
+                <p className="font-semibold text-amber-200">Garbage listing</p>
+                <p className="text-xs text-white/60 break-all">Listing PDA: {item.listing}</p>
+                <p className="text-xs text-white/60 break-all">Vault: {item.vault_state}</p>
+                <p className="text-xs text-white/80 break-all">Core: {item.core_asset}</p>
+                <p className="text-xs text-white/60">Seller: {item.seller}</p>
+                <p className="text-xs text-aurora font-semibold">Price: {item.price_lamports ? item.price_lamports / 1_000_000_000 : 0} SOL</p>
+                <p className="text-xs text-white/60">Status: {item.status || 'unknown'}</p>
+                {publicKey?.toBase58() === address && (
+                  <button
+                    type="button"
+                    disabled={!!cleaningId}
+                    onClick={() => handleForceCancelGarbage(item)}
+                    className={`mt-2 w-full rounded-lg border border-white/20 px-3 py-1.5 text-xs font-semibold transition ${
+                      cleaningId
+                        ? 'bg-white/5 text-white/40 cursor-not-allowed'
+                        : 'bg-white/5 hover:border-amber-400/60 hover:text-amber-200'
+                    }`}
+                  >
+                    {cleaningId === item.core_asset ? 'Force cancelling…' : 'Force cancel'}
+                  </button>
+                )}
+              </div>
+            </div>
+          ))}
+          {!filteredGarbage.length && <p className="text-white/60">No garbage listings tied to this wallet.</p>}
+        </div>
+      )}
+
+      {viewTab === 'virtual' && (
       <div className="rounded-3xl border border-white/10 bg-white/5 p-4 space-y-3">
         <div className="flex items-center justify-between">
           <div>
@@ -236,35 +585,53 @@ export default function ProfilePage() {
         {recycleStatus && <p className="text-sm text-white/70">{recycleStatus}</p>}
         <div className="grid sm:grid-cols-2 md:grid-cols-3 gap-3">
           {virtualCards.map((vc) => (
-            <div key={`${vc.template_id}-${vc.rarity}`} className="rounded-xl border border-white/10 bg-black/30 p-3 space-y-2">
-              <div className="flex items-center justify-between text-sm text-white/80">
-                <span>{vc.rarity} #{vc.template_id}</span>
-                <span className="font-semibold">x{vc.count}</span>
-              </div>
-              {publicKey?.toBase58() === address && (
-                <div className="flex items-center gap-2">
-                  <input
-                    type="number"
-                    min={0}
-                    max={vc.count}
-                    value={selected[vc.template_id] ?? 0}
-                    onChange={(e) =>
-                      setSelected((prev) => ({
-                        ...prev,
-                        [vc.template_id]: Math.max(0, Math.min(vc.count, parseInt(e.target.value || '0', 10))),
-                      }))
-                    }
-                    className="w-20 px-2 py-1 rounded-lg bg-white/10 border border-white/10 text-sm"
+            <div key={`${vc.template_id}-${vc.rarity}`} className={`rounded-xl border border-white/10 bg-black/30 p-3 space-y-2 ${rarityGlowClass(vc.rarity)}`}>
+              <div className="flex items-start gap-3">
+                <div className="w-16 h-20 rounded-lg overflow-hidden border border-white/10 bg-black/50 flex-shrink-0">
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={normalizeImage(vc.image_url) || '/card_back.png'}
+                    alt={vc.name || `Card ${vc.template_id}`}
+                    className="w-full h-full object-cover"
+                    loading="lazy"
+                    onError={(e) => {
+                      (e.target as HTMLImageElement).src = '/card_back.png';
+                    }}
                   />
-                  <span className="text-xs text-white/60">to recycle</span>
                 </div>
-              )}
+                <div className="flex-1 space-y-1">
+                  <div className="flex items-center justify-between text-sm text-white/80">
+                    <span className="font-semibold">{vc.name || `Card #${vc.template_id}`}</span>
+                    <span className="font-semibold">x{vc.count}</span>
+                  </div>
+                  <p className="text-xs text-white/60">{vc.rarity}{vc.is_energy ? ' · Energy' : ''}</p>
+                  {publicKey?.toBase58() === address && (
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="number"
+                        min={0}
+                        max={vc.count}
+                        value={selected[vc.template_id] ?? 0}
+                        onChange={(e) =>
+                          setSelected((prev) => ({
+                            ...prev,
+                            [vc.template_id]: Math.max(0, Math.min(vc.count, parseInt(e.target.value || '0', 10))),
+                          }))
+                        }
+                        className="w-20 px-2 py-1 rounded-lg bg-white/10 border border-white/10 text-sm"
+                      />
+                      <span className="text-xs text-white/60">to recycle</span>
+                    </div>
+                  )}
+                </div>
+              </div>
             </div>
           ))}
           {!virtualCards.length && <p className="text-white/60 text-sm">No virtual cards yet.</p>}
         </div>
         <p className="text-xs text-white/50">10 virtual cards → 1 Mochi token (devnet)</p>
       </div>
+      )}
     </div>
   );
 }

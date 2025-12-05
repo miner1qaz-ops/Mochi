@@ -9,6 +9,8 @@ const links = [
   { href: '/', label: 'Home' },
   { href: '/gacha', label: 'Gacha' },
   { href: '/marketplace', label: 'Marketplace' },
+  { href: '/pricing', label: 'Pricing' },
+  { href: '/stadium', label: 'Stadium' },
   { href: '/profile', label: 'Profile' },
   { href: '/admin', label: 'Admin' }
 ];

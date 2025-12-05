@@ -14,6 +14,9 @@ SYS_PROGRAM_ID = Pubkey.from_string("11111111111111111111111111111111")
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 MPL_CORE_PROGRAM_ID = Pubkey.from_string("CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d")
 
+# Seed sale program (devnet mock)
+SEED_SALE_PROGRAM_ID = Pubkey.from_string("2mt9FhkfhrkC5RL29MVPfMGVzpFR3eupGCMqKVYssiue")
+
 
 CurrencyLayout = Enum("Sol" / CStruct(), "Token" / CStruct(), enum_name="Currency")
 OpenPackStartLayout = CStruct(
@@ -26,7 +29,32 @@ OpenPackV2Layout = CStruct(
     "client_seed_hash" / U8[32],
     "rare_templates" / Vec(U32),
 )
-ListCardLayout = CStruct("price_lamports" / U64, "currency_mint" / Option(U8[32]))
+SeedInitLayout = CStruct(
+    "start_ts" / U64,
+    "end_ts" / U64,
+    "price_tokens_per_sol" / U64,
+    "token_cap" / U64,
+    "sol_cap_lamports" / U64,
+)
+SeedContributeLayout = CStruct("lamports" / U64)
+ListCardLayout = CStruct(
+    "price_lamports" / U64,
+    "currency_mint" / Option(U8[32]),
+    "template_id" / U32,
+    "rarity" / U8,
+)
+
+RARITY_ORDER = [
+    "Common",
+    "Uncommon",
+    "Rare",
+    "DoubleRare",
+    "UltraRare",
+    "IllustrationRare",
+    "SpecialIllustrationRare",
+    "MegaHyperRare",
+    "Energy",
+]
 
 
 def sighash(name: str) -> bytes:
@@ -67,11 +95,36 @@ def listing_pda(vault_state: Pubkey, core_asset: Pubkey) -> Pubkey:
         [b"listing", bytes(vault_state), bytes(core_asset)], PROGRAM_ID
     )[0]
 
+def seed_sale_pda(authority: Pubkey, mint: Pubkey) -> Pubkey:
+    return Pubkey.find_program_address([b"seed_sale", bytes(authority), bytes(mint)], SEED_SALE_PROGRAM_ID)[0]
+
+def seed_vault_authority_pda(sale: Pubkey) -> Pubkey:
+    return Pubkey.find_program_address([b"seed_vault", bytes(sale)], SEED_SALE_PROGRAM_ID)[0]
+
+def seed_contribution_pda(sale: Pubkey, buyer: Pubkey) -> Pubkey:
+    return Pubkey.find_program_address([b"contrib", bytes(sale), bytes(buyer)], SEED_SALE_PROGRAM_ID)[0]
+
+def vesting_pda(beneficiary: Pubkey) -> Pubkey:
+    return Pubkey.find_program_address([b"vesting", bytes(beneficiary)], SEED_SALE_PROGRAM_ID)[0]
+
+def seed_vault_token_pda(sale: Pubkey) -> Pubkey:
+    return Pubkey.find_program_address([b"seed_vault_token", bytes(sale)], SEED_SALE_PROGRAM_ID)[0]
+
+def vest_vault_token_pda(beneficiary: Pubkey) -> Pubkey:
+    return Pubkey.find_program_address([b"vest_vault_token", bytes(beneficiary)], SEED_SALE_PROGRAM_ID)[0]
+
 
 def encode_currency_tag(currency: str):
     if currency.lower() == "sol":
         return CurrencyLayout.enum.Sol()
     return CurrencyLayout.enum.Token()
+
+def encode_rarity_tag(rarity: str) -> int:
+    norm = rarity.replace(" ", "").replace("_", "").lower()
+    for idx, label in enumerate(RARITY_ORDER):
+        if label.lower() == norm:
+            return idx
+    raise ValueError(f"Unsupported rarity {rarity}")
 
 
 def encode_open_pack_start(currency: str, client_seed_hash: bytes, rarity_prices: List[int]) -> bytes:
@@ -146,15 +199,152 @@ def encode_admin_reset_session() -> bytes:
 def encode_admin_force_close_session() -> bytes:
     return sighash("admin_force_close_session")
 
+def encode_admin_force_cancel_listing() -> bytes:
+    return sighash("admin_force_cancel_listing")
+
+def encode_admin_prune_listing() -> bytes:
+    return sighash("admin_prune_listing")
+
+def encode_seed_init(start_ts: int, end_ts: int, price_tokens_per_sol: int, token_cap: int, sol_cap_lamports: int) -> bytes:
+    data = SeedInitLayout.build(
+        {
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "price_tokens_per_sol": price_tokens_per_sol,
+            "token_cap": token_cap,
+            "sol_cap_lamports": sol_cap_lamports,
+        }
+    )
+    return sighash("init_sale") + data
+
+def encode_seed_contribute(lamports: int) -> bytes:
+    data = SeedContributeLayout.build({"lamports": lamports})
+    return sighash("contribute") + data
+
+def encode_seed_claim() -> bytes:
+    return sighash("claim")
+
+def encode_seed_cancel() -> bytes:
+    return sighash("cancel_sale")
+
+def encode_init_vesting(start_ts: int, cliff_ts: int, end_ts: int, total_amount: int) -> bytes:
+    return (
+        sighash("init_vesting")
+        + start_ts.to_bytes(8, "little", signed=True)
+        + cliff_ts.to_bytes(8, "little", signed=True)
+        + end_ts.to_bytes(8, "little", signed=True)
+        + total_amount.to_bytes(8, "little")
+    )
+
+def encode_claim_vesting() -> bytes:
+    return sighash("claim_vesting")
+
 
 def encode_user_reset_session() -> bytes:
     return sighash("user_reset_session")
 
 
-def encode_list_card(price_lamports: int, currency_mint: Optional[str]) -> bytes:
+def encode_list_card(price_lamports: int, currency_mint: Optional[str], template_id: int, rarity_tag: int) -> bytes:
     currency_bytes = None if not currency_mint else list(Pubkey.from_string(currency_mint).to_bytes())
-    data = ListCardLayout.build({"price_lamports": price_lamports, "currency_mint": currency_bytes})
+    data = ListCardLayout.build(
+        {
+            "price_lamports": price_lamports,
+            "currency_mint": currency_bytes,
+            "template_id": template_id,
+            "rarity": rarity_tag,
+        }
+    )
     return sighash("list_card") + data
+
+def build_seed_init_ix(authority: Pubkey, mint: Pubkey, treasury: Pubkey, start_ts: int, end_ts: int, price_tokens_per_sol: int, token_cap: int, sol_cap_lamports: int) -> Instruction:
+    sale = seed_sale_pda(authority, mint)
+    vault_auth = seed_vault_authority_pda(sale)
+    seed_vault = seed_vault_token_pda(sale)
+    data = encode_seed_init(start_ts, end_ts, price_tokens_per_sol, token_cap, sol_cap_lamports)
+    accounts = [
+        AccountMeta(authority, True, True),
+        AccountMeta(mint, False, False),
+        AccountMeta(treasury, False, True),
+        AccountMeta(sale, False, True),
+        AccountMeta(vault_auth, False, False),
+        AccountMeta(seed_vault, False, True),
+        AccountMeta(TOKEN_PROGRAM_ID, False, False),
+        AccountMeta(SYS_PROGRAM_ID, False, False),
+        AccountMeta(Pubkey.from_string("SysvarRent111111111111111111111111111111111"), False, False),
+    ]
+    return Instruction(SEED_SALE_PROGRAM_ID, data, accounts)
+
+def build_seed_contribute_ix(buyer: Pubkey, authority: Pubkey, mint: Pubkey, treasury: Pubkey, lamports: int) -> Instruction:
+    sale = seed_sale_pda(authority, mint)
+    contrib = seed_contribution_pda(sale, buyer)
+    data = encode_seed_contribute(lamports)
+    accounts = [
+        AccountMeta(buyer, True, True),
+        AccountMeta(sale, False, True),
+        AccountMeta(treasury, False, True),
+        AccountMeta(contrib, False, True),
+        AccountMeta(SYS_PROGRAM_ID, False, False),
+    ]
+    return Instruction(SEED_SALE_PROGRAM_ID, data, accounts)
+
+def build_seed_claim_ix(buyer: Pubkey, authority: Pubkey, mint: Pubkey, user_ata: Pubkey) -> Instruction:
+    sale = seed_sale_pda(authority, mint)
+    contrib = seed_contribution_pda(sale, buyer)
+    vault_auth = seed_vault_authority_pda(sale)
+    seed_vault = seed_vault_token_pda(sale)
+    data = encode_seed_claim()
+    accounts = [
+        AccountMeta(buyer, True, False),
+        AccountMeta(sale, False, True),
+        AccountMeta(contrib, False, True),
+        AccountMeta(seed_vault, False, True),
+        AccountMeta(vault_auth, False, False),
+        AccountMeta(user_ata, False, True),
+        AccountMeta(TOKEN_PROGRAM_ID, False, False),
+    ]
+    return Instruction(SEED_SALE_PROGRAM_ID, data, accounts)
+
+def build_seed_cancel_ix(authority: Pubkey, mint: Pubkey) -> Instruction:
+    sale = seed_sale_pda(authority, mint)
+    data = encode_seed_cancel()
+    accounts = [
+        AccountMeta(authority, True, False),
+        AccountMeta(sale, False, True),
+    ]
+    return Instruction(SEED_SALE_PROGRAM_ID, data, accounts)
+
+def build_init_vesting_ix(authority: Pubkey, mint: Pubkey, beneficiary: Pubkey, start_ts: int, cliff_ts: int, end_ts: int, total_amount: int) -> Instruction:
+    vesting = vesting_pda(beneficiary)
+    vest_vault = vest_vault_token_pda(beneficiary)
+    vest_vault_authority = vesting  # same seeds
+    data = encode_init_vesting(start_ts, cliff_ts, end_ts, total_amount)
+    accounts = [
+        AccountMeta(authority, True, True),
+        AccountMeta(mint, False, False),
+        AccountMeta(beneficiary, False, False),
+        AccountMeta(vesting, False, True),
+        AccountMeta(vest_vault_authority, False, False),
+        AccountMeta(vest_vault, False, True),
+        AccountMeta(TOKEN_PROGRAM_ID, False, False),
+        AccountMeta(SYS_PROGRAM_ID, False, False),
+        AccountMeta(Pubkey.from_string("SysvarRent111111111111111111111111111111111"), False, False),
+    ]
+    return Instruction(SEED_SALE_PROGRAM_ID, data, accounts)
+
+def build_claim_vesting_ix(beneficiary: Pubkey, beneficiary_ata: Pubkey) -> Instruction:
+    vesting = vesting_pda(beneficiary)
+    vest_vault = vest_vault_token_pda(beneficiary)
+    vest_vault_authority = vesting
+    data = encode_claim_vesting()
+    accounts = [
+        AccountMeta(beneficiary, True, False),
+        AccountMeta(vesting, False, True),
+        AccountMeta(vest_vault, False, True),
+        AccountMeta(vest_vault_authority, False, False),
+        AccountMeta(beneficiary_ata, False, True),
+        AccountMeta(TOKEN_PROGRAM_ID, False, False),
+    ]
+    return Instruction(SEED_SALE_PROGRAM_ID, data, accounts)
 
 
 def encode_cancel_listing() -> bytes:
@@ -568,6 +758,37 @@ def build_admin_force_close_v2_ix(
         accounts.append(AccountMeta(pubkey=cr, is_signer=False, is_writable=True))
     return Instruction(program_id=PROGRAM_ID, data=encode_admin_force_close_v2(), accounts=accounts)
 
+def build_admin_force_cancel_listing_ix(
+    admin: Pubkey,
+    vault_state: Pubkey,
+    card_record: Pubkey,
+    core_asset: Pubkey,
+    listing: Pubkey,
+    vault_authority: Pubkey,
+    seller: Pubkey,
+) -> Instruction:
+    accounts = [
+        AccountMeta(pubkey=admin, is_signer=True, is_writable=True),
+        AccountMeta(pubkey=vault_state, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=card_record, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=core_asset, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=listing, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=seller, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=SYS_PROGRAM_ID, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=MPL_CORE_PROGRAM_ID, is_signer=False, is_writable=False),
+    ]
+    return Instruction(program_id=PROGRAM_ID, data=encode_admin_force_cancel_listing(), accounts=accounts)
+
+
+def build_admin_prune_listing_ix(admin: Pubkey, vault_state: Pubkey, listing: Pubkey) -> Instruction:
+    accounts = [
+        AccountMeta(pubkey=admin, is_signer=True, is_writable=True),
+        AccountMeta(pubkey=vault_state, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=listing, is_signer=False, is_writable=True),
+    ]
+    return Instruction(program_id=PROGRAM_ID, data=encode_admin_prune_listing(), accounts=accounts)
+
 
 def build_user_reset_session_ix(
     user: Pubkey,
@@ -593,20 +814,25 @@ def build_list_card_ix(
     seller: Pubkey,
     vault_state: Pubkey,
     card_record: Pubkey,
+    core_asset: Pubkey,
     listing: Pubkey,
     vault_authority: Pubkey,
     price_lamports: int,
     currency_mint: Optional[str],
+    template_id: int,
+    rarity_tag: int,
 ) -> Instruction:
     accounts = [
         AccountMeta(pubkey=seller, is_signer=True, is_writable=True),
         AccountMeta(pubkey=vault_state, is_signer=False, is_writable=True),
         AccountMeta(pubkey=card_record, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=core_asset, is_signer=False, is_writable=True),
         AccountMeta(pubkey=listing, is_signer=False, is_writable=True),
-        AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=True),
         AccountMeta(pubkey=SYS_PROGRAM_ID, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=MPL_CORE_PROGRAM_ID, is_signer=False, is_writable=False),
     ]
-    data = encode_list_card(price_lamports, currency_mint)
+    data = encode_list_card(price_lamports, currency_mint, template_id, rarity_tag)
     return Instruction(program_id=PROGRAM_ID, data=data, accounts=accounts)
 
 
@@ -614,15 +840,30 @@ def build_cancel_listing_ix(
     seller: Pubkey,
     vault_state: Pubkey,
     card_record: Pubkey,
+    core_asset: Pubkey,
     listing: Pubkey,
+    vault_authority: Pubkey,
 ) -> Instruction:
     accounts = [
         AccountMeta(pubkey=seller, is_signer=True, is_writable=True),
         AccountMeta(pubkey=vault_state, is_signer=False, is_writable=True),
         AccountMeta(pubkey=card_record, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=core_asset, is_signer=False, is_writable=True),
         AccountMeta(pubkey=listing, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=SYS_PROGRAM_ID, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=MPL_CORE_PROGRAM_ID, is_signer=False, is_writable=False),
     ]
     return Instruction(program_id=PROGRAM_ID, data=encode_cancel_listing(), accounts=accounts)
+
+def build_system_transfer_ix(sender: Pubkey, recipient: Pubkey, lamports: int) -> Instruction:
+    # SystemProgram transfer: instruction = 2 (u32 LE) + lamports (u64 LE)
+    data = (2).to_bytes(4, "little") + lamports.to_bytes(8, "little")
+    accounts = [
+        AccountMeta(pubkey=sender, is_signer=True, is_writable=True),
+        AccountMeta(pubkey=recipient, is_signer=False, is_writable=True),
+    ]
+    return Instruction(program_id=SYS_PROGRAM_ID, data=data, accounts=accounts)
 
 
 def build_fill_listing_ix(

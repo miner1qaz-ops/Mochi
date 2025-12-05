@@ -198,6 +198,19 @@ Next steps:
 - Fixed both the user and admin force-expire flows by marking `vault_authority` writable in the CPI builders, and updated the resume/backfill logic so pending sessions with missing DB rows are re-created automatically.
 - Rebuilt the frontend and restarted both services after the changes.
 
+## 2025-12-05 – Codex
+- Pricing 2.0: reset `PriceSnapshot` (purged corrupted rows) and made it append-only with new fields `market_price` (recent sales) and `direct_low` plus an index on `(template_id, collected_at)` for high-frequency inserts.
+- Backend fair-value engine now prioritizes `market_price → direct_low → mid`, computes `confidence_score` from spread/staleness, and exposes new endpoints `/pricing/stats?wallet=` (portfolio_total + 24h change) and `/pricing/sparklines` (30-point history with fair_value).
+- `/pricing/card/{id}` and search/set endpoints return `fair_value`, `confidence_score`, and sparkline points; portfolio calculations now use fair_value + confidence.
+- Frontend pricing page redesigned with investment dashboard, per-row sparklines (green/red trend), and “Live Market Card” hover showing fair value, last-updated badge, and volatility warning.
+- Docs updated (Agent Guide) to reflect append-only import flow and new pricing API surface; `scripts/fetch_tcg_prices.py` writes the new fields without deletes.
+
+## 2025-11-27T21:30:00+08:00 – Codex
+- Added a reproducible Docker toolchain for Anchor builds: `Dockerfile.anchor` now installs Solana CLI 1.18.20 from the GitHub tarball, Rust stable, and Anchor CLI 0.30.1 (with time crate patch). Symlinks place Solana binaries on PATH.
+- Built base image `anchor-dev` locally; versions baked in: solana-cli 1.18.20, anchor-cli 0.30.1, rustc/cargo 1.91.1.
+- Usage: `docker run --rm -it -v /root/mochi:/workspace -v /root/mochi/anchor-program/keys:/root/.config/solana -w /workspace/anchor-program anchor-dev bash`, then `anchor clean && anchor build --program-name mochi_seed_sale --arch sbf` and `anchor deploy --program-name mochi_seed_sale --provider.cluster devnet`.
+- Documented the container workflow and image build command in `docs/commands_devnet_setup.md` (Docker section).
+
 ## 2025-11-29 – Codex
 - Marketplace list endpoint now returns a versioned tx (fixed undefined `tx_v0_b64`) and parses on-chain Listing PDAs so price/currency/seller/status reflect reality instead of zeros.
 - Added `scripts/test-listing.ts` to POST listing payloads against the API for fast debugging without the UI.
@@ -247,3 +260,63 @@ Next steps:
 - Backend: disabled old single-shot claim; added `/program/claim/batch_flow` (per-card tx list + finalize) and `/program/claim/test3` (single 3-card test tx). Restarted `mochi-backend`.
 - Frontend gacha: “Keep cards” now uses `batch_flow` sequential txs; added “Test claim 3 NFTs” button calling `/api/program/claim/test3`. Rebuilt frontend and restarted `mochi-frontend`.
 - State hygiene: force-closed sessions; reset all CardRecords in current vault to Available. One corrupted CardRecord in an old vault_state remains but is ignored by current flows.
+
+## 2025-12-01T00:00:00+00:00 – Codex
+- Backend `/program/v2/open/confirm` now accepts optional rarities/template_ids/server_nonce from the client, retries the session fetch, tolerates already-accepted CardRecords, and always persists the lineup before adding low-tier virtual cards (fixes missing virtual inventory).
+- Frontend send path now forwards lineup data to confirm-open and auto-attempts a resume hydrate if confirm throws, reducing the “unexpected state accepted” loop; keeps the opening overlay until hydrate completes.
+- API client updated for the new confirm-open payload; virtual inventory should populate immediately after pack open without needing manual resume.
+
+## 2025-12-02T00:00:00+00:00 – Codex
+- Minted new devnet Mochi token `2iL86tZQkt3MB4iVbFwNefEdTeR3Dh5QNNxDfuF16yjT` (decimals=6) with 1,000,000,000 supply to admin ATA `7gcEZxTRqHDCubymXhsvraHqo6imt8j2StN9qb4UqMtu`; switched backend `.env` and frontend `.env.local` to use this mint for recycle UI/tests.
+- Rebuilt frontend and restarted backend/frontend services after the mint swap.
+
+## 2025-12-03T00:00:00+00:00 – Codex
+- Added MSRV patches for the Anchor toolchain (toml_datetime/toml_edit/toml_parser/toml_write, indexmap 2.11.4, borsh & borsh-derive 1.6.0) and kept `Cargo.lock` at version 3; build inside the `anchor-dev` Docker image with `rustup default 1.75.0` before `anchor build/deploy`.
+- Built the `anchor-dev` container and successfully compiled/deployed `mochi_seed_sale` (program id `2mt9FhkfhrkC5RL29MVPfMGVzpFR3eupGCMqKVYssiue`) to devnet after extending the program account for the larger binary.
+- Regenerated IDL with full account layouts at `anchor-program/idl/mochi_seed_sale.json` (copy also in `target/idl`). PDAs for the devnet sale config: sale `8S39Fqt73RvakApyQq7mcnPQTQ7MqKVRB4Y6JRzaWviY`, vault auth `J8kvs3vE6mFFhceA59khvkhtKAx4wZQN4xmSfF73j4P7`, seed vault `9pSNuqZjx15rzc9mP4tvFGcZYJrczDtLMm6B19s3trY5`.
+- Fixed `SeedSale::LEN` (under-allocation) and re-deployed; `init_sale` now succeeds. Init tx: `5bR86vLzYqN9WHsdnmZukaUAwmgBdYQ3u7wCDGv3nJG2JdX1Sa93FiWArY4fZivzUoDsCJPPNr2dGd5tVXFFFBde`. Seed vault funded with the full devnet Mochi mint (sig `24wdtitnJRCu5mKXjzd3BFMH4QaYc7yMNW2Y8UaA3JnKG5eppRY99G7FT1JFWVd9VLhSAvMnxHtdLAb5uyBCUyqT`).
+- Updated `contribute` to `init_if_needed` so a wallet can contribute multiple times (no single-contribution limit). Redeployed the program with the same id to devnet.
+- Contributor count: reverted on-chain field to keep account size stable; frontend now derives contributor count by scanning Contribution PDAs for the sale (best-effort RPC). Redeployed mochi_seed_sale with unchanged account layout.
+
+## 2025-12-05T00:00:00+00:00 – Codex
+- Integrated “Mochi Stadium” mini-games (bot duels) into the frontend:
+  - New nav item `Stadium` → `app/stadium` hub with cards for each game.
+  - Game pages under `app/stadium/*` (connect-3, memory-duel, speed-match, tactics-lite, rps-plus) load Phaser clients dynamically.
+  - Game logic/assets in `frontend/stadium/games/*`; Pokémon sprite PNGs in `public/img/pokemon/`.
+- Added Phaser dependency to the frontend; ensure `npm install` is run if node_modules is missing.
+- Profile dashboard: totals + CTA tab buttons; sort/search moved inside the dashboard (removed duplicate counters).
+
+## 2025-12-06T00:00:00+00:00 – Codex
+- Marketplace fill guard: `/marketplace/fill/build` now verifies the Listing PDA exists and is owned by the program; if missing/wrong-owner it returns HTTP 400 ("please relist") instead of producing a tx that fails with AccountOwnedByWrongProgram.
+
+## 2025-12-06 – Codex
+- Added pricing scaffolding: SQLModel `PriceSnapshot`, pricing endpoints (`/pricing/card/{id}`, `/pricing/card/{id}/history`, `/pricing/portfolio`), marketplace price hints (`current_mid`, `high_90d`, `low_90d`), and a mock USD→SOL helper (`get_sol_price`). Sellback code is wired to compute 90% mid-price, but on-chain payout override still needs program support.
+- Added price-oracle scaffold: `price_oracle/` folder plus `scripts/fetch_tcg_prices.py` and `price_oracle/config.json`. Currently uses mock rows; replace `run_spider` with the vendored pokespider (Scrapy + Playwright) to ingest TCGPlayer prices into the DB.
+
+## 2025-12-07 – Codex
+- Pricing pipeline documented and refreshed:
+  - Added a price-oracle section to `docs/AGENT_GUIDE.md` describing the fetch-elsewhere/import flow (pokemonTCG.io), since this VPS IP is blocked.
+  - Imported `/root/me1.json` into `backend/mochi.db` → 188 fresh `PriceSnapshot` rows for Mega Evolution mapped to existing `CardTemplate` entries.
+  - Backend pricing responses now return derived fields: `display_price`, 7d/30d averages, spread ratio, and `price_confidence`.
+  - Pricing UI shows display price + confidence, and a detail modal with history sparkline fetched on demand.
+- Added `scripts/rescue_garbage.ts`, a TS utility to call `admin_force_cancel_listing` for listings pointing to an old/non-canonical vault_state and return NFTs to the seller. Reads garbage JSON, derives PDAs (listing, card_record, vault_authority) for the old vault, and sends the rescue tx. Use with admin keypair + RPC where the old vault lives.
+
+## 2025-12-04 – Codex
+- Wired Scrapy runner to actually return scraped rows via a shared `COLLECTED_ITEMS` bucket and fixed package imports (`price_oracle/__init__.py`, fully qualified spider settings).
+- Mock spider now emits real card-template names so `PriceSnapshot` inserts succeed; running `POKESP_MOCK=1 PYTHONPATH=/root/mochi:/root/mochi/backend DATABASE_URL=sqlite:///backend/mochi.db python scripts/fetch_tcg_prices.py` inserts snapshots against `CardTemplate` rows.
+- `price_oracle/pokespider/settings.py` now uses the fully-qualified module path to avoid `ModuleNotFoundError: pokespider`.
+- Added live price search endpoint `/pricing/search` (returns latest snapshot for matching CardTemplate names) and a frontend page at `/pricing` with search UI. Header nav now links to “Pricing.”
+- Added `/pricing/set` (latest prices by set) and `/pricing/sets` (available sets with prices). Pricing UI now has a “Set view” with filters (set selector, rarity, sort) defaulting to Mega Evolution plus the existing search tab.
+
+## 2025-12-03T05:57:00+00:00 – Codex
+- Backend seed-sale support added: settings for `SEED_SALE_AUTHORITY/MINT/TREASURY`, parsers for sale/contribution PDAs, ATA helper, and contributor count via RPC scan.
+- New endpoints:
+  - `GET /seed_sale/state` returns on-chain sale fields, vault/treasury balances, contributor count, and optional user contribution.
+  - `POST /seed_sale/contribute/build` validates window/caps (min 0.01 SOL) and returns a ready contribute transaction.
+  - `POST /seed_sale/claim/build` checks sale end/contribution/claimable, adds ATA creation when needed, and returns claim tx meta.
+- Responses include `tx_b64`/`tx_v0_b64` + instruction metadata alongside lamports/tokens owed/claimable to keep the frontend thin.
+
+## 2025-12-03T06:10:00+00:00 – Codex
+- Frontend home seed-sale widget now calls backend builders (`/seed_sale/state`, `/seed_sale/contribute/build`, `/seed_sale/claim/build`) instead of hand-built txs; shows live caps/progress/your stake via the API.
+- Updated `frontend/.env.local` to use `NEXT_PUBLIC_BACKEND_URL=https://getmochi.fun/api` so the site hits the new domain.
+- Contribute/claim flows deserialize backend v0 txs and submit via wallet adapter; balances/tokens owed respect mint decimals. Rebuild + service restart pending after these changes.

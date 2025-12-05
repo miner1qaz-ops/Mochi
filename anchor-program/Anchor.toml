@@ -1,6 +1,7 @@
 [workspace]
 members = [
-  "programs/mochi_v2_vault"
+  "programs/mochi_v2_vault",
+  "programs/mochi_seed_sale",
 ]
 
 [provider]
@@ -12,6 +13,7 @@ mochi_v2_vault = "Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx"
 
 [programs.devnet]
 mochi_v2_vault = "Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx"
+mochi_seed_sale = "2mt9FhkfhrkC5RL29MVPfMGVzpFR3eupGCMqKVYssiue"
 
 [scripts]
 lint = "cargo fmt"

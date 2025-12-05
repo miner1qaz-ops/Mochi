@@ -1,0 +1,20 @@
+[package]
+name = "mochi_seed_sale"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "mochi_seed_sale"
+
+[features]
+# Keep defaults lean for BPF. Enable `idl-build` explicitly when generating IDL.
+default = []
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = { workspace = true, features = ["init-if-needed"] }
+anchor-spl = { workspace = true }

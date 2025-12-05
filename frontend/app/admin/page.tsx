@@ -1,29 +1,72 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
-import { api } from '../../lib/api';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Connection, PublicKey } from '@solana/web3.js';
+import { api, fetchSeedSaleState, SeedSaleState } from '../../lib/api';
+import { fetchPricesMock } from '../../lib/api';
+
+type Session = {
+  session_id: string;
+  user: string;
+  rarities: string;
+  state: string;
+  expires_at: number;
+};
+
+type Listing = {
+  core_asset: string;
+  price_lamports: number;
+  status: string;
+  currency_mint?: string | null;
+  rarity?: string | null;
+  template_id?: number | null;
+};
+
+const VAULT_AUTH = 'FKALjGXodzs1RhSGYKL72xnnQjB35nK9e6dtZ9fTLj3g';
+const LOW_STOCK_THRESHOLD = 3;
 
 export default function AdminPage() {
-  const vaultAuthority = 'FKALjGXodzs1RhSGYKL72xnnQjB35nK9e6dtZ9fTLj3g';
+  const tabs = ['overview', 'vault', 'sessions', 'market', 'seed', 'wallets'] as const;
+  const [activeTab, setActiveTab] = useState<(typeof tabs)[number]>('overview');
   const [inventory, setInventory] = useState<Record<string, number>>({});
-  const [sessions, setSessions] = useState<any[]>([]);
+  const [sessions, setSessions] = useState<Session[]>([]);
   const [sessionsLoading, setSessionsLoading] = useState(false);
   const [sessionPage, setSessionPage] = useState(1);
   const [sessionPageSize] = useState(10);
   const [sessionTotal, setSessionTotal] = useState(0);
-  const [vaultAssets, setVaultAssets] = useState<string[]>([]);
-  const [refreshing, setRefreshing] = useState(false);
   const [assets, setAssets] = useState<any[]>([]);
-  const [galleryAssets, setGalleryAssets] = useState<any[]>([]);
-  const [search, setSearch] = useState('');
-  const [clearing, setClearing] = useState(false);
-  const [adminMessage, setAdminMessage] = useState<string | null>(null);
-  const [diagnostics, setDiagnostics] = useState<any[]>([]);
   const [reserved, setReserved] = useState<any[]>([]);
+  const [diagnostics, setDiagnostics] = useState<any[]>([]);
+  const [listings, setListings] = useState<Listing[]>([]);
+  const [seedState, setSeedState] = useState<SeedSaleState | null>(null);
+  const [search, setSearch] = useState('');
+  const [refreshing, setRefreshing] = useState(false);
   const [diagLoading, setDiagLoading] = useState(false);
   const [unreserving, setUnreserving] = useState(false);
   const [forceCloseWallet, setForceCloseWallet] = useState('');
   const [forceClosing, setForceClosing] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const [adminMessage, setAdminMessage] = useState<string | null>(null);
+  const [pricingMessage, setPricingMessage] = useState<string | null>(null);
+  const [walletBalances, setWalletBalances] = useState<Record<string, number>>({});
+
+  const lowStock = useMemo(
+    () =>
+      Object.entries(inventory)
+        .filter(([_, count]) => Number(count) <= LOW_STOCK_THRESHOLD)
+        .map(([rarity, count]) => ({ rarity, count })),
+    [inventory],
+  );
+
+  const stuckSessions = useMemo(() => {
+    const now = Date.now() / 1000;
+    return diagnostics.filter((d: any) => d.state === 'pending' && d.expires_at < now);
+  }, [diagnostics]);
+
+  const activeListings = useMemo(
+    () => listings.filter((l) => (l.status || '').toLowerCase() === 'active'),
+    [listings],
+  );
 
   const fetchSessions = useCallback(
     async (targetPage = 1) => {
@@ -48,7 +91,7 @@ export default function AdminPage() {
     [sessionPageSize],
   );
 
-  const loadDiagnostics = async () => {
+  const loadDiagnostics = useCallback(async () => {
     try {
       setDiagLoading(true);
       const [diagRes, reservedRes] = await Promise.all([
@@ -62,29 +105,62 @@ export default function AdminPage() {
     } finally {
       setDiagLoading(false);
     }
-  };
+  }, []);
+
+  const loadSeedState = useCallback(async () => {
+    try {
+      const res = await fetchSeedSaleState();
+      setSeedState(res);
+    } catch (err) {
+      console.warn('seed state load failed', err);
+      setSeedState(null);
+    }
+  }, []);
+
+  const bootstrap = useCallback(async () => {
+    const [invRes, assetsRes, listRes] = await Promise.all([
+      api.get('/admin/inventory/rarity'),
+      api.get('/admin/inventory/assets'),
+      api.get('/marketplace/listings'),
+    ]);
+    setInventory(invRes.data || {});
+    setAssets(assetsRes.data || []);
+    setListings(listRes.data || []);
+  }, []);
 
   useEffect(() => {
-    api.get('/admin/inventory/rarity').then((res) => setInventory(res.data));
+    bootstrap();
     fetchSessions(1);
-    api.get('/admin/inventory/assets').then((res) => {
-      setAssets(res.data);
-      setVaultAssets(res.data.map((a: any) => a.asset_id));
-    });
-    api.get(`/profile/${vaultAuthority}`).then((res) => setGalleryAssets(res.data.assets || []));
     loadDiagnostics();
-  }, [fetchSessions]);
+    loadSeedState();
+  }, [bootstrap, fetchSessions, loadDiagnostics, loadSeedState]);
+
+  useEffect(() => {
+    const conn = new Connection(process.env.NEXT_PUBLIC_SOLANA_RPC || 'https://api.devnet.solana.com', 'confirmed');
+    async function loadBalances() {
+      try {
+        const addrs = knownWallets.map((w) => w.address);
+        const pubkeys = addrs.map((a) => new PublicKey(a));
+        const res = await conn.getMultipleAccountsInfo(pubkeys);
+        const map: Record<string, number> = {};
+        res.forEach((info, idx) => {
+          if (info) {
+            map[addrs[idx]] = info.lamports || 0;
+          }
+        });
+        setWalletBalances(map);
+      } catch (err) {
+        console.error('Failed to load balances', err);
+      }
+    }
+    loadBalances();
+  }, []); // run once; knownWallets is static
 
   const handleRefresh = async () => {
     try {
       setRefreshing(true);
-      const res = await api.post('/admin/inventory/refresh');
-      const assets: string[] = res.data?.updated || [];
-      setVaultAssets(assets);
-      const inv = await api.get('/admin/inventory/rarity');
-      setInventory(inv.data);
-      const assetsRes = await api.get('/admin/inventory/assets');
-      setAssets(assetsRes.data);
+      await api.post('/admin/inventory/refresh');
+      await bootstrap();
       await fetchSessions(sessionPage);
       await loadDiagnostics();
     } catch (e) {
@@ -101,9 +177,7 @@ export default function AdminPage() {
       const res = await api.post('/admin/sessions/force_expire');
       const { cleared, signature } = res.data;
       setAdminMessage(
-        cleared
-          ? `Cleared ${cleared} sessions${signature ? ` • sig ${signature}` : ''}`
-          : 'No pending sessions to clear'
+        cleared ? `Cleared ${cleared} sessions${signature ? ` • sig ${signature}` : ''}` : 'No pending sessions to clear',
       );
       await fetchSessions(1);
       await loadDiagnostics();
@@ -152,99 +226,268 @@ export default function AdminPage() {
 
   const totalPages = sessionPageSize ? Math.max(1, Math.ceil((sessionTotal || 0) / sessionPageSize)) : 1;
 
+  const filteredAssets = useMemo(() => {
+    const q = search.toLowerCase();
+    return assets.filter((a) => {
+      if (!q) return true;
+      return (
+        a.asset_id?.toLowerCase().includes(q) ||
+        (a.name || '').toLowerCase().includes(q) ||
+        (a.rarity || '').toLowerCase().includes(q)
+      );
+    });
+  }, [assets, search]);
+
+  const activeSessions = sessions.filter((s) => s.state === 'pending');
+  const inventoryTotal = Object.values(inventory).reduce((a, b) => a + b, 0) || 0;
+  const reservedCount = reserved.length;
+  const stuckCount = stuckSessions.length;
+  const knownWallets = useMemo(
+    () => [
+      { label: 'Treasury / Admin', address: 'CKjhhqfijtAD48cg2FDcDH5ARCVjRiQS6ppmXFBM6Lcs' },
+      { label: 'Vault authority PDA', address: VAULT_AUTH },
+      { label: 'Program (vault)', address: 'Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx' },
+      { label: 'Seed sale PDA', address: '8S39Fqt73RvakApyQq7mcnPQTQ7MqKVRB4Y6JRzaWviY' },
+      { label: 'Seed vault token account', address: '9pSNuqZjx15rzc9mP4tvFGcZYJrczDtLMm6B19s3trY5' },
+    ],
+    [],
+  );
+
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-3xl font-semibold">Admin dashboard</h1>
-        <p className="text-white/60">Vault inventory, active sessions, listings.</p>
-      </div>
-      <div className="grid md:grid-cols-3 gap-3">
-        <div className="p-4 rounded-2xl bg-white/5 border border-white/10">
-          <p className="text-xs uppercase text-white/60">Vault inventory</p>
-          <p className="text-2xl font-semibold mt-1">
-            {Object.values(inventory).reduce((a, b) => a + b, 0) || '—'}
-          </p>
-          <p className="text-white/60 text-sm">By rarity (live from backend)</p>
-        </div>
-        <div className="p-4 rounded-2xl bg-aurora/15 border border-white/10">
-          <p className="text-xs uppercase text-white/60">Active sessions</p>
-          <p className="text-2xl font-semibold mt-1">{sessionTotal || '—'}</p>
-          <p className="text-white/60 text-sm">Pending decisions</p>
-        </div>
-        <div className="p-4 rounded-2xl bg-sakura/15 border border-white/10">
-          <p className="text-xs uppercase text-white/60">Actions</p>
-          <p className="text-white/70 text-sm">Refresh vault / settle sessions</p>
-        </div>
-      </div>
-      <div className="card-blur rounded-2xl p-4 border border-white/5 space-y-3">
-        <div className="flex items-center justify-between">
-          <div>
-            <p className="text-sm text-white/70">Vault assets</p>
-            <p className="text-xs text-white/50 break-all">Authority PDA: FKALjGXodzs1RhSGYKL72xnnQjB35nK9e6dtZ9fTLj3g</p>
-          </div>
-          <div className="text-right">
-            <p className="text-2xl font-semibold">{assets.length || 0}</p>
-            <p className="text-xs text-white/60">NFTs held</p>
-          </div>
+      <div className="flex flex-wrap justify-between gap-3 items-center">
+        <div>
+          <h1 className="text-3xl font-semibold">Admin dashboard</h1>
+          <p className="text-white/60 text-sm">Quick health of vault, sessions, marketplace, seed sale.</p>
         </div>
         <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={handleRefresh}
+            className="px-3 py-2 rounded-xl bg-white/10 border border-white/10 text-sm"
+            disabled={refreshing}
+          >
+            {refreshing ? 'Refreshing…' : 'Refresh all'}
+          </button>
+          <button
+            type="button"
+            onClick={handleForceExpire}
+            className="px-3 py-2 rounded-xl bg-sakura/30 border border-sakura/50 text-sm"
+            disabled={clearing}
+          >
+            {clearing ? 'Expiring…' : 'Expire pending'}
+          </button>
+          <button
+            type="button"
+            onClick={handleUnreserve}
+            className="px-3 py-2 rounded-xl bg-aurora/20 border border-aurora/50 text-sm"
+            disabled={unreserving}
+          >
+            {unreserving ? 'Clearing…' : 'Unreserve all'}
+          </button>
+          <button
+            type="button"
+            onClick={async () => {
+              setPricingMessage(null);
+              try {
+                const res = await fetchPricesMock();
+                setPricingMessage(`Fetched ${res.snapshots} price snapshots (source: ${res.source}).`);
+              } catch (err: any) {
+                setPricingMessage(err?.message || 'Price fetch failed.');
+              }
+            }}
+            className="px-3 py-2 rounded-xl bg-white/10 border border-white/10 text-sm"
+            disabled={refreshing}
+          >
+            Fetch prices (mock)
+          </button>
+        </div>
+      </div>
+      {pricingMessage && <p className="text-xs text-white/70">{pricingMessage}</p>}
+
+      <div className="flex flex-wrap gap-2">
+        {tabs.map((t) => (
+          <button
+            key={t}
+            type="button"
+            onClick={() => setActiveTab(t)}
+            className={`px-3 py-2 rounded-xl border text-sm ${
+              activeTab === t ? 'bg-aurora/30 border-aurora/60 text-white' : 'bg-white/5 border-white/10 text-white/70'
+            }`}
+          >
+            {t.charAt(0).toUpperCase() + t.slice(1)}
+          </button>
+        ))}
+      </div>
+
+      <div className="grid gap-3 md:grid-cols-4">
+        <SummaryCard label="Vault cards" value={inventoryTotal || '—'} hint="By rarity" />
+        <SummaryCard label="Pending sessions" value={activeSessions.length || '—'} hint="Need decision" />
+        <SummaryCard label="Stuck sessions" value={stuckCount || '0'} hint="Expired but pending" tone={stuckCount > 0 ? 'warn' : undefined} />
+        <SummaryCard label="Active listings" value={activeListings.length || '—'} hint={`Total ${listings.length || 0}`} />
+      </div>
+
+      {lowStock.length > 0 && (
+        <div className="rounded-2xl border border-amber-500/40 bg-amber-500/10 p-4 text-sm text-amber-100">
+          <div className="font-semibold mb-1">Low vault stock</div>
+          <div className="flex flex-wrap gap-3">
+            {lowStock.map((l) => (
+              <span key={l.rarity} className="glass-chip glass-chip--tiny">
+                {l.rarity}: {l.count}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {(activeTab === 'overview' || activeTab === 'vault') && (
+      <div className="grid gap-4 lg:grid-cols-3">
+        <div className="lg:col-span-2 card-blur rounded-2xl p-4 border border-white/5 space-y-3">
+          <div className="flex items-center justify-between gap-2">
+            <div>
+              <p className="text-sm text-white/70">Vault assets</p>
+              <p className="text-xs text-white/50 break-all">Authority PDA: {VAULT_AUTH}</p>
+            </div>
+            <div className="text-right">
+              <p className="text-2xl font-semibold">{assets.length || 0}</p>
+              <p className="text-xs text-white/60">NFTs held</p>
+            </div>
+          </div>
           <input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Search by name, rarity, or asset id"
             className="w-full rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-sm text-white placeholder:text-white/40"
           />
-          <button
-            type="button"
-            onClick={handleRefresh}
-            className="px-4 py-2 rounded-xl bg-white/10 border border-white/10 text-sm"
-            disabled={refreshing}
-          >
-            {refreshing ? 'Refreshing…' : 'Refresh vault'}
-          </button>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <input
-            value={forceCloseWallet}
-            onChange={(e) => setForceCloseWallet(e.target.value)}
-            placeholder="Wallet to force-close session"
-            className="flex-1 rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-sm text-white placeholder:text-white/40"
-          />
-          <button
-            type="button"
-            onClick={handleForceClose}
-            className="px-4 py-2 rounded-xl bg-sakura/20 border border-sakura/50 text-sm"
-            disabled={forceClosing}
-          >
-            {forceClosing ? 'Force closing…' : 'Force close session'}
-          </button>
-        </div>
-        <div className="grid md:grid-cols-2 gap-2 text-sm max-h-72 overflow-auto">
-          {assets
-            .filter((a) => {
-              const q = search.toLowerCase();
-              return (
-                !q ||
-                a.asset_id.toLowerCase().includes(q) ||
-                (a.name || '').toLowerCase().includes(q) ||
-                (a.rarity || '').toLowerCase().includes(q)
-              );
-            })
-            .map((a) => (
+          <div className="grid md:grid-cols-2 gap-2 text-sm max-h-72 overflow-auto">
+            {filteredAssets.map((a) => (
               <div key={a.asset_id} className="p-3 rounded-xl bg-white/5 border border-white/5 space-y-1">
                 <p className="font-semibold break-all">{a.name || 'Unknown'} • {a.rarity || '—'}</p>
                 <p className="text-white/60 text-xs break-all">{a.asset_id}</p>
                 <p className="text-white/50 text-xs">Template {a.template_id} • Status {a.status}</p>
               </div>
             ))}
-          {!assets.length && <p className="text-white/60">Run refresh to load vault assets.</p>}
+            {!filteredAssets.length && <p className="text-white/60">No assets match your search.</p>}
+          </div>
+        </div>
+        <div className="card-blur rounded-2xl p-4 border border-white/5 space-y-3">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm text-white/70">Controls</p>
+              <p className="text-xs text-white/50">Use with caution.</p>
+            </div>
+          </div>
+          <div className="space-y-2 text-sm">
+            <label className="text-xs text-white/60">Force-close wallet</label>
+            <div className="flex gap-2">
+              <input
+                value={forceCloseWallet}
+                onChange={(e) => setForceCloseWallet(e.target.value)}
+                placeholder="Wallet to force-close session"
+                className="flex-1 rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-sm text-white placeholder:text-white/40"
+              />
+              <button
+                type="button"
+                onClick={handleForceClose}
+                className="px-4 py-2 rounded-xl bg-sakura/20 border border-sakura/50 text-sm"
+                disabled={forceClosing}
+              >
+                {forceClosing ? 'Closing…' : 'Force close'}
+              </button>
+            </div>
+            {adminMessage && <p className="text-xs text-white/60">{adminMessage}</p>}
+            <div className="flex items-center justify-between pt-2">
+              <span className="text-xs text-white/60">Reserved/user_owned MintRecords</span>
+              <button
+                type="button"
+                onClick={handleUnreserve}
+                className="px-3 py-2 rounded-lg bg-aurora/20 border border-aurora/40 text-xs"
+                disabled={unreserving}
+              >
+                {unreserving ? 'Clearing…' : 'Unreserve all'}
+              </button>
+            </div>
+            <div className="text-xs text-white/60 max-h-32 overflow-auto grid gap-1">
+              {reserved.map((asset) => (
+                <div key={asset.asset_id} className="p-2 rounded-lg bg-white/5 border border-white/10 space-y-1">
+                  <p className="font-mono text-white/80">{asset.asset_id}</p>
+                  <p>Template {asset.template_id ?? '—'} • {asset.rarity ?? '—'} • {asset.status}</p>
+                </div>
+              ))}
+              {!reserved.length && <p className="text-white/60">No reserved assets.</p>}
+            </div>
+          </div>
         </div>
       </div>
+      )}
+
+      {(activeTab === 'overview' || activeTab === 'sessions') && (
+      <div className="card-blur rounded-2xl p-4 border border-white/5 space-y-2">
+        <div className="flex items-center justify-between mb-2">
+          <h3 className="font-semibold">Sessions</h3>
+          <button
+            type="button"
+            onClick={handleForceExpire}
+            className="px-4 py-2 rounded-xl bg-sakura/30 border border-sakura/50 text-sm"
+            disabled={clearing}
+          >
+            {clearing ? 'Clearing…' : 'Force expire pending'}
+          </button>
+        </div>
+        <div className="flex flex-wrap gap-3 text-xs text-white/60 mb-2">
+          <span>Pending: {activeSessions.length}</span>
+          <span>Stuck: {stuckSessions.length}</span>
+          <span>Total: {sessionTotal}</span>
+        </div>
+        <div className="space-y-2 text-sm">
+          {sessionsLoading && <p className="text-white/60">Loading sessions…</p>}
+          {sessions.map((s) => (
+            <div key={s.session_id} className="p-3 rounded-xl bg-white/5 flex justify-between">
+              <div>
+                <p className="font-semibold">{s.user}</p>
+                <p className="text-white/60 break-all text-xs">{s.session_id}</p>
+                <p className="text-white/60">Rarities: {s.rarities}</p>
+              </div>
+              <div className="text-right text-white/70">
+                <p className="capitalize">{s.state}</p>
+                <p className="text-xs">expires {new Date(s.expires_at * 1000).toLocaleTimeString()}</p>
+              </div>
+            </div>
+          ))}
+          {!sessionsLoading && !sessions.length && <p className="text-white/60">No sessions.</p>}
+        </div>
+        <div className="flex flex-wrap items-center justify-between text-xs text-white/70 mt-3 gap-2">
+          <span>
+            Page {sessionPage} / {totalPages} • {sessionTotal} total
+          </span>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => fetchSessions(Math.max(1, sessionPage - 1))}
+              className="px-3 py-1 rounded-lg border border-white/20 disabled:opacity-40 disabled:cursor-not-allowed"
+              disabled={sessionPage <= 1 || sessionsLoading}
+            >
+              ← Prev
+            </button>
+            <button
+              type="button"
+              onClick={() => fetchSessions(Math.min(totalPages, sessionPage + 1))}
+              className="px-3 py-1 rounded-lg border border-white/20 disabled:opacity-40 disabled:cursor-not-allowed"
+              disabled={sessionPage >= totalPages || sessionsLoading}
+            >
+              Next →
+            </button>
+          </div>
+        </div>
+      </div>
+      )}
+
+      {(activeTab === 'overview' || activeTab === 'sessions') && (
       <div className="card-blur rounded-2xl p-4 border border-white/5 space-y-3">
         <div className="flex items-center justify-between">
           <div>
             <p className="text-sm text-white/70">Session diagnostics</p>
-            <p className="text-xs text-white/50">Shows whether PackSession PDAs exist and the status of each reserved card.</p>
+            <p className="text-xs text-white/50">On-chain PackSession + CardRecord states.</p>
           </div>
           <button
             type="button"
@@ -289,175 +532,95 @@ export default function AdminPage() {
           {!diagnostics.length && <p className="text-white/60">No session diagnostics yet.</p>}
         </div>
       </div>
-      <div className="card-blur rounded-2xl p-4 border border-white/5 space-y-2">
-        <div className="flex items-center justify-between">
-          <div>
-            <p className="text-sm text-white/70">Reserved assets</p>
-            <p className="text-xs text-white/50">MintRecords still marked as reserved/user_owned.</p>
-          </div>
-          <button
-            type="button"
-            onClick={loadDiagnostics}
-            className="px-4 py-2 rounded-xl bg-white/10 border border-white/10 text-sm"
-            disabled={diagLoading}
-          >
-            {diagLoading ? 'Refreshing…' : 'Refresh list'}
-          </button>
-        </div>
-        <div className="flex items-center justify-between">
-          <div className="text-xs text-white/60">MintRecords still flagged as reserved/user_owned.</div>
-          <button
-            type="button"
-            onClick={handleUnreserve}
-            className="px-4 py-2 rounded-xl bg-sakura/30 border border-sakura/50 text-sm"
-            disabled={unreserving}
-          >
-            {unreserving ? 'Clearing…' : 'Unreserve all'}
-          </button>
-        </div>
-        <div className="text-xs text-white/60 max-h-56 overflow-auto grid md:grid-cols-2 gap-2">
-          {reserved.map((asset) => (
-            <div key={asset.asset_id} className="p-2 rounded-lg bg-white/5 border border-white/10 space-y-1">
-              <p className="font-mono text-white/80">{asset.asset_id}</p>
-              <p>Template {asset.template_id ?? '—'} • {asset.rarity ?? '—'}</p>
-              <p>Status: <span className="font-semibold">{asset.status}</span></p>
-              <p>Owner: {asset.owner || '—'}</p>
-            </div>
-          ))}
-          {!reserved.length && <p className="text-white/60">No reserved assets.</p>}
-        </div>
-      </div>
-      <div className="card-blur rounded-2xl p-4 border border-white/5">
-        <h3 className="font-semibold mb-2">Inventory by rarity</h3>
-        <div className="grid md:grid-cols-3 gap-3 text-sm">
-          {Object.entries(inventory).map(([rarity, count]) => (
-            <div key={rarity} className="p-3 rounded-xl bg-white/5 flex justify-between">
-              <span>{rarity}</span>
-              <span className="font-semibold">{count}</span>
-            </div>
-          ))}
-          {!Object.keys(inventory).length && <p className="text-white/60">No data yet.</p>}
-        </div>
-      </div>
-      <div className="card-blur rounded-2xl p-4 border border-white/5">
-        <div className="flex items-center justify-between mb-2">
-          <h3 className="font-semibold">Sessions</h3>
-          <button
-            type="button"
-            onClick={handleForceExpire}
-            className="px-4 py-2 rounded-xl bg-sakura/30 border border-sakura/50 text-sm"
-            disabled={clearing}
-          >
-            {clearing ? 'Clearing…' : 'Force expire all'}
-          </button>
-        </div>
-        {adminMessage && <p className="text-xs text-white/70 mb-2">{adminMessage}</p>}
-        <div className="space-y-2 text-sm">
-          {sessionsLoading && <p className="text-white/60">Loading sessions…</p>}
-          {sessions.map((s) => (
-            <div key={s.session_id} className="p-3 rounded-xl bg-white/5 flex justify-between">
-              <div>
-                <p className="font-semibold">{s.user}</p>
-                <p className="text-white/60 break-all text-xs">{s.session_id}</p>
-                <p className="text-white/60">Rarities: {s.rarities}</p>
-              </div>
-              <div className="text-right text-white/70">
-                <p>{s.state}</p>
-                <p className="text-xs">expires at {new Date(s.expires_at * 1000).toLocaleTimeString()}</p>
-              </div>
-            </div>
-          ))}
-          {!sessionsLoading && !sessions.length && <p className="text-white/60">No sessions.</p>}
-        </div>
-        <div className="flex flex-wrap items-center justify-between text-xs text-white/70 mt-3 gap-2">
-          <span>
-            Page {sessionPage} / {totalPages} • {sessionTotal} total
-          </span>
-          <div className="flex gap-2">
-            <button
-              type="button"
-              onClick={() => fetchSessions(Math.max(1, sessionPage - 1))}
-              className="px-3 py-1 rounded-lg border border-white/20 disabled:opacity-40 disabled:cursor-not-allowed"
-              disabled={sessionPage <= 1 || sessionsLoading}
-            >
-              ← Prev
-            </button>
-            <button
-              type="button"
-              onClick={() => fetchSessions(Math.min(totalPages, sessionPage + 1))}
-              className="px-3 py-1 rounded-lg border border-white/20 disabled:opacity-40 disabled:cursor-not-allowed"
-              disabled={sessionPage >= totalPages || sessionsLoading}
-            >
-              Next →
-            </button>
-          </div>
-        </div>
-      </div>
-      <div className="card-blur rounded-2xl p-4 border border-white/5 space-y-3">
-        <div className="flex items-center justify-between">
-          <div>
-            <p className="text-sm text-white/70">Vault assets (Helius)</p>
-            <p className="text-xs text-white/50">Refresh pulls current vault PDA holdings via Helius.</p>
-          </div>
-          <button
-            type="button"
-            onClick={handleRefresh}
-            className="px-4 py-2 rounded-xl bg-white/10 border border-white/10 text-sm"
-            disabled={refreshing}
-          >
-            {refreshing ? 'Refreshing…' : 'Refresh vault'}
-          </button>
-        </div>
-        <div className="text-xs text-white/60">
-          Showing latest {vaultAssets.length || 0} asset ids. Full list stored in backend.
-        </div>
-        <div className="grid md:grid-cols-2 gap-2 text-sm max-h-64 overflow-auto">
-          {vaultAssets.map((id) => (
-            <div key={id} className="p-3 rounded-xl bg-white/5 border border-white/5 break-all">
-              {id}
-            </div>
-          ))}
-          {!vaultAssets.length && <p className="text-white/60">Run refresh to load vault assets.</p>}
-        </div>
-      </div>
+      )}
 
-      <div className="card-blur rounded-2xl p-4 border border-white/5 space-y-3">
-        <div className="flex items-center justify-between">
-          <div>
-            <p className="text-sm text-white/70">Vault asset gallery</p>
-            <p className="text-xs text-white/50">Preview on-chain art pulled via Helius (no local fallback).</p>
+      {(activeTab === 'overview' || activeTab === 'market' || activeTab === 'seed') && (
+      <div className="grid gap-4 md:grid-cols-2">
+        <div className="card-blur rounded-2xl p-4 border border-white/5 space-y-3">
+          <div className="flex items-center justify-between">
+            <h3 className="font-semibold">Marketplace</h3>
+            <span className="text-xs text-white/60">{activeListings.length} active</span>
           </div>
-          <p className="text-xs text-white/60">{galleryAssets.length || 0} items</p>
-        </div>
-        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-          {galleryAssets.map((a) => {
-            const image = a?.content?.links?.image || a?.content?.metadata?.image || '';
-            const name = a?.content?.metadata?.name || 'Core asset';
-            return (
-              <div key={a.id} className="p-3 rounded-xl bg-white/5 border border-white/5 space-y-2">
-                <div className="relative aspect-[3/4] rounded-lg overflow-hidden border border-white/10 bg-black/20">
-                  {image ? (
-                    // eslint-disable-next-line @next/next/no-img-element
-                    <img src={image} alt={name} className="w-full h-full object-cover" loading="lazy" />
-                  ) : (
-                    <div className="w-full h-full bg-gradient-to-br from-white/10 to-white/5 flex items-center justify-center text-xs text-white/50">
-                      No image
-                    </div>
-                  )}
-                  <div className="absolute bottom-0 inset-x-0 bg-gradient-to-t from-black/60 to-transparent p-2">
-                    <p className="text-xs text-white/80">{a.rarity || a.content?.metadata?.attributes?.find?.((attr: any) => attr.trait_type === 'Rarity')?.value || '—'}</p>
-                  </div>
+          <div className="grid gap-2 text-sm max-h-64 overflow-auto">
+            {activeListings.slice(0, 8).map((l) => (
+              <div key={l.core_asset} className="p-2 rounded-lg bg-white/5 border border-white/10 flex justify-between">
+                <div>
+                  <p className="font-semibold text-white/90">{l.rarity || '—'} • {l.template_id ?? '—'}</p>
+                  <p className="text-xs text-white/60 break-all">{l.core_asset}</p>
                 </div>
-                <div className="space-y-1 text-xs text-white/70">
-                  <p className="font-semibold text-sm text-white">{name}</p>
-                  <p className="break-all text-white/60">{a.id}</p>
+                <div className="text-right text-xs text-white/70">
+                  <p>{(l.price_lamports / 1_000_000_000).toFixed(2)} SOL</p>
+                  <p>{l.status}</p>
                 </div>
               </div>
-            );
-          })}
-          {!galleryAssets.length && <p className="text-white/60">No assets to display.</p>}
+            ))}
+            {!activeListings.length && <p className="text-white/60 text-sm">No active listings.</p>}
+          </div>
+        </div>
+        <div className="card-blur rounded-2xl p-4 border border-white/5 space-y-2">
+          <div className="flex items-center justify-between">
+            <h3 className="font-semibold">Seed sale</h3>
+            <button
+              type="button"
+              onClick={loadSeedState}
+              className="px-3 py-1 rounded-lg bg-white/10 border border-white/10 text-xs"
+            >
+              Refresh
+            </button>
+          </div>
+          {seedState ? (
+            <div className="text-sm text-white/80 space-y-1">
+              <p>Raised: {(seedState.raised_lamports / 1_000_000_000).toFixed(2)} SOL</p>
+              <p>
+                Sold: {(seedState.sold_tokens / 10 ** (seedState.token_decimals || 0)).toFixed(2)} /{' '}
+                {seedState.token_cap / 10 ** (seedState.token_decimals || 0)}
+              </p>
+              <p>Contributors: {seedState.contributor_count ?? '—'}</p>
+              <p>Ends: {new Date(seedState.end_ts * 1000).toLocaleString()}</p>
+            </div>
+          ) : (
+            <p className="text-white/60 text-sm">Seed sale state unavailable.</p>
+          )}
         </div>
       </div>
+      )}
+
+      {activeTab === 'wallets' && (
+        <div className="card-blur rounded-2xl p-4 border border-white/5 space-y-3">
+          <div className="flex items-center justify-between">
+            <h3 className="font-semibold">Key wallets (SOL balances)</h3>
+            <button
+              type="button"
+              onClick={() => window.location.reload()}
+              className="px-3 py-1 rounded-lg bg-white/10 border border-white/10 text-xs"
+            >
+              Refresh
+            </button>
+          </div>
+          <div className="grid md:grid-cols-2 gap-2 text-sm">
+            {knownWallets.map((w) => (
+              <div key={w.address} className="p-3 rounded-xl bg-white/5 border border-white/10 space-y-1">
+                <p className="font-semibold text-white">{w.label}</p>
+                <p className="text-xs text-white/60 break-all">{w.address}</p>
+                <p className="text-xs text-white/70">
+                  {(walletBalances[w.address] ?? 0) / 1_000_000_000} SOL
+                </p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SummaryCard({ label, value, hint, tone }: { label: string; value: string | number; hint?: string; tone?: 'warn' }) {
+  const bg = tone === 'warn' ? 'bg-amber-500/10 border-amber-500/40' : 'bg-white/5 border-white/10';
+  return (
+    <div className={`p-4 rounded-2xl ${bg}`}>
+      <p className="text-xs uppercase text-white/60">{label}</p>
+      <p className="text-2xl font-semibold mt-1">{value}</p>
+      {hint && <p className="text-white/60 text-sm">{hint}</p>}
     </div>
   );
 }

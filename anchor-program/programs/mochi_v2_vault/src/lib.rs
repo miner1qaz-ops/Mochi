@@ -1,12 +1,20 @@
 use anchor_lang::prelude::*;
-use anchor_lang::solana_program::{program::invoke, program::invoke_signed, system_instruction};
+use anchor_lang::solana_program::{program::invoke, program::invoke_signed, rent::Rent, system_instruction, system_program};
+use anchor_lang::Discriminator;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 use mpl_core::instructions::{BurnV1CpiBuilder, TransferV1CpiBuilder};
+use std::io::{Cursor, Write};
 
 declare_id!("Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx");
 
 const PACK_CARD_COUNT: usize = 11;
 const MAX_RARE_CARDS: usize = 3;
+const GACHA_VAULT_SEED: &[u8] = b"vault_state";
+const GACHA_VAULT_AUTHORITY_SEED: &[u8] = b"vault_authority";
+const MARKETPLACE_VAULT_SEED: &[u8] = b"market_vault_state";
+const MARKETPLACE_VAULT_AUTHORITY_SEED: &[u8] = b"market_vault_authority";
+const LISTING_SEED: &[u8] = b"listing";
+const CARD_RECORD_SEED: &[u8] = b"card_record";
 
 #[program]
 mod mochi_v2_vault {
@@ -30,6 +38,26 @@ mod mochi_v2_vault {
         vault_state.pack_price_usdc = pack_price_usdc;
         vault_state.buyback_bps = buyback_bps;
         vault_state.claim_window_seconds = claim_window_seconds;
+        vault_state.marketplace_fee_bps = marketplace_fee_bps;
+        vault_state.core_collection = core_collection;
+        vault_state.usdc_mint = usdc_mint;
+        Ok(())
+    }
+
+    pub fn initialize_marketplace_vault(
+        ctx: Context<InitializeMarketplaceVault>,
+        marketplace_fee_bps: u16,
+        core_collection: Option<Pubkey>,
+        usdc_mint: Option<Pubkey>,
+    ) -> Result<()> {
+        let vault_state = &mut ctx.accounts.vault_state;
+        vault_state.admin = ctx.accounts.admin.key();
+        vault_state.vault_authority = ctx.accounts.vault_authority.key();
+        vault_state.vault_authority_bump = ctx.bumps.vault_authority;
+        vault_state.pack_price_sol = 0;
+        vault_state.pack_price_usdc = 0;
+        vault_state.buyback_bps = 0;
+        vault_state.claim_window_seconds = 0;
         vault_state.marketplace_fee_bps = marketplace_fee_bps;
         vault_state.core_collection = core_collection;
         vault_state.usdc_mint = usdc_mint;
@@ -212,6 +240,7 @@ mod mochi_v2_vault {
                 &ctx.accounts.user.to_account_info(),
                 &ctx.accounts.vault_state.key(),
                 ctx.accounts.vault_state.vault_authority_bump,
+                GACHA_VAULT_AUTHORITY_SEED,
                 &ctx.accounts.system_program.to_account_info(),
                 &ctx.accounts.mpl_core_program.to_account_info(),
             )?;
@@ -253,7 +282,7 @@ mod mochi_v2_vault {
             Currency::Sol => {
                 let vault_key = vault_state.key();
                 let seeds = &[
-                    b"vault_authority",
+                    GACHA_VAULT_AUTHORITY_SEED,
                     vault_key.as_ref(),
                     &[vault_state.vault_authority_bump],
                 ];
@@ -282,7 +311,7 @@ mod mochi_v2_vault {
                 }
                 let vault_key = vault_state.key();
                 let seeds = &[
-                    b"vault_authority",
+                    GACHA_VAULT_AUTHORITY_SEED,
                     vault_key.as_ref(),
                     &[vault_state.vault_authority_bump],
                 ];
@@ -564,6 +593,7 @@ mod mochi_v2_vault {
                 &ctx.accounts.user.to_account_info(),
                 &ctx.accounts.vault_state.key(),
                 ctx.accounts.vault_state.vault_authority_bump,
+                GACHA_VAULT_AUTHORITY_SEED,
                 &ctx.accounts.system_program.to_account_info(),
                 &ctx.accounts.mpl_core_program.to_account_info(),
             )?;
@@ -616,6 +646,7 @@ mod mochi_v2_vault {
                 &ctx.accounts.user.to_account_info(),
                 &ctx.accounts.vault_state.key(),
                 ctx.accounts.vault_state.vault_authority_bump,
+                GACHA_VAULT_AUTHORITY_SEED,
                 &ctx.accounts.system_program.to_account_info(),
                 &ctx.accounts.mpl_core_program.to_account_info(),
             )?;
@@ -663,6 +694,7 @@ mod mochi_v2_vault {
                 &ctx.accounts.user.to_account_info(),
                 &ctx.accounts.vault_state.key(),
                 ctx.accounts.vault_state.vault_authority_bump,
+                GACHA_VAULT_AUTHORITY_SEED,
                 &ctx.accounts.system_program.to_account_info(),
                 &ctx.accounts.mpl_core_program.to_account_info(),
             )?;
@@ -756,7 +788,7 @@ mod mochi_v2_vault {
                 };
                 let vault_key = vault_state.key();
                 let seeds = &[
-                    b"vault_authority",
+                    GACHA_VAULT_AUTHORITY_SEED,
                     vault_key.as_ref(),
                     &[vault_state.vault_authority_bump],
                 ];
@@ -890,11 +922,38 @@ mod mochi_v2_vault {
         ctx: Context<ListCard>,
         price_lamports: u64,
         currency_mint: Option<Pubkey>,
+        template_id: u32,
+        rarity: Rarity,
     ) -> Result<()> {
+        // Enforce canonical vault_state PDA so listings cannot target a bogus vault.
+        let (expected_vault, _) = Pubkey::find_program_address(&[b"vault_state"], ctx.program_id);
+        require_keys_eq!(ctx.accounts.vault_state.key(), expected_vault, MochiError::VaultMismatch);
+
         let record = &mut ctx.accounts.card_record;
+        let seller_key = ctx.accounts.seller.key();
+        let vault_key = ctx.accounts.vault_state.key();
+        let core_key = ctx.accounts.core_asset.key();
+
+        let is_uninitialized = record.vault_state == Pubkey::default();
+        if is_uninitialized {
+            record.vault_state = vault_key;
+            record.core_asset = core_key;
+            record.template_id = template_id;
+            record.rarity = rarity.clone();
+            record.status = CardStatus::Available;
+            record.owner = seller_key;
+        } else {
+            require_keys_eq!(record.vault_state, vault_key, MochiError::VaultMismatch);
+            require_keys_eq!(record.core_asset, core_key, MochiError::AssetMismatch);
+            require!(
+                record.template_id == template_id,
+                MochiError::TemplateMismatch
+            );
+            require!(record.rarity == rarity, MochiError::RarityMismatch);
+        }
+
         require!(
-            record.owner == ctx.accounts.seller.key()
-                || record.owner == ctx.accounts.vault_authority.key(),
+            record.owner == seller_key || record.owner == ctx.accounts.vault_authority.key(),
             MochiError::Unauthorized
         );
         require!(
@@ -902,27 +961,85 @@ mod mochi_v2_vault {
             MochiError::CardNotAvailable
         );
 
+        // Move custody into vault if user-owned.
+        if record.owner != ctx.accounts.vault_authority.key() {
+            transfer_core_asset_user(
+                &ctx.accounts.core_asset,
+                &ctx.accounts.seller.to_account_info(),
+                &ctx.accounts.seller.to_account_info(),
+                &ctx.accounts.vault_authority.to_account_info(),
+                &ctx.accounts.system_program.to_account_info(),
+                &ctx.accounts.mpl_core_program.to_account_info(),
+            )?;
+        }
+
         record.status = CardStatus::Reserved;
         record.owner = ctx.accounts.vault_authority.key();
-        // Transfer custody into vault authority escrow (if not already)
-        transfer_core_asset(
-            &ctx.accounts.core_asset,
-            &ctx.accounts.vault_authority,
-            &ctx.accounts.vault_authority,
-            &ctx.accounts.vault_authority.to_account_info(),
-            &ctx.accounts.vault_state.key(),
-            ctx.accounts.vault_state.vault_authority_bump,
-            &ctx.accounts.system_program.to_account_info(),
-            &ctx.accounts.mpl_core_program.to_account_info(),
-        )?;
 
-        let listing = &mut ctx.accounts.listing;
-        listing.seller = ctx.accounts.seller.key();
-        listing.core_asset = record.core_asset;
-        listing.price_lamports = price_lamports;
-        listing.currency_mint = currency_mint;
-        listing.status = ListingStatus::Active;
-        listing.vault_state = ctx.accounts.vault_state.key();
+        // ----- Repair or initialize listing PDA even if a stale System-owned account exists -----
+        let listing_info = ctx.accounts.listing.to_account_info();
+        let listing_bump = ctx.bumps.listing;
+        let signer_seeds: &[&[u8]] = &[
+            b"listing",
+            vault_key.as_ref(),
+            core_key.as_ref(),
+            &[listing_bump],
+        ];
+
+        // If the listing PDA is System-owned (old/stale), claim it and assign to our program.
+        if listing_info.owner == &system_program::ID {
+            let rent = Rent::get()?;
+            let needed = rent.minimum_balance(8 + Listing::SIZE);
+            let current = **listing_info.lamports.borrow();
+            if current < needed {
+                let diff = needed
+                    .checked_sub(current)
+                    .ok_or(MochiError::MathOverflow)?;
+                invoke(
+                    &system_instruction::transfer(
+                        &ctx.accounts.seller.key(),
+                        &listing_info.key(),
+                        diff,
+                    ),
+                    &[
+                        ctx.accounts.seller.to_account_info(),
+                        listing_info.clone(),
+                        ctx.accounts.system_program.to_account_info(),
+                    ],
+                )?;
+            }
+            // Allocate and assign to program using PDA signer.
+            invoke_signed(
+                &system_instruction::allocate(&listing_info.key(), (8 + Listing::SIZE) as u64),
+                &[listing_info.clone(), ctx.accounts.system_program.to_account_info()],
+                &[signer_seeds],
+            )?;
+            invoke_signed(
+                &system_instruction::assign(&listing_info.key(), &crate::ID),
+                &[listing_info.clone(), ctx.accounts.system_program.to_account_info()],
+                &[signer_seeds],
+            )?;
+        } else {
+            // If owned by some other program, reject.
+            require_keys_eq!(*listing_info.owner, crate::ID, MochiError::Unauthorized);
+        }
+
+        // Serialize fresh listing data (overwrite any drifted state).
+        {
+            let mut data = listing_info.try_borrow_mut_data()?;
+            let mut cursor = Cursor::new(&mut data[..]);
+            // Write discriminator then state
+            cursor.write_all(&Listing::discriminator())?;
+            let listing_state = Listing {
+                vault_state: vault_key,
+                seller: seller_key,
+                core_asset: record.core_asset,
+                price_lamports,
+                currency_mint,
+                status: ListingStatus::Active,
+            };
+            listing_state.try_serialize(&mut cursor)?;
+        }
         Ok(())
     }
 
@@ -938,14 +1055,22 @@ mod mochi_v2_vault {
             MochiError::Unauthorized
         );
 
-        let record = &mut ctx.accounts.card_record;
-        require_keys_eq!(
-            record.core_asset,
-            listing.core_asset,
-            MochiError::AssetMismatch
-        );
+        // Defensive: recover or rebuild card_record even if prior data drifted.
+        let mut record = CardRecord::try_deserialize(&mut &ctx.accounts.card_record.data.borrow()[..])
+            .or_else(|_| CardRecord::try_deserialize_unchecked(&mut &ctx.accounts.card_record.data.borrow()[..]))
+            .unwrap_or(CardRecord {
+                vault_state: ctx.accounts.vault_state.key(),
+                core_asset: listing.core_asset,
+                template_id: 0,
+                rarity: Rarity::Common,
+                status: CardStatus::Reserved,
+                owner: ctx.accounts.vault_authority.key(),
+            });
+        record.vault_state = ctx.accounts.vault_state.key();
+        record.core_asset = listing.core_asset;
         record.status = CardStatus::UserOwned;
         record.owner = ctx.accounts.seller.key();
+
         transfer_core_asset(
             &ctx.accounts.core_asset,
             &ctx.accounts.vault_authority,
@@ -953,46 +1078,53 @@ mod mochi_v2_vault {
             &ctx.accounts.seller.to_account_info(),
             &ctx.accounts.vault_state.key(),
             ctx.accounts.vault_state.vault_authority_bump,
+            MARKETPLACE_VAULT_AUTHORITY_SEED,
             &ctx.accounts.system_program.to_account_info(),
             &ctx.accounts.mpl_core_program.to_account_info(),
         )?;
+
+        // Persist repaired record.
+        {
+            let mut data = ctx.accounts.card_record.try_borrow_mut_data()?;
+            let mut cursor = std::io::Cursor::new(data.as_mut());
+            record.try_serialize(&mut cursor)?;
+        }
 
         listing.status = ListingStatus::Cancelled;
         Ok(())
     }
 
     pub fn fill_listing(ctx: Context<FillListing>) -> Result<()> {
-        let listing = &mut ctx.accounts.listing;
         require!(
-            listing.status == ListingStatus::Active,
+            ctx.accounts.listing.status == ListingStatus::Active,
             MochiError::InvalidListingState
         );
+        let core_key = ctx.accounts.card_record.core_asset;
 
         let fee_bps = ctx.accounts.vault_state.marketplace_fee_bps as u64;
-        let fee = listing
-            .price_lamports
+        let price = ctx.accounts.listing.price_lamports;
+        let fee = price
             .checked_mul(fee_bps)
             .and_then(|v| v.checked_div(10_000))
             .ok_or(MochiError::MathOverflow)?;
-        let seller_amount = listing
-            .price_lamports
+        let seller_amount = price
             .checked_sub(fee)
             .ok_or(MochiError::MathOverflow)?;
-
-        // SOL path only for now
-        invoke(
-            &system_instruction::transfer(
-                &ctx.accounts.buyer.key(),
-                &ctx.accounts.vault_treasury.key(),
-                fee,
-            ),
-            &[
-                ctx.accounts.buyer.to_account_info(),
-                ctx.accounts.vault_treasury.to_account_info(),
-                ctx.accounts.system_program.to_account_info(),
-            ],
-        )?;
-
+        // Direct pay: buyer -> treasury (fee) and buyer -> seller (net). No escrow on listing PDA.
+        if fee > 0 {
+            invoke(
+                &system_instruction::transfer(
+                    &ctx.accounts.buyer.key(),
+                    &ctx.accounts.vault_treasury.key(),
+                    fee,
+                ),
+                &[
+                    ctx.accounts.buyer.to_account_info(),
+                    ctx.accounts.vault_treasury.to_account_info(),
+                    ctx.accounts.system_program.to_account_info(),
+                ],
+            )?;
+        }
         invoke(
             &system_instruction::transfer(
                 &ctx.accounts.buyer.key(),
@@ -1009,7 +1141,7 @@ mod mochi_v2_vault {
         let record = &mut ctx.accounts.card_record;
         require_keys_eq!(
             record.core_asset,
-            listing.core_asset,
+            core_key,
             MochiError::AssetMismatch
         );
         record.status = CardStatus::UserOwned;
@@ -1021,10 +1153,12 @@ mod mochi_v2_vault {
             &ctx.accounts.buyer.to_account_info(),
             &ctx.accounts.vault_state.key(),
             ctx.accounts.vault_state.vault_authority_bump,
+            MARKETPLACE_VAULT_AUTHORITY_SEED,
             &ctx.accounts.system_program.to_account_info(),
             &ctx.accounts.mpl_core_program.to_account_info(),
         )?;
 
+        let listing = &mut ctx.accounts.listing;
         listing.status = ListingStatus::Filled;
         Ok(())
     }
@@ -1042,6 +1176,7 @@ mod mochi_v2_vault {
             &ctx.accounts.vault_authority,
             &ctx.accounts.vault_state.key(),
             ctx.accounts.vault_state.vault_authority_bump,
+            GACHA_VAULT_AUTHORITY_SEED,
             &ctx.accounts.system_program.to_account_info(),
             &ctx.accounts.mpl_core_program.to_account_info(),
         )?;
@@ -1063,11 +1198,88 @@ mod mochi_v2_vault {
             &ctx.accounts.destination.to_account_info(),
             &ctx.accounts.vault_state.key(),
             ctx.accounts.vault_state.vault_authority_bump,
+            GACHA_VAULT_AUTHORITY_SEED,
             &ctx.accounts.system_program.to_account_info(),
             &ctx.accounts.mpl_core_program.to_account_info(),
         )?;
         record.owner = ctx.accounts.destination.key();
         record.status = CardStatus::Deprecated;
+        Ok(())
+    }
+
+    /// Admin-only prune for malformed listings that point to a wrong/nonexistent vault_state.
+    /// This does NOT move any assets; it simply marks the listing as Cancelled to hide it.
+    pub fn admin_prune_listing(ctx: Context<AdminPruneListing>) -> Result<()> {
+        require_keys_eq!(
+            ctx.accounts.admin.key(),
+            ctx.accounts.vault_state.admin,
+            MochiError::Unauthorized
+        );
+        // Overwrite the listing account regardless of prior contents to mark it Cancelled.
+        let listing = Listing {
+            vault_state: ctx.accounts.vault_state.key(),
+            seller: Pubkey::default(),
+            core_asset: Pubkey::default(),
+            price_lamports: 0,
+            currency_mint: None,
+            status: ListingStatus::Cancelled,
+        };
+        let mut data = ctx.accounts.listing.try_borrow_mut_data()?;
+        let mut cursor = std::io::Cursor::new(&mut data[..]);
+        cursor.write_all(&Listing::discriminator())?;
+        listing.try_serialize(&mut cursor)?;
+        Ok(())
+    }
+
+    /// Admin-only escape hatch to repair/cancel corrupted listings.
+    /// Returns NFT to seller and marks listing + card_record accordingly.
+    pub fn admin_force_cancel_listing(ctx: Context<AdminForceCancel>) -> Result<()> {
+        require_keys_eq!(
+            ctx.accounts.admin.key(),
+            ctx.accounts.vault_state.admin,
+            MochiError::Unauthorized
+        );
+        let listing = &mut ctx.accounts.listing;
+        require_keys_eq!(listing.vault_state, ctx.accounts.vault_state.key(), MochiError::VaultMismatch);
+
+        // Defensive: recover card_record even if drifted.
+        let mut record = CardRecord::try_deserialize(&mut &ctx.accounts.card_record.data.borrow()[..])
+            .or_else(|_| CardRecord::try_deserialize_unchecked(&mut &ctx.accounts.card_record.data.borrow()[..]))
+            .unwrap_or(CardRecord {
+                vault_state: ctx.accounts.vault_state.key(),
+                core_asset: listing.core_asset,
+                template_id: 0,
+                rarity: Rarity::Common,
+                status: CardStatus::Reserved,
+                owner: ctx.accounts.vault_authority.key(),
+            });
+        record.vault_state = ctx.accounts.vault_state.key();
+        record.core_asset = listing.core_asset;
+        record.status = CardStatus::UserOwned;
+        record.owner = listing.seller;
+
+        // Return NFT to seller.
+        transfer_core_asset(
+            &ctx.accounts.core_asset,
+            &ctx.accounts.vault_authority,
+            &ctx.accounts.vault_authority,
+            &ctx.accounts.seller.to_account_info(),
+            &ctx.accounts.vault_state.key(),
+            ctx.accounts.vault_state.vault_authority_bump,
+            MARKETPLACE_VAULT_AUTHORITY_SEED,
+            &ctx.accounts.system_program.to_account_info(),
+            &ctx.accounts.mpl_core_program.to_account_info(),
+        )?;
+
+        // Persist repaired card_record
+        {
+            let mut data = ctx.accounts.card_record.try_borrow_mut_data()?;
+            let mut cursor = std::io::Cursor::new(&mut data[..]);
+            cursor.write_all(&CardRecord::discriminator())?;
+            record.try_serialize(&mut cursor)?;
+        }
+
+        listing.status = ListingStatus::Cancelled;
         Ok(())
     }
 
@@ -1399,18 +1611,19 @@ pub struct ListCard<'info> {
     pub seller: Signer<'info>,
     #[account(mut, seeds = [b"vault_state"], bump)]
     pub vault_state: Account<'info, VaultState>,
-    #[account(mut)]
+    #[account(
+        init_if_needed,
+        payer = seller,
+        seeds = [b"card_record", vault_state.key().as_ref(), core_asset.key().as_ref()],
+        bump,
+        space = 8 + CardRecord::SIZE,
+    )]
     pub card_record: Account<'info, CardRecord>,
     /// CHECK: Core asset account (Metaplex Core), validated off-chain
     pub core_asset: UncheckedAccount<'info>,
-    #[account(
-        init,
-        payer = seller,
-        seeds = [b"listing", vault_state.key().as_ref(), card_record.core_asset.as_ref()],
-        bump,
-        space = 8 + Listing::SIZE,
-    )]
-    pub listing: Account<'info, Listing>,
+    #[account(mut, seeds = [b"listing", vault_state.key().as_ref(), core_asset.key().as_ref()], bump)]
+    /// CHECK: We will repair/assign and serialize manually.
+    pub listing: UncheckedAccount<'info>,
     /// CHECK: Vault authority PDA (validated by seeds)
     #[account(seeds = [b"vault_authority", vault_state.key().as_ref()], bump = vault_state.vault_authority_bump)]
     pub vault_authority: UncheckedAccount<'info>,
@@ -1426,14 +1639,16 @@ pub struct CancelListing<'info> {
     pub seller: Signer<'info>,
     #[account(mut, seeds = [b"vault_state"], bump)]
     pub vault_state: Account<'info, VaultState>,
-    #[account(mut)]
-    pub card_record: Account<'info, CardRecord>,
+    #[account(mut, seeds = [b"card_record", vault_state.key().as_ref(), core_asset.key().as_ref()], bump)]
+    /// CHECK: We will deserialize or rebuild defensively.
+    pub card_record: UncheckedAccount<'info>,
     /// CHECK: Core asset (Metaplex Core), validated off-chain
+    #[account(mut)]
     pub core_asset: UncheckedAccount<'info>,
-    #[account(mut, seeds = [b"listing", vault_state.key().as_ref(), card_record.core_asset.as_ref()], bump)]
+    #[account(mut, seeds = [b"listing", vault_state.key().as_ref(), core_asset.key().as_ref()], bump)]
     pub listing: Account<'info, Listing>,
     /// CHECK: Vault authority PDA (validated by seeds)
-    #[account(seeds = [b"vault_authority", vault_state.key().as_ref()], bump = vault_state.vault_authority_bump)]
+    #[account(mut, seeds = [b"vault_authority", vault_state.key().as_ref()], bump = vault_state.vault_authority_bump)]
     pub vault_authority: UncheckedAccount<'info>,
     /// CHECK: System program
     pub system_program: UncheckedAccount<'info>,
@@ -1454,7 +1669,7 @@ pub struct FillListing<'info> {
     /// CHECK: Core asset account (Metaplex Core), validated off-chain
     #[account(mut)]
     pub core_asset: UncheckedAccount<'info>,
-    #[account(mut, seeds = [b"listing", vault_state.key().as_ref(), card_record.core_asset.as_ref()], bump)]
+    #[account(mut, seeds = [b"listing", vault_state.key().as_ref(), core_asset.key().as_ref()], bump)]
     pub listing: Account<'info, Listing>,
     /// CHECK: Vault authority PDA (validated by seeds)
     #[account(seeds = [b"vault_authority", vault_state.key().as_ref()], bump = vault_state.vault_authority_bump)]
@@ -1506,12 +1721,47 @@ pub struct AdminMigrateAsset<'info> {
 }
 
 #[derive(Accounts)]
+pub struct AdminForceCancel<'info> {
+    pub admin: Signer<'info>,
+    #[account(mut, seeds = [b"vault_state"], bump)]
+    pub vault_state: Account<'info, VaultState>,
+    #[account(mut, seeds = [b"card_record", vault_state.key().as_ref(), core_asset.key().as_ref()], bump)]
+    /// CHECK: we will deserialize or rebuild
+    pub card_record: UncheckedAccount<'info>,
+    /// CHECK: core asset
+    #[account(mut)]
+    pub core_asset: UncheckedAccount<'info>,
+    #[account(mut, seeds = [b"listing", vault_state.key().as_ref(), core_asset.key().as_ref()], bump)]
+    pub listing: Account<'info, Listing>,
+    #[account(mut, seeds = [b"vault_authority", vault_state.key().as_ref()], bump = vault_state.vault_authority_bump)]
+    /// CHECK: vault authority
+    pub vault_authority: UncheckedAccount<'info>,
+    /// Seller (funds will be returned)
+    #[account(mut)]
+    pub seller: SystemAccount<'info>,
+    /// CHECK: system program
+    pub system_program: UncheckedAccount<'info>,
+    /// CHECK: mpl-core
+    pub mpl_core_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
 pub struct DeprecateCard<'info> {
     pub admin: Signer<'info>,
     #[account(mut, seeds = [b"vault_state"], bump)]
     pub vault_state: Account<'info, VaultState>,
     #[account(mut)]
     pub card_record: Account<'info, CardRecord>,
+}
+
+#[derive(Accounts)]
+pub struct AdminPruneListing<'info> {
+    pub admin: Signer<'info>,
+    #[account(mut, seeds = [b"vault_state"], bump)]
+    pub vault_state: Account<'info, VaultState>,
+    /// CHECK: listing PDA may have been created with wrong seeds; we only mark Cancelled.
+    #[account(mut)]
+    pub listing: UncheckedAccount<'info>,
 }
 
 #[account]
@@ -1665,6 +1915,8 @@ pub enum MochiError {
     CardNotAvailable,
     #[msg("Vault mismatch")]
     VaultMismatch,
+    #[msg("Listing invalid state")]
+    InvalidListingState,
     #[msg("Session already exists")]
     SessionExists,
     #[msg("Invalid session state")]
@@ -1675,8 +1927,6 @@ pub enum MochiError {
     SessionNotExpired,
     #[msg("Card not reserved")]
     CardNotReserved,
-    #[msg("Listing invalid state")]
-    InvalidListingState,
     #[msg("Asset mismatch")]
     AssetMismatch,
     #[msg("Math overflow")]
@@ -1695,6 +1945,8 @@ pub enum MochiError {
     TemplateMismatch,
     #[msg("Card key mismatch")]
     CardKeyMismatch,
+    #[msg("Rarity mismatch")]
+    RarityMismatch,
 }
 
 fn persist_card_record(card_record: &CardRecord, acc_info: &AccountInfo) -> Result<()> {
@@ -1774,11 +2026,13 @@ fn transfer_core_asset<'info>(
     new_owner: &AccountInfo<'info>,
     vault_state: &Pubkey,
     vault_bump: u8,
+    authority_seed: &[u8],
     system_program: &AccountInfo<'info>,
     mpl_core_program: &AccountInfo<'info>,
 ) -> Result<()> {
-    let seeds = &[b"vault_authority", vault_state.as_ref(), &[vault_bump]];
-    let signer = &[&seeds[..]];
+    let bump_arr = [vault_bump];
+    let seeds: [&[u8]; 3] = [authority_seed, vault_state.as_ref(), &bump_arr];
+    let signer: &[&[&[u8]]] = &[&seeds];
     let mut builder = TransferV1CpiBuilder::new(mpl_core_program);
     builder
         .asset(asset)
@@ -1797,10 +2051,11 @@ fn burn_core_asset<'info>(
     payer: &AccountInfo<'info>,
     vault_state: &Pubkey,
     vault_bump: u8,
+    authority_seed: &[u8],
     system_program: &AccountInfo<'info>,
     mpl_core_program: &AccountInfo<'info>,
 ) -> Result<()> {
-    let seeds = &[b"vault_authority", vault_state.as_ref(), &[vault_bump]];
+    let seeds = &[authority_seed, vault_state.as_ref(), &[vault_bump]];
     let signer = &[&seeds[..]];
     let mut builder = BurnV1CpiBuilder::new(mpl_core_program);
     builder
@@ -1811,4 +2066,21 @@ fn burn_core_asset<'info>(
     builder
         .invoke_signed(signer)
         .map_err(|_| MochiError::CoreCpiError.into())
+}
+fn transfer_core_asset_user<'info>(
+    asset: &AccountInfo<'info>,
+    authority: &AccountInfo<'info>,
+    payer: &AccountInfo<'info>,
+    new_owner: &AccountInfo<'info>,
+    system_program: &AccountInfo<'info>,
+    mpl_core_program: &AccountInfo<'info>,
+) -> Result<()> {
+    let mut builder = TransferV1CpiBuilder::new(mpl_core_program);
+    builder
+        .asset(asset)
+        .payer(payer)
+        .authority(Some(authority))
+        .new_owner(new_owner)
+        .system_program(Some(system_program));
+    builder.invoke().map_err(|_| MochiError::CoreCpiError.into())
 }
