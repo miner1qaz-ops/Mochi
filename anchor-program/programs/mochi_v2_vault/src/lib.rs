@@ -194,6 +194,112 @@ mod mochi_v2_vault {
         Ok(())
     }
 
+    /// One-time migration to grow the marketplace VaultState PDA to the expanded size.
+    pub fn migrate_marketplace_vault(
+        ctx: Context<MigrateMarketplaceVault>,
+        marketplace_fee_bps: u16,
+        core_collection: Option<Pubkey>,
+        usdc_mint: Option<Pubkey>,
+        mochi_mint: Option<Pubkey>,
+    ) -> Result<()> {
+        let admin_key = ctx.accounts.admin.key();
+        let vault_key = ctx.accounts.vault_state.key();
+        let (expected_vault_auth, vault_bump) =
+            Pubkey::find_program_address(&[MARKETPLACE_VAULT_AUTHORITY_SEED, vault_key.as_ref()], ctx.program_id);
+
+        let target_len: usize = 8 + VaultState::SIZE;
+        let rent = Rent::get()?;
+        let required_lamports = rent.minimum_balance(target_len);
+        let vault_info = ctx.accounts.vault_state.to_account_info();
+
+        require!(
+            vault_info.owner == ctx.program_id,
+            MochiError::Unauthorized
+        );
+
+        if vault_info.lamports() < required_lamports {
+            let diff = required_lamports
+                .checked_sub(vault_info.lamports())
+                .ok_or(MochiError::MathOverflow)?;
+            invoke(
+                &system_instruction::transfer(&admin_key, vault_info.key, diff),
+                &[
+                    ctx.accounts.admin.to_account_info(),
+                    vault_info.clone(),
+                    ctx.accounts.system_program.to_account_info(),
+                ],
+            )?;
+        }
+
+        // Grow account to the new size and zero-fill.
+        vault_info.realloc(target_len, false)?;
+        let mut data = vault_info.try_borrow_mut_data()?;
+        data.fill(0);
+        data[..8].copy_from_slice(&VaultState::discriminator());
+        let mut offset = 8;
+
+        // admin
+        data[offset..offset + 32].copy_from_slice(admin_key.as_ref());
+        offset += 32;
+        // vault_authority
+        data[offset..offset + 32].copy_from_slice(expected_vault_auth.as_ref());
+        offset += 32;
+        // pack_price_sol
+        data[offset..offset + 8].copy_from_slice(&0u64.to_le_bytes());
+        offset += 8;
+        // pack_price_usdc
+        data[offset..offset + 8].copy_from_slice(&0u64.to_le_bytes());
+        offset += 8;
+        // buyback_bps (u16)
+        data[offset..offset + 2].copy_from_slice(&0u16.to_le_bytes());
+        offset += 2;
+        // claim_window_seconds (i64)
+        data[offset..offset + 8].copy_from_slice(&0i64.to_le_bytes());
+        offset += 8;
+        // marketplace_fee_bps (u16)
+        data[offset..offset + 2].copy_from_slice(&marketplace_fee_bps.to_le_bytes());
+        offset += 2;
+
+        // core_collection option
+        match core_collection {
+            Some(pk) => {
+                data[offset] = 1;
+                data[offset + 1..offset + 33].copy_from_slice(pk.as_ref());
+            }
+            None => data[offset] = 0,
+        }
+        offset += 1 + 32;
+
+        // usdc_mint option
+        match usdc_mint {
+            Some(pk) => {
+                data[offset] = 1;
+                data[offset + 1..offset + 33].copy_from_slice(pk.as_ref());
+            }
+            None => data[offset] = 0,
+        }
+        offset += 1 + 32;
+
+        // mochi_mint option
+        match mochi_mint {
+            Some(pk) => {
+                data[offset] = 1;
+                data[offset + 1..offset + 33].copy_from_slice(pk.as_ref());
+            }
+            None => data[offset] = 0,
+        }
+        offset += 1 + 32;
+
+        // reward_per_pack
+        data[offset..offset + 8].copy_from_slice(&0u64.to_le_bytes());
+        offset += 8;
+
+        // vault_authority_bump
+        data[offset] = vault_bump;
+        // padding already zeroed
+        Ok(())
+    }
+
     pub fn deposit_card(ctx: Context<DepositCard>, template_id: u32, rarity: Rarity) -> Result<()> {
         require!(
             ctx.accounts.admin.key() == ctx.accounts.vault_state.admin,
@@ -2179,6 +2285,19 @@ pub struct MigrateVaultState<'info> {
     #[account(mut, seeds = [GACHA_VAULT_SEED], bump)]
     /// CHECK: migrating legacy account; seeds enforced above.
     pub vault_state: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MigrateMarketplaceVault<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    /// CHECK: legacy marketplace vault PDA (may be undersized); seeds enforced.
+    #[account(mut, seeds = [MARKETPLACE_VAULT_SEED], bump)]
+    pub vault_state: UncheckedAccount<'info>,
+    /// CHECK: marketplace vault authority PDA
+    #[account(seeds = [MARKETPLACE_VAULT_AUTHORITY_SEED, vault_state.key().as_ref()], bump)]
+    pub vault_authority: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }
 

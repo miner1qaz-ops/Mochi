@@ -438,7 +438,7 @@ export default function MarketplacePage() {
       {sortedFeed.length === 0 ? (
         <p className="text-center text-white/60 py-10">No active listings yet.</p>
       ) : (
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
           {sortedFeed.map((listing) => {
             const badgeClass = statusBadges[statusLabel(listing.status)] || 'bg-white/10 text-white border border-white/10';
             const rarityClass = rarityBadge(listing.rarity || undefined);
@@ -452,62 +452,65 @@ export default function MarketplacePage() {
             const nameLabel = displayName(listing.name, listing.template_id, listing.core_asset);
             return (
               <TiltCard key={listing.core_asset}>
-                <div className={`p-3 space-y-3 ${rarityGlowClass(listing.rarity)}`}>
-                  <div className="w-full aspect-[3/4] rounded-xl overflow-hidden bg-white/5 border border-white/5 relative">
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img
-                      src={imgSrc}
-                      alt={nameLabel || 'card'}
-                      className="w-full h-full object-cover"
-                      loading="lazy"
-                      onError={(e) => {
-                        (e.target as HTMLImageElement).src = '/card_back.png';
-                      }}
-                    />
-                    {isFake && (
-                      <div className="absolute inset-x-2 bottom-2 rounded-lg bg-rose-500/80 text-[11px] text-white px-2 py-1 text-center">
-                        Unverified · No physical redemption
-                      </div>
-                    )}
-                  </div>
-                  <div className="space-y-1">
-                    <div className="flex items-center gap-2 text-[11px] text-white/60">
-                      <span className="px-2 py-1 rounded-full bg-white/10 border border-white/10">{listing.currency_mint ? 'USDC' : 'SOL'}</span>
-                      <span className={`px-2 py-1 rounded-full ${badgeClass}`}>{statusLabel(listing.status)}</span>
-                      {listing.rarity && (
-                        <span className={`px-2 py-1 rounded-full ${rarityClass}`}>{listing.rarity}</span>
-                      )}
+                <div className={`p-3 space-y-2 ${rarityGlowClass(listing.rarity)}`}>
+                  <div className="flex gap-3 items-start">
+                    <div className="w-24 h-32 rounded-xl overflow-hidden bg-white/5 border border-white/5 relative shrink-0">
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img
+                        src={imgSrc}
+                        alt={nameLabel || 'card'}
+                        className="w-full h-full object-cover"
+                        loading="lazy"
+                        onError={(e) => {
+                          (e.target as HTMLImageElement).src = '/card_back.png';
+                        }}
+                      />
                       {isFake && (
-                        <span className="px-2 py-1 rounded-full bg-rose-500/20 border border-rose-500/60 text-rose-100">
+                        <div className="absolute inset-x-1 bottom-1 rounded-md bg-rose-500/80 text-[10px] text-white px-1.5 py-0.5 text-center">
                           Unverified
-                        </span>
+                        </div>
                       )}
                     </div>
-                    <p className="font-semibold text-lg break-words">{nameLabel}</p>
-                    {listing.template_id && <p className="text-white/60 text-sm">Template #{listing.template_id}</p>}
-                    <p className="text-white/70 text-sm">Seller: {shortAddr(listing.seller) || 'unknown'}</p>
-                  </div>
-                  <div className="rounded-2xl px-3 py-2 bg-white/10 border border-white/10 text-sm flex items-center justify-between">
-                    <span className="text-white/60">Price</span>
-                    <span className="font-semibold text-white">{formatLamports(listing.price_lamports)}</span>
-                  </div>
-                  <div className="flex gap-2">
-                    <button
-                      className="flex-1 px-3 py-2 rounded-xl bg-gradient-to-r from-cyan-400 to-fuchsia-500 text-ink font-semibold shadow-lg shadow-cyan-500/20 disabled:opacity-50"
-                      onClick={() => handleFill(listing.core_asset)}
-                      disabled={loading || statusLabel(listing.status) !== 'active'}
-                    >
-                      Buy
-                    </button>
-                    {isSeller && (
-                      <button
-                        className="px-3 py-2 rounded-xl bg-white/10 border border-white/20 hover:border-amber-300/60 disabled:opacity-50"
-                        onClick={() => handleCancel(listing.core_asset)}
-                        disabled={loading}
-                      >
-                        Cancel
-                      </button>
-                    )}
+                    <div className="flex-1 space-y-2 min-w-0">
+                      <div className="flex items-center gap-2 text-[11px] text-white/60 flex-wrap">
+                        <span className="px-2 py-1 rounded-full bg-white/10 border border-white/10">{listing.currency_mint ? 'USDC' : 'SOL'}</span>
+                        <span className={`px-2 py-1 rounded-full ${badgeClass}`}>{statusLabel(listing.status)}</span>
+                        {listing.rarity && <span className={`px-2 py-1 rounded-full ${rarityClass}`}>{listing.rarity}</span>}
+                        {isFake && (
+                          <span className="px-2 py-1 rounded-full bg-rose-500/20 border border-rose-500/60 text-rose-100">
+                            Unverified
+                          </span>
+                        )}
+                      </div>
+                      <div className="space-y-0.5">
+                        <p className="font-semibold text-base truncate">{nameLabel}</p>
+                        <p className="text-xs text-white/60 break-all">{listing.core_asset}</p>
+                        <p className="text-xs text-white/70">Seller: {shortAddr(listing.seller) || 'unknown'}</p>
+                        {listing.template_id && <p className="text-xs text-white/50">Template #{listing.template_id}</p>}
+                      </div>
+                      <div className="rounded-2xl px-3 py-2 bg-white/10 border border-white/10 text-sm flex items-center justify-between">
+                        <span className="text-white/60">Price</span>
+                        <span className="font-semibold text-white">{formatLamports(listing.price_lamports)}</span>
+                      </div>
+                      <div className="flex gap-2">
+                        <button
+                          className="flex-1 px-3 py-2 rounded-xl bg-gradient-to-r from-cyan-400 to-fuchsia-500 text-ink font-semibold shadow-lg shadow-cyan-500/20 disabled:opacity-50"
+                          onClick={() => handleFill(listing.core_asset)}
+                          disabled={loading || statusLabel(listing.status) !== 'active'}
+                        >
+                          Buy
+                        </button>
+                        {isSeller && (
+                          <button
+                            className="px-3 py-2 rounded-xl bg-white/10 border border-white/20 hover:border-amber-300/60 disabled:opacity-50"
+                            onClick={() => handleCancel(listing.core_asset)}
+                            disabled={loading}
+                          >
+                            Cancel
+                          </button>
+                        )}
+                      </div>
+                    </div>
                   </div>
                 </div>
               </TiltCard>

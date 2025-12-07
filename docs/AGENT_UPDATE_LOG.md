@@ -198,6 +198,18 @@ Next steps:
 - `/program/session/pending` and `/program/open/build` both call this backfill helper, so hitting the Resume button (or simply retrying Claim/Sell-back) surfaces the active pack instead of blocking with “wallet already has a session”.
 - Verified the hot wallet `63KMUfAuxy…` now returns session `3sxb…` from `/program/session/pending`; admin pagination also shows the pending row so ops can force-expire if needed.
 
+## 2025-12-06 – Codex
+- Anchor program (`mochi_v2_vault`) updated: `open_pack_v2` now enforces that the MOCHI mint authority equals the vault authority PDA and always mints rewards on-chain when `reward_per_pack > 0`; added explicit `require_keys_eq!` checks for mint/ATA ownership and extra `msg!` logs around reward config and `mint_to`. Added `RewardMinted` event emission for monitoring.
+- Redeployed `mochi_v2_vault` to devnet (program unchanged: `Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx`) with the logging changes to surface reward minting in tx logs.
+- Reset on-chain reward config via `set_reward_config` so the vault PDA is the mint authority and rewards are active: `mochi_mint = 2iL86tZQkt3MB4iVbFwNefEdTeR3Dh5QNNxDfuF16yjT`, `reward_per_pack = 100_000_000` (100 MOCHI @ 6 decimals). Tx sig: `Zd9K9Cea5z22cUMwJbgp9EfSEU3V3VK7XvQ7oTovrN85nPTgeXF9Yimm2k7KaUnEZghNVzn8XjAzzaUL2bQQU6B`.
+- Verified backend open builder already includes the user MOCHI ATA (auto-creates if missing); reward mint now lands in the same open transaction. If rewards stop, re-run `set_reward_config` or reassign mint authority to the vault PDA.
+
+## 2025-12-07 – Codex
+- Fixed marketplace listing failures (`AccountDidNotDeserialize` on `vault_state`) after the VaultState struct grew. Added a one-time admin instruction `migrate_marketplace_vault` to resize and rewrite the marketplace vault PDA to the current layout (includes reward fields).
+- Built and redeployed `mochi_v2_vault` to devnet (program unchanged: `Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx`).
+- Ran the migration on devnet for the marketplace vault PDA (`mx1PX4zganVFtuneoc61jcuadctsUPk9UGbyhNnnLwT`, auth `CGhdCwqZx7zn6YNqASY6V4uxFZpegb1QDu5qnMNDKihd`), tx `2j3ypYWtFAA3xRUbGHJU9i5zXrT23LdKK65myrUoRvmvgwx4FkgtdzxYQk9hkpgjEqEaHxZPXEHihbNz7QMZCub7`. It now deserializes at 215 bytes with `marketplace_fee_bps=200`.
+- Listing flow works again; if deploying elsewhere, run `migrate_marketplace_vault` once on that cluster to upgrade the marketplace vault PDA.
+
 ## 2025-12-05T10:15:00Z – Codex
 - Simplified marketplace `list_card`: `card_record` and `listing` PDAs are now `init_if_needed` (no PDA signatures), with canonical vault enforcement baked in. This removes the `AccountDidNotSerialize (0xbbc)` failures seen on listing.
 - Regenerated IDL (`anchor-program/idl/mochi_v2_vault.json`) and redeployed `mochi_v2_vault` to devnet (sig `46KoTXDZ9aNkEPvkJZA1TQXqRCvzo6WSZ5Gdogc7xaxHxsxVM61uq5mqxhrqrhbwxdFZDPfXjErkgtyLLDQnA4aB`).
