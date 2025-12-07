@@ -87,12 +87,15 @@ class Settings(BaseSettings):
     mochi_token_mint: Optional[str] = None
     mochi_token_decimals: int = 6
     mochi_pack_reward: int = 100  # whole-token amount awarded per pack open
+    enable_legacy_offchain_rewards: bool = False
     listing_fee_mochi: int = 0  # raw smallest-unit amount
     official_collections: Optional[str] = None  # comma-separated list of collection mints treated as official
     seed_sale_authority: Optional[str] = None
     seed_sale_mint: Optional[str] = None
     seed_sale_treasury: Optional[str] = None
-    recycle_rate: int = 10
+    program_id: Optional[str] = None  # optional: supplied for tx_builder env loading
+    seed_sale_program_id: Optional[str] = None
+    recycle_rate: int = 1
     claim_window_seconds: int = 3600
     server_seed: str = os.environ.get("SERVER_SEED", "dev-server-seed")
     database_url: str = "sqlite:///./mochi.db"
@@ -2591,11 +2594,15 @@ def confirm_open_v2(req: ConfirmOpenRequest, db: Session = Depends(get_session))
     # Add low-tier virtuals on open (only if we have a usable lineup).
     if rarities and template_ids:
         mutate_virtual_cards(wallet, low_tier_virtual_items(rarities, template_ids), db, direction=1)
-    reward = {}
-    try:
-        reward = maybe_spawn_pack_reward(wallet, session_id, db)
-    except Exception as exc:  # noqa: BLE001
-        reward = {"status": "failed", "error": str(exc)}
+    reward: dict = {
+        "status": "on_chain_only",
+        "reason": "Legacy off-chain rewards disabled; rely on on-chain vault config",
+    }
+    if auth_settings.enable_legacy_offchain_rewards:
+        try:
+            reward = maybe_spawn_pack_reward(wallet, session_id, db)
+        except Exception as exc:  # noqa: BLE001
+            reward = {"status": "failed", "error": str(exc)}
     return {"state": on_state, "assets": rare_assets, "reward": reward}
 
 
@@ -3133,10 +3140,8 @@ def recycle_build(req: RecycleBuildRequest, db: Session = Depends(get_session)):
     if total_cards < auth_settings.recycle_rate:
         raise HTTPException(status_code=400, detail=f"Need at least {auth_settings.recycle_rate} cards to recycle")
 
-    reward_tokens = total_cards // auth_settings.recycle_rate
-    if reward_tokens <= 0:
-        raise HTTPException(status_code=400, detail="Recycle did not produce any rewards")
-    reward_amount = reward_tokens * (10 ** auth_settings.mochi_token_decimals)
+    # Reward: 1 card = 1 MOCHI (whole token) => raw units = count * 10^decimals
+    reward_amount = total_cards * (10 ** auth_settings.mochi_token_decimals)
 
     admin_kp = load_admin_keypair()
     admin_pub = admin_kp.pubkey()
@@ -3144,13 +3149,54 @@ def recycle_build(req: RecycleBuildRequest, db: Session = Depends(get_session)):
     dest_token = to_pubkey(req.user_token_account)
     mint_ix = build_mint_to_ix(mint_pub, dest_token, admin_pub, reward_amount)
     blockhash = get_latest_blockhash()
-    message = MessageV0.try_compile(admin_pub, [mint_ix], [], Hash.from_string(blockhash))
+    # Fee payer = user; admin pre-signs as mint authority. Wallet adds its signature and submits.
+    message = MessageV0.try_compile(to_pubkey(req.wallet), [mint_ix], [], Hash.from_string(blockhash))
     tx = VersionedTransaction(message, [admin_kp])
     tx_b64 = base64.b64encode(bytes(tx)).decode()
     tx_v0_b64 = tx_b64  # already versioned message
     instr = wrap_instruction_meta(instruction_to_dict(mint_ix))
 
-    # Deduct recycled cards and log
+    return TxResponse(
+        tx_b64=tx_b64,
+        tx_v0_b64=tx_v0_b64,
+        recent_blockhash=blockhash,
+        instructions=[instr],
+    )
+
+
+class RecycleConfirmRequest(BaseModel):
+    wallet: str
+    signature: str
+    items: List[RecycleItem]
+
+
+@app.post("/profile/recycle/confirm")
+def recycle_confirm(req: RecycleConfirmRequest, db: Session = Depends(get_session)):
+    if not req.items:
+        raise HTTPException(status_code=400, detail="No items provided for recycle")
+    # Confirm tx succeeded
+    try:
+        resp = sol_client.confirm_transaction(req.signature, commitment="confirmed")
+        if isinstance(resp, dict) and resp.get("error"):
+            raise HTTPException(status_code=400, detail=f"Transaction not confirmed: {resp.get('error')}")
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Failed to confirm transaction: {exc}") from exc
+
+    # Re-validate inventory and deduct
+    balance: Dict[int, int] = {}
+    stmt = select(VirtualCard).where(VirtualCard.wallet == req.wallet)
+    for row in db.exec(stmt).all():
+        balance[row.template_id] = row.count
+    total_cards = 0
+    for item in req.items:
+        have = balance.get(item.template_id, 0)
+        if have < item.count:
+            raise HTTPException(status_code=400, detail=f"Not enough virtual cards for template {item.template_id}")
+        total_cards += item.count
+    reward_amount = total_cards * (10 ** auth_settings.mochi_token_decimals)
+
     expanded: List[tuple[int, str]] = []
     for item in req.items:
         for _ in range(item.count):
@@ -3159,12 +3205,7 @@ def recycle_build(req: RecycleBuildRequest, db: Session = Depends(get_session)):
     db.add(RecycleLog(wallet=req.wallet, total_cards=total_cards, reward_amount=reward_amount))
     db.commit()
 
-    return TxResponse(
-        tx_b64=tx_b64,
-        tx_v0_b64=tx_v0_b64,
-        recent_blockhash=blockhash,
-        instructions=[instr],
-    )
+    return {"ok": True, "signature": req.signature, "reward_amount": reward_amount, "total_cards": total_cards}
 
 
 @app.get("/marketplace/listings", response_model=List[ListingView])

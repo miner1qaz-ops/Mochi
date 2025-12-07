@@ -3,7 +3,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useParams } from 'next/navigation';
 import { useConnection, useWallet } from '@solana/wallet-adapter-react';
-import { PublicKey } from '@solana/web3.js';
+import { PublicKey, VersionedTransaction } from '@solana/web3.js';
+import { Buffer } from 'buffer';
 import {
   api,
   fetchVirtualCards,
@@ -262,9 +263,20 @@ export default function ProfilePage() {
         items: recycleItems,
         user_token_account: userAta.toBase58(),
       });
-      const tx = buildV0Tx(publicKey, data.recent_blockhash, data.instructions);
+      let tx: VersionedTransaction;
+      if (data.tx_v0_b64) {
+        tx = VersionedTransaction.deserialize(Buffer.from(data.tx_v0_b64, 'base64'));
+      } else {
+        tx = buildV0Tx(publicKey, data.recent_blockhash, data.instructions);
+      }
       const signed = await signTransaction(tx);
       const sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
+      await connection.confirmTransaction(sig, 'confirmed');
+      await api.post('/profile/recycle/confirm', {
+        wallet: publicKey.toBase58(),
+        signature: sig,
+        items: recycleItems,
+      });
       setRecycleStatus(`Recycled! Tx: ${sig}`);
       fetchVirtualCards(publicKey.toBase58()).then(setVirtualCards).catch(() => {});
     } catch (e) {
@@ -387,7 +399,7 @@ export default function ProfilePage() {
         </div>
       )}
       <div className="card-blur rounded-2xl border border-white/5 p-4 space-y-3">
-        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3 text-sm text-white">
+        <div className="grid grid-cols-2 max-[520px]:grid-cols-1 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3 text-sm text-white">
           <div className="rounded-xl bg-white/5 border border-white/10 p-3">
             <p className="text-xs text-white/60">Owned NFTs</p>
             <p className="text-lg font-semibold">{totalNfts}</p>
