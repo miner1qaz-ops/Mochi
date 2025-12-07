@@ -3152,17 +3152,18 @@ def recycle_build(req: RecycleBuildRequest, db: Session = Depends(get_session)):
     try:
         ata_info = sol_client.get_account_info(dest_token)
         if ata_info.value is None:
-            create_ix = build_create_ata_ix(admin_pub, to_pubkey(req.wallet), mint_pub, dest_token)
+            create_ix = build_create_ata_ix(admin_pub, to_pubkey(req.wallet), mint_pub)
     except Exception:
         # fallback: attempt create
-        create_ix = build_create_ata_ix(admin_pub, to_pubkey(req.wallet), mint_pub, dest_token)
+        create_ix = build_create_ata_ix(admin_pub, to_pubkey(req.wallet), mint_pub)
     mint_ix = build_mint_to_ix(mint_pub, dest_token, admin_pub, reward_amount)
     blockhash = get_latest_blockhash()
-    # Note: payer is admin to avoid partial-signature requirements here; user still signs to submit.
-    # If we want user to pay fees later, we need partial signing support (admin + user) on the client.
     instructions = [ix for ix in [create_ix, mint_ix] if ix is not None]
-    message = MessageV0.try_compile(admin_pub, instructions, [], Hash.from_string(blockhash))
-    tx = VersionedTransaction(message, [admin_kp])
+    # Payer = user; admin pre-signs mint authority. We partially sign for admin and leave payer to the wallet.
+    message = MessageV0.try_compile(to_pubkey(req.wallet), instructions, [], Hash.from_string(blockhash))
+    admin_sig = admin_kp.sign_message(message.serialize())
+    payer_placeholder = Signature.default()
+    tx = VersionedTransaction.populate(message, [payer_placeholder, admin_sig])
     tx_b64 = base64.b64encode(bytes(tx)).decode()
     tx_v0_b64 = tx_b64  # already versioned message
     instr = wrap_instruction_meta(instruction_to_dict(mint_ix))
