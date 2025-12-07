@@ -334,6 +334,7 @@ Next steps:
   - Backend pricing responses now return derived fields: `display_price`, 7d/30d averages, spread ratio, and `price_confidence`.
   - Pricing UI shows display price + confidence, and a detail modal with history sparkline fetched on demand.
 - Added `scripts/rescue_garbage.ts`, a TS utility to call `admin_force_cancel_listing` for listings pointing to an old/non-canonical vault_state and return NFTs to the seller. Reads garbage JSON, derives PDAs (listing, card_record, vault_authority) for the old vault, and sends the rescue tx. Use with admin keypair + RPC where the old vault lives.
+- Recycle flow tightened: reward is now exactly 1 card = 1 MOCHI (raw units with configured decimals), no minimum batch size beyond selecting at least one card, user pays gas on the mint tx, and `/profile/recycle/confirm` deducts virtual cards after confirming the on-chain mint.
 
 ## 2025-12-04 – Codex
 - Wired Scrapy runner to actually return scraped rows via a shared `COLLECTED_ITEMS` bucket and fixed package imports (`price_oracle/__init__.py`, fully qualified spider settings).
@@ -360,3 +361,7 @@ Next steps:
 
 ## 2025-12-06T09:30:00Z – Codex
 - Domain migration note: legacy metadata/images are still served from `https://mochims.fun/nft/...` while the live site runs at `https://getmochi.fun`. Frontend no longer rewrites URLs; keep both domains serving the same files or add redirects, and mint future batches with `getmochi.fun` in the manifest to avoid broken images.
+
+## 2025-12-06T12:45:00Z – Codex
+- Backend tx builder now requires env-driven program ids: `PROGRAM_ID` and `SEED_SALE_PROGRAM_ID` are loaded from `backend/.env` (devnet defaults provided).
+- Frontend marketplace enforces `NEXT_PUBLIC_PROGRAM_ID` (no hard-coded fallback), and the admin dashboard now reads `NEXT_PUBLIC_VAULT_AUTHORITY`/`NEXT_PUBLIC_SEED_*` from `frontend/.env.local` for PDAs and balance diagnostics.

@@ -3137,8 +3137,9 @@ def recycle_build(req: RecycleBuildRequest, db: Session = Depends(get_session)):
         if have < item.count:
             raise HTTPException(status_code=400, detail=f"Not enough virtual cards for template {item.template_id}")
         total_cards += item.count
-    if total_cards < auth_settings.recycle_rate:
-        raise HTTPException(status_code=400, detail=f"Need at least {auth_settings.recycle_rate} cards to recycle")
+    # Allow recycling any positive count; enforce count > 0 after validation.
+    if total_cards <= 0:
+        raise HTTPException(status_code=400, detail="Select at least one card to recycle")
 
     # Reward: 1 card = 1 MOCHI (whole token) => raw units = count * 10^decimals
     reward_amount = total_cards * (10 ** auth_settings.mochi_token_decimals)
