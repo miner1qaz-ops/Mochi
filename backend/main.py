@@ -71,6 +71,7 @@ from tx_builder import (
     vault_state_pda,
     versioned_tx_b64,
     build_system_transfer_ix,
+    build_create_ata_ix,
 )
 
 
@@ -3148,11 +3149,20 @@ def recycle_build(req: RecycleBuildRequest, db: Session = Depends(get_session)):
     admin_pub = admin_kp.pubkey()
     mint_pub = to_pubkey(mint_str)
     dest_token = to_pubkey(req.user_token_account)
+    create_ix = None
+    try:
+        ata_info = sol_client.get_account_info(dest_token)
+        if ata_info.value is None:
+            create_ix = build_create_ata_ix(admin_pub, to_pubkey(req.wallet), mint_pub, dest_token)
+    except Exception:
+        # fallback: attempt create
+        create_ix = build_create_ata_ix(admin_pub, to_pubkey(req.wallet), mint_pub, dest_token)
     mint_ix = build_mint_to_ix(mint_pub, dest_token, admin_pub, reward_amount)
     blockhash = get_latest_blockhash()
     # Note: payer is admin to avoid partial-signature requirements here; user still signs to submit.
     # If we want user to pay fees later, we need partial signing support (admin + user) on the client.
-    message = MessageV0.try_compile(admin_pub, [mint_ix], [], Hash.from_string(blockhash))
+    instructions = [ix for ix in [create_ix, mint_ix] if ix is not None]
+    message = MessageV0.try_compile(admin_pub, instructions, [], Hash.from_string(blockhash))
     tx = VersionedTransaction(message, [admin_kp])
     tx_b64 = base64.b64encode(bytes(tx)).decode()
     tx_v0_b64 = tx_b64  # already versioned message
