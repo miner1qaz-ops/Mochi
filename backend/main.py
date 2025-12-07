@@ -3162,14 +3162,12 @@ def recycle_build(req: RecycleBuildRequest, db: Session = Depends(get_session)):
     instructions = [ix for ix in [create_ix, mint_ix] if ix is not None]
     # Payer = user; admin pre-signs mint authority. We partially sign for admin and leave payer slot empty for wallet.
     message = MessageV0.try_compile(to_pubkey(req.wallet), instructions, [], Hash.from_string(blockhash))
-    # signatures array must align with signer order in the message header
-    sigs = [Signature.default() for _ in range(message.header.num_required_signatures)]
-    static_keys = list(message.static_account_keys())
-    try:
-        admin_idx = static_keys.index(admin_pub)
-    except ValueError:
-        raise HTTPException(status_code=500, detail="Recycle tx missing admin signer")
-    sigs[admin_idx] = admin_kp.sign_message(bytes(message))
+    required = message.header.num_required_signatures
+    sigs = [Signature.default() for _ in range(required)]
+    if required < 2:
+        raise HTTPException(status_code=500, detail="Recycle tx missing expected signers")
+    # Assume signer order: 0 = payer (user), 1 = admin mint authority.
+    sigs[1] = admin_kp.sign_message(bytes(message))
     tx = VersionedTransaction.populate(message, sigs)
     tx_b64 = base64.b64encode(bytes(tx)).decode()
     tx_v0_b64 = tx_b64  # already versioned message
