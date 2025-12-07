@@ -3152,10 +3152,11 @@ def recycle_build(req: RecycleBuildRequest, db: Session = Depends(get_session)):
     try:
         ata_info = sol_client.get_account_info(dest_token)
         if ata_info.value is None:
-            create_ix = build_create_ata_ix(admin_pub, to_pubkey(req.wallet), mint_pub)
+            # payer = user so user covers rent/fees
+            create_ix = build_create_ata_ix(to_pubkey(req.wallet), to_pubkey(req.wallet), mint_pub)
     except Exception:
-        # fallback: attempt create
-        create_ix = build_create_ata_ix(admin_pub, to_pubkey(req.wallet), mint_pub)
+        # fallback: attempt create with user as payer
+        create_ix = build_create_ata_ix(to_pubkey(req.wallet), to_pubkey(req.wallet), mint_pub)
     mint_ix = build_mint_to_ix(mint_pub, dest_token, admin_pub, reward_amount)
     blockhash = get_latest_blockhash()
     instructions = [ix for ix in [create_ix, mint_ix] if ix is not None]
@@ -3164,6 +3165,10 @@ def recycle_build(req: RecycleBuildRequest, db: Session = Depends(get_session)):
     admin_sig = admin_kp.sign_message(bytes(message))
     payer_placeholder = Signature.default()
     tx = VersionedTransaction.populate(message, [payer_placeholder, admin_sig])
+    # Sanity check signatures before returning (will fail if order/count is wrong)
+    verify = tx.verify_with_results()
+    if not all(verify):
+        raise HTTPException(status_code=500, detail=f\"Recycle tx failed signature verify: {verify}\")
     tx_b64 = base64.b64encode(bytes(tx)).decode()
     tx_v0_b64 = tx_b64  # already versioned message
     instr = wrap_instruction_meta(instruction_to_dict(mint_ix))
