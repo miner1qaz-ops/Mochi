@@ -3165,10 +3165,6 @@ def recycle_build(req: RecycleBuildRequest, db: Session = Depends(get_session)):
     admin_sig = admin_kp.sign_message(bytes(message))
     payer_placeholder = Signature.default()
     tx = VersionedTransaction.populate(message, [payer_placeholder, admin_sig])
-    # Sanity check signatures before returning (will fail if order/count is wrong)
-    verify = tx.verify_with_results()
-    if not all(verify):
-        raise HTTPException(status_code=500, detail=f\"Recycle tx failed signature verify: {verify}\")
     tx_b64 = base64.b64encode(bytes(tx)).decode()
     tx_v0_b64 = tx_b64  # already versioned message
     instr = wrap_instruction_meta(instruction_to_dict(mint_ix))
