@@ -71,7 +71,6 @@ from tx_builder import (
     vault_state_pda,
     versioned_tx_b64,
     build_system_transfer_ix,
-    build_create_ata_ix,
 )
 
 
