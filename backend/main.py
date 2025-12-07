@@ -3150,8 +3150,9 @@ def recycle_build(req: RecycleBuildRequest, db: Session = Depends(get_session)):
     dest_token = to_pubkey(req.user_token_account)
     mint_ix = build_mint_to_ix(mint_pub, dest_token, admin_pub, reward_amount)
     blockhash = get_latest_blockhash()
-    # Fee payer = user; admin pre-signs as mint authority. Wallet adds its signature and submits.
-    message = MessageV0.try_compile(to_pubkey(req.wallet), [mint_ix], [], Hash.from_string(blockhash))
+    # Note: payer is admin to avoid partial-signature requirements here; user still signs to submit.
+    # If we want user to pay fees later, we need partial signing support (admin + user) on the client.
+    message = MessageV0.try_compile(admin_pub, [mint_ix], [], Hash.from_string(blockhash))
     tx = VersionedTransaction(message, [admin_kp])
     tx_b64 = base64.b64encode(bytes(tx)).decode()
     tx_v0_b64 = tx_b64  # already versioned message
