@@ -52,14 +52,23 @@ pub mod mochi_seed_sale {
         require!(clock.unix_timestamp <= sale.end_ts, SeedError::Ended);
         require!(lamports > 0, SeedError::InvalidContribution);
 
-        let potential_raise = sale.raised_lamports.checked_add(lamports).ok_or(SeedError::Overflow)?;
+        let potential_raise = sale
+            .raised_lamports
+            .checked_add(lamports)
+            .ok_or(SeedError::Overflow)?;
         if sale.sol_cap_lamports > 0 {
-            require!(potential_raise <= sale.sol_cap_lamports, SeedError::CapReached);
+            require!(
+                potential_raise <= sale.sol_cap_lamports,
+                SeedError::CapReached
+            );
         }
         let tokens_owed = lamports
             .checked_mul(sale.price_tokens_per_sol)
             .ok_or(SeedError::Overflow)?;
-        let potential_sold = sale.sold_tokens.checked_add(tokens_owed).ok_or(SeedError::Overflow)?;
+        let potential_sold = sale
+            .sold_tokens
+            .checked_add(tokens_owed)
+            .ok_or(SeedError::Overflow)?;
         if sale.token_cap > 0 {
             require!(potential_sold <= sale.token_cap, SeedError::CapReached);
         }
@@ -72,7 +81,11 @@ pub mod mochi_seed_sale {
         );
         anchor_lang::solana_program::program::invoke(
             &transfer_ix,
-            &[ctx.accounts.buyer.to_account_info(), ctx.accounts.system_program.to_account_info(), ctx.accounts.treasury.to_account_info()],
+            &[
+                ctx.accounts.buyer.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+                ctx.accounts.treasury.to_account_info(),
+            ],
         )?;
 
         let contrib = &mut ctx.accounts.contribution;
@@ -82,7 +95,10 @@ pub mod mochi_seed_sale {
             .contributed_lamports
             .checked_add(lamports)
             .ok_or(SeedError::Overflow)?;
-        contrib.tokens_owed = contrib.tokens_owed.checked_add(tokens_owed).ok_or(SeedError::Overflow)?;
+        contrib.tokens_owed = contrib
+            .tokens_owed
+            .checked_add(tokens_owed)
+            .ok_or(SeedError::Overflow)?;
         contrib.claimed = false;
         sale.raised_lamports = potential_raise;
         sale.sold_tokens = potential_sold;
@@ -108,7 +124,11 @@ pub mod mochi_seed_sale {
             to: ctx.accounts.user_ata.to_account_info(),
             authority: ctx.accounts.vault_authority.to_account_info(),
         };
-        let cpi_ctx = CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), cpi_accounts, signer);
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+            signer,
+        );
         token::transfer(cpi_ctx, amount)?;
 
         contrib.claimed = true;
@@ -117,7 +137,10 @@ pub mod mochi_seed_sale {
 
     pub fn cancel_sale(ctx: Context<CancelSale>) -> Result<()> {
         let sale = &mut ctx.accounts.sale;
-        require!(ctx.accounts.authority.key() == sale.authority, SeedError::Unauthorized);
+        require!(
+            ctx.accounts.authority.key() == sale.authority,
+            SeedError::Unauthorized
+        );
         sale.is_canceled = true;
         Ok(())
     }
@@ -149,8 +172,14 @@ pub mod mochi_seed_sale {
     pub fn claim_vesting(ctx: Context<ClaimVesting>) -> Result<()> {
         let clock = Clock::get()?;
         let vest = &mut ctx.accounts.vesting;
-        require!(clock.unix_timestamp >= vest.cliff_ts, SeedError::CliffNotReached);
-        require!(vest.total_amount > vest.claimed_amount, SeedError::NothingToClaim);
+        require!(
+            clock.unix_timestamp >= vest.cliff_ts,
+            SeedError::CliffNotReached
+        );
+        require!(
+            vest.total_amount > vest.claimed_amount,
+            SeedError::NothingToClaim
+        );
 
         let vested = vested_amount(vest, clock.unix_timestamp)?;
         let claimable = vested
@@ -165,7 +194,11 @@ pub mod mochi_seed_sale {
             to: ctx.accounts.beneficiary_ata.to_account_info(),
             authority: ctx.accounts.vest_vault_authority.to_account_info(),
         };
-        let cpi_ctx = CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), cpi_accounts, signer);
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+            signer,
+        );
         token::transfer(cpi_ctx, claimable)?;
 
         vest.claimed_amount = vest
@@ -375,16 +408,28 @@ impl Vesting {
 
 #[error_code]
 pub enum SeedError {
-    #[msg("Sale window is invalid")] InvalidWindow,
-    #[msg("Sale not started")] NotStarted,
-    #[msg("Sale ended")] Ended,
-    #[msg("Sale not ended")] NotEnded,
-    #[msg("Sale canceled")] Canceled,
-    #[msg("Contribution too small")] InvalidContribution,
-    #[msg("Cap reached")] CapReached,
-    #[msg("Overflow")] Overflow,
-    #[msg("Unauthorized")] Unauthorized,
-    #[msg("Already claimed")] AlreadyClaimed,
-    #[msg("Nothing to claim")] NothingToClaim,
-    #[msg("Cliff not reached")] CliffNotReached,
+    #[msg("Sale window is invalid")]
+    InvalidWindow,
+    #[msg("Sale not started")]
+    NotStarted,
+    #[msg("Sale ended")]
+    Ended,
+    #[msg("Sale not ended")]
+    NotEnded,
+    #[msg("Sale canceled")]
+    Canceled,
+    #[msg("Contribution too small")]
+    InvalidContribution,
+    #[msg("Cap reached")]
+    CapReached,
+    #[msg("Overflow")]
+    Overflow,
+    #[msg("Unauthorized")]
+    Unauthorized,
+    #[msg("Already claimed")]
+    AlreadyClaimed,
+    #[msg("Nothing to claim")]
+    NothingToClaim,
+    #[msg("Cliff not reached")]
+    CliffNotReached,
 }

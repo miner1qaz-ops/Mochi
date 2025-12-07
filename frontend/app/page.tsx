@@ -88,6 +88,7 @@ const normalizeImage = (src?: string | null) => {
   if (url.startsWith('ipfs://')) {
     url = url.replace('ipfs://', 'https://ipfs.io/ipfs/');
   }
+  // Legacy metadata was minted on mochims.fun; rewrite to getmochi.fun where we proxy /nft/.
   url = url.replace('mochims.fun', 'getmochi.fun');
   return url;
 };

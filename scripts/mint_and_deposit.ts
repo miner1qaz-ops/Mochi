@@ -66,7 +66,10 @@ function loadTemplates(): TemplateRow[] {
     seen.add(tmpl.templateId);
     unique.push(tmpl);
   }
-  return unique;
+  const allowlist = new Set(
+    ['rare', 'double rare', 'double_rare', 'doublerare', 'ultra rare', 'ultra_rare', 'ultrarare', 'illustration rare', 'illustration_rare', 'illustrationrare', 'special illustration rare', 'special_illustration_rare', 'specialillustrationrare', 'mega hyper rare', 'mega_hyper_rare', 'megahyperrare'].map((s) => s.replace(/\\s+/g, '').toLowerCase())
+  );
+  return unique.filter((t) => allowlist.has(t.rarity.replace(/\\s+/g, '').toLowerCase()));
 }
 
 async function vaultPdas(program: Program, vaultState: PublicKey) {
@@ -179,41 +182,44 @@ async function main() {
   const templates = loadTemplates().sort((a, b) => a.templateId - b.templateId);
   const maxCount = process.env.CORE_TEMPLATE_LIMIT ? Number(process.env.CORE_TEMPLATE_LIMIT) : null;
   const offset = process.env.CORE_TEMPLATE_OFFSET ? Number(process.env.CORE_TEMPLATE_OFFSET) : 0;
+  const copies = process.env.CORE_TEMPLATE_COPIES ? Number(process.env.CORE_TEMPLATE_COPIES) : 3;
   const sliced = offset > 0 ? templates.slice(offset) : templates;
   const selected = maxCount && maxCount > 0 ? sliced.slice(0, maxCount) : sliced;
   console.log(
-    `Minting ${selected.length} assets to vault authority ${vaultAuth.toBase58()} (offset ${offset})`
+    `Minting ${selected.length * copies} assets (copies=${copies}) to vault authority ${vaultAuth.toBase58()} (offset ${offset})`
   );
 
   for (const row of selected) {
     const tokenId = String(row.templateId).padStart(3, '0');
     const jsonUri = `${JSON_BASE}/${tokenId}.json`;
     const name = `${row.name} #${tokenId}`;
-    const coreAsset = await mintCoreToVault(connection, payer, vaultAuth, jsonUri, name);
-    const [cardRecord] = PublicKey.findProgramAddressSync(
-      [Buffer.from('card_record'), vaultState.toBuffer(), coreAsset.toBuffer()],
-      PROGRAM_ID
-    );
-    const existing = await connection.getAccountInfo(cardRecord);
-    if (existing) {
-      console.log(`CardRecord already exists for asset ${coreAsset.toBase58()}, skipping`);
-      continue;
+    for (let copy = 0; copy < copies; copy += 1) {
+      const coreAsset = await mintCoreToVault(connection, payer, vaultAuth, jsonUri, name);
+      const [cardRecord] = PublicKey.findProgramAddressSync(
+        [Buffer.from('card_record'), vaultState.toBuffer(), coreAsset.toBuffer()],
+        PROGRAM_ID
+      );
+      const existing = await connection.getAccountInfo(cardRecord);
+      if (existing) {
+        console.log(`CardRecord already exists for asset ${coreAsset.toBase58()}, skipping`);
+        continue;
+      }
+      await depositCard(
+        program,
+        {
+          admin: payer.publicKey,
+          vaultState,
+          vaultAuthority: vaultAuth,
+          cardRecord,
+          coreAsset,
+          systemProgram: SystemProgram.programId,
+          mplCoreProgram: MPL_CORE_PROGRAM_ID,
+        },
+        row.templateId,
+        row.rarity
+      );
+      console.log(`Minted and deposited template ${row.templateId} (${row.rarity}) -> ${coreAsset.toBase58()}`);
     }
-    await depositCard(
-      program,
-      {
-        admin: payer.publicKey,
-        vaultState,
-        vaultAuthority: vaultAuth,
-        cardRecord,
-        coreAsset,
-        systemProgram: SystemProgram.programId,
-        mplCoreProgram: MPL_CORE_PROGRAM_ID,
-      },
-      row.templateId,
-      row.rarity
-    );
-    console.log(`Minted and deposited template ${row.templateId} (${row.rarity}) -> ${coreAsset.toBase58()}`);
   }
 }
 

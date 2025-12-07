@@ -31,6 +31,7 @@ export type Listing = {
   rarity?: string;
   name?: string;
   image_url?: string;
+  is_fake?: boolean;
 };
 
 export type GarbageListing = {
@@ -148,6 +149,7 @@ export type PricingPortfolioBreakdown = {
   fair_value: number;
   confidence_score?: string | null;
   total_value_usd: number;
+  image_url?: string | null;
 };
 
 export type PricingStats = {
@@ -155,6 +157,68 @@ export type PricingStats = {
   change_24h?: number | null;
   last_valuation_at: number;
   breakdown: PricingPortfolioBreakdown[];
+};
+
+export type PortfolioHoldings = {
+  total_value_usd: number;
+  breakdown: PricingPortfolioBreakdown[];
+};
+
+export type PortfolioTopHolding = {
+  template_id: number;
+  name?: string | null;
+  count: number;
+  fair_value: number;
+  total_value_usd: number;
+  image_url?: string | null;
+};
+
+export type PortfolioSummary = {
+  total_value_usd: number;
+  total_nfts: number;
+  total_virtual: number;
+  sparkline: number[];
+  top_holdings: PortfolioTopHolding[];
+};
+
+export type MarketCardListing = {
+  core_asset: string;
+  price_lamports: number;
+  seller?: string | null;
+  currency_mint?: string | null;
+  is_fake?: boolean;
+};
+
+export type MarketCardSummary = {
+  template_id: number;
+  name: string;
+  set_name?: string | null;
+  rarity?: string | null;
+  image_url?: string | null;
+  fair_price?: number | null;
+  lowest_listing?: number | null;
+  listing_count: number;
+  sparkline: PricingHistoryPoint[];
+  is_fake?: boolean;
+};
+
+export type MarketCardDetail = {
+  template_id: number;
+  name: string;
+  set_name?: string | null;
+  rarity?: string | null;
+  image_url?: string | null;
+  fair_price?: number | null;
+  confidence?: string | null;
+  change_24h?: number | null;
+  change_7d?: number | null;
+  change_30d?: number | null;
+  history: PricingHistoryPoint[];
+  listings: MarketCardListing[];
+  my_assets?: string[] | null;
+  lowest_listing?: number | null;
+  listing_count: number;
+  is_fake?: boolean;
 };
 
 export async function previewPack(client_seed: string, wallet: string, pack_type: string = 'meg_web') {
@@ -197,6 +261,11 @@ export async function claimPack(wallet: string) {
 export async function sellbackPack(wallet: string, user_token_account?: string, vault_token_account?: string) {
   const { data } = await api.post('/program/v2/sellback/build', { wallet, user_token_account, vault_token_account });
   return data as { tx_b64: string; tx_v0_b64: string; recent_blockhash: string; instructions: InstructionMeta[] };
+}
+
+export async function fetchInventoryRarity(): Promise<Record<string, number>> {
+  const { data } = await api.get('/admin/inventory/rarity');
+  return data as Record<string, number>;
 }
 
 export async function expirePack(wallet: string) {
@@ -310,6 +379,26 @@ export async function fetchPricingSparklines(templateIds: number[], points: numb
 export async function fetchPricingStats(wallet: string) {
   const { data } = await api.get('/pricing/stats', { params: { wallet } });
   return data as PricingStats;
+}
+
+export async function fetchPortfolioSummary(wallet: string) {
+  const { data } = await api.get('/portfolio/summary', { params: { wallet } });
+  return data as PortfolioSummary;
+}
+
+export async function fetchPortfolioHoldings(wallet: string) {
+  const { data } = await api.get('/portfolio/holdings', { params: { wallet } });
+  return data as PortfolioHoldings;
+}
+
+export async function fetchMarketCards(params: { q?: string; set_name?: string; rarity?: string; sort?: string; listed_only?: boolean }) {
+  const { data } = await api.get('/market/cards', { params });
+  return data as MarketCardSummary[];
+}
+
+export async function fetchMarketCard(templateId: number, opts?: { days?: number; wallet?: string }) {
+  const { data } = await api.get(`/market/card/${templateId}`, { params: opts });
+  return data as MarketCardDetail;
 }
 
 export async function fetchSeedSaleState(wallet?: string) {

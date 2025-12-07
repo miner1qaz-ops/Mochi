@@ -15,6 +15,10 @@ import {
   VirtualCard,
   Listing,
   GarbageListing,
+  fetchPortfolioSummary,
+  fetchPortfolioHoldings,
+  PortfolioSummary,
+  PortfolioHoldings,
 } from '../../../lib/api';
 import { deriveAta } from '../../../lib/ata';
 import { buildV0Tx } from '../../../lib/tx';
@@ -42,7 +46,13 @@ export default function ProfilePage() {
     () => new PublicKey(process.env.NEXT_PUBLIC_MOCHI_TOKEN_MINT || '3gqKrJoVx3gUXLHCsNQfpyZAuVagLHQFGtYgbtY3VEsn'),
     []
   );
+  const mochiDecimals = useMemo(() => Number(process.env.NEXT_PUBLIC_MOCHI_TOKEN_DECIMALS || 6), []);
+  const [mochiBalance, setMochiBalance] = useState<number | null>(null);
   const [assetImages, setAssetImages] = useState<Record<string, string>>({});
+  const [portfolioSummary, setPortfolioSummary] = useState<PortfolioSummary | null>(null);
+  const [portfolioHoldings, setPortfolioHoldings] = useState<PortfolioHoldings | null>(null);
+  const [showHoldings, setShowHoldings] = useState(false);
+  const [holdingsLoading, setHoldingsLoading] = useState(false);
 
   const normalizeImage = (src?: string | null) => {
     if (!src) return undefined;
@@ -50,7 +60,7 @@ export default function ProfilePage() {
     if (url.startsWith('ipfs://')) {
       url = url.replace('ipfs://', 'https://ipfs.io/ipfs/');
     }
-    // Legacy assets still point to mochims.fun; swap to the live, valid cert on getmochi.fun
+    // Legacy metadata was minted on mochims.fun; rewrite to getmochi.fun where we now proxy /nft/.
     url = url.replace('mochims.fun', 'getmochi.fun');
     return url;
   };
@@ -128,7 +138,31 @@ export default function ProfilePage() {
     fetchGarbageListings()
       .then((items) => setGarbageListings(items || []))
       .catch(() => setGarbageListings([]));
+    fetchPortfolioSummary(address)
+      .then(setPortfolioSummary)
+      .catch(() => setPortfolioSummary(null));
   }, [address]);
+
+  useEffect(() => {
+    if (!address || !connection) return;
+    let cancelled = false;
+    const loadMochi = async () => {
+      try {
+        const owner = new PublicKey(address);
+        const ata = await deriveAta(owner, mochiMint);
+        const bal = await connection.getTokenAccountBalance(ata);
+        if (!cancelled) {
+          setMochiBalance(Number(bal?.value?.amount || 0));
+        }
+      } catch (e) {
+        if (!cancelled) setMochiBalance(0);
+      }
+    };
+    loadMochi();
+    return () => {
+      cancelled = true;
+    };
+  }, [address, connection, mochiMint]);
 
   const rarityOrder: Record<string, number> = {
     Common: 0,
@@ -187,6 +221,20 @@ export default function ProfilePage() {
   const totalVirtual = virtualCards.reduce((sum, v) => sum + v.count, 0);
   const totalNfts = filteredAssets.length;
   const totalListed = filteredListings.length;
+  const topHoldings = portfolioSummary?.top_holdings || [];
+
+  const loadHoldings = async () => {
+    if (!address || holdingsLoading || portfolioHoldings) return;
+    setHoldingsLoading(true);
+    try {
+      const data = await fetchPortfolioHoldings(address);
+      setPortfolioHoldings(data);
+    } catch {
+      setPortfolioHoldings(null);
+    } finally {
+      setHoldingsLoading(false);
+    }
+  };
 
   const recycleItems = Object.entries(selected)
     .filter(([, cnt]) => cnt > 0)
@@ -237,6 +285,9 @@ export default function ProfilePage() {
     fetchGarbageListings()
       .then((items) => setGarbageListings(items || []))
       .catch(() => setGarbageListings([]));
+    fetchPortfolioSummary(address)
+      .then(setPortfolioSummary)
+      .catch(() => setPortfolioSummary(null));
   };
 
   const handleList = async (assetId: string) => {
@@ -336,7 +387,7 @@ export default function ProfilePage() {
         </div>
       )}
       <div className="card-blur rounded-2xl border border-white/5 p-4 space-y-3">
-        <div className="grid grid-cols-3 gap-3 text-sm text-white">
+        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3 text-sm text-white">
           <div className="rounded-xl bg-white/5 border border-white/10 p-3">
             <p className="text-xs text-white/60">Owned NFTs</p>
             <p className="text-lg font-semibold">{totalNfts}</p>
@@ -348,6 +399,38 @@ export default function ProfilePage() {
           <div className="rounded-xl bg-white/5 border border-white/10 p-3">
             <p className="text-xs text-white/60">Virtual cards</p>
             <p className="text-lg font-semibold">{totalVirtual}</p>
+          </div>
+          <div className="rounded-xl bg-white/5 border border-white/10 p-3">
+            <p className="text-xs text-white/60">MOCHI balance</p>
+            <p className="text-lg font-semibold">
+              {mochiBalance === null ? '—' : (mochiBalance / 10 ** mochiDecimals).toLocaleString(undefined, { maximumFractionDigits: mochiDecimals })}
+            </p>
+            <div className="text-[11px] text-white/60 break-all">Mint: {mochiMint.toBase58()}</div>
+          </div>
+          <div className="rounded-xl bg-white/5 border border-white/10 p-3">
+            <p className="text-xs text-white/60">Portfolio value</p>
+            <p className="text-lg font-semibold">
+              {portfolioSummary ? `$${portfolioSummary.total_value_usd.toFixed(2)}` : '—'}
+            </p>
+            <div className="text-[11px] text-white/60">NFTs: {portfolioSummary?.total_nfts ?? '—'} · Virtual: {portfolioSummary?.total_virtual ?? '—'}</div>
+            {portfolioSummary?.sparkline?.length ? (
+              <svg viewBox={`0 0 120 40`} className="w-full h-10 mt-1">
+                {(() => {
+                  const vals = portfolioSummary.sparkline;
+                  const min = Math.min(...vals);
+                  const max = Math.max(...vals);
+                  const range = max - min || 1;
+                  const coords = vals.map((v, i) => {
+                    const x = (i / Math.max(1, vals.length - 1)) * 120;
+                    const y = 40 - ((v - min) / range) * 40;
+                    return `${x},${y}`;
+                  });
+                  return <polyline fill="none" stroke="#34d399" strokeWidth="2" points={coords.join(' ')} strokeLinejoin="round" strokeLinecap="round" />;
+                })()}
+              </svg>
+            ) : (
+              <div className="text-[11px] text-white/50 mt-1">No price history</div>
+            )}
           </div>
         </div>
         <div className="flex gap-2 text-sm flex-wrap">
@@ -409,7 +492,76 @@ export default function ProfilePage() {
       </div>
 
       {viewTab === 'nft' && (
-        <div className="grid sm:grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-3">
+        <div className="space-y-4">
+          {portfolioSummary && (
+            <div className="rounded-2xl border border-white/10 bg-white/5 p-3 space-y-2">
+              <div className="flex items-center justify-between">
+                <div className="text-sm font-semibold">Top holdings</div>
+                <div className="text-xs text-white/60">Snapshot · tap a card to view in Market</div>
+              </div>
+              <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-2 text-sm">
+                {topHoldings.length === 0 && <div className="text-xs text-white/60">No holdings yet.</div>}
+                {topHoldings.slice(0, 5).map((h) => (
+                  <a
+                    key={h.template_id}
+                    href={`/market/card/${h.template_id}`}
+                    className="rounded-xl border border-white/5 bg-black/20 p-2 flex gap-2 items-center hover:bg-white/10"
+                  >
+                    {h.image_url ? (
+                      <img src={h.image_url} alt={h.name || ''} className="h-12 w-9 object-contain rounded-lg bg-black/30 border border-white/10" />
+                    ) : (
+                      <div className="h-12 w-9 rounded-lg bg-black/30 border border-white/10 flex items-center justify-center text-[10px] text-white/50">No art</div>
+                    )}
+                    <div className="flex-1 min-w-0">
+                      <div className="font-semibold truncate">{h.name || `Card #${h.template_id}`}</div>
+                      <div className="text-[11px] text-white/60">Qty {h.count} · Fair ${h.fair_value.toFixed(2)}</div>
+                      <div className="text-sm font-semibold">${h.total_value_usd.toFixed(2)}</div>
+                    </div>
+                  </a>
+                ))}
+              </div>
+              <div className="flex justify-end">
+                <button
+                  type="button"
+                  className="px-3 py-2 rounded-lg bg-white/10 border border-white/10 text-sm"
+                  onClick={() => {
+                    if (!showHoldings) loadHoldings();
+                    setShowHoldings((prev) => !prev);
+                  }}
+                >
+                  {showHoldings ? 'Hide full breakdown' : 'View full breakdown'}
+                </button>
+              </div>
+              {showHoldings && (
+                <div className="mt-2 text-sm space-y-2">
+                  {holdingsLoading && <div className="text-white/70 text-xs">Loading breakdown…</div>}
+                  {!holdingsLoading && portfolioHoldings && portfolioHoldings.breakdown.length === 0 && (
+                    <div className="text-xs text-white/60">No holdings yet.</div>
+                  )}
+                  {!holdingsLoading &&
+                    portfolioHoldings?.breakdown.map((b) => (
+                      <a
+                        key={b.template_id}
+                        href={`/market/card/${b.template_id}`}
+                        className="flex items-center justify-between rounded-lg bg-black/20 border border-white/5 px-3 py-2 hover:bg-white/10"
+                      >
+                        <div className="truncate flex items-center gap-2">
+                          {b.image_url ? (
+                            <img src={b.image_url} alt={b.name || ''} className="h-10 w-8 object-contain rounded bg-black/30 border border-white/10" />
+                          ) : null}
+                          <span>{b.name || `Card #${b.template_id}`} × {b.count}</span>
+                        </div>
+                        <div className="flex items-center gap-3 text-right">
+                          <span className="text-white/70 text-xs">Fair: ${b.fair_value.toFixed(2)}</span>
+                          <span className="font-semibold">${b.total_value_usd.toFixed(2)}</span>
+                        </div>
+                      </a>
+                    ))}
+                </div>
+              )}
+            </div>
+          )}
+          <div className="grid sm:grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-3">
           {filteredAssets.map((asset) => {
             const name = asset.content?.metadata?.name || 'Core asset';
             const templateAttr = asset.content?.metadata?.attributes?.find(
@@ -484,6 +636,7 @@ export default function ProfilePage() {
             );
           })}
           {!assets.length && <p className="text-white/60">No assets found.</p>}
+          </div>
         </div>
       )}
 

@@ -35,6 +35,13 @@
               {
                 "kind": "const",
                 "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
                   118,
                   97,
                   117,
@@ -123,6 +130,13 @@
               {
                 "kind": "const",
                 "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
                   118,
                   97,
                   117,
@@ -609,6 +623,206 @@
       "args": []
     },
     {
+      "name": "admin_prune_listing",
+      "docs": [
+        "Admin-only prune for malformed listings that point to a wrong/nonexistent vault_state.",
+        "This does NOT move any assets; it simply marks the listing as Cancelled to hide it."
+      ],
+      "discriminator": [
+        57,
+        147,
+        191,
+        182,
+        179,
+        36,
+        231,
+        164
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true
+        },
+        {
+          "name": "vault_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "listing",
+          "writable": true
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "admin_rescue_legacy_listing",
+      "docs": [
+        "Admin-only rescue for legacy listings anchored to an old/non-canonical vault_state PDA.",
+        "Returns the asset to the original seller and marks the listing cancelled."
+      ],
+      "discriminator": [
+        181,
+        47,
+        89,
+        105,
+        18,
+        253,
+        220,
+        91
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true
+        },
+        {
+          "name": "marketplace_vault_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "legacy_vault_state",
+          "writable": true
+        },
+        {
+          "name": "card_record",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  97,
+                  114,
+                  100,
+                  95,
+                  114,
+                  101,
+                  99,
+                  111,
+                  114,
+                  100
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "legacy_vault_state"
+              },
+              {
+                "kind": "account",
+                "path": "core_asset"
+              }
+            ]
+          }
+        },
+        {
+          "name": "core_asset",
+          "writable": true
+        },
+        {
+          "name": "listing",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  105,
+                  115,
+                  116,
+                  105,
+                  110,
+                  103
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "legacy_vault_state"
+              },
+              {
+                "kind": "account",
+                "path": "core_asset"
+              }
+            ]
+          }
+        },
+        {
+          "name": "legacy_vault_authority",
+          "writable": true
+        },
+        {
+          "name": "seller",
+          "docs": [
+            "Seller destination (must match listing.seller)"
+          ],
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "mpl_core_program"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "admin_reset_cards",
       "discriminator": [
         249,
@@ -823,6 +1037,13 @@
               {
                 "kind": "const",
                 "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
                   118,
                   97,
                   117,
@@ -911,6 +1132,13 @@
               {
                 "kind": "const",
                 "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
                   118,
                   97,
                   117,
@@ -1630,6 +1858,178 @@
       "args": []
     },
     {
+      "name": "emergency_return_asset",
+      "docs": [
+        "Admin-only guardrail to return a stuck listing's asset to its original seller.",
+        "Destination is fixed to listing.seller; admin cannot redirect funds."
+      ],
+      "discriminator": [
+        146,
+        154,
+        251,
+        58,
+        253,
+        216,
+        178,
+        209
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true
+        },
+        {
+          "name": "vault_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "card_record",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  97,
+                  114,
+                  100,
+                  95,
+                  114,
+                  101,
+                  99,
+                  111,
+                  114,
+                  100
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              },
+              {
+                "kind": "account",
+                "path": "core_asset"
+              }
+            ]
+          }
+        },
+        {
+          "name": "core_asset",
+          "writable": true
+        },
+        {
+          "name": "listing",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  105,
+                  115,
+                  116,
+                  105,
+                  110,
+                  103
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              },
+              {
+                "kind": "account",
+                "path": "core_asset"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_authority",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              }
+            ]
+          }
+        },
+        {
+          "name": "seller",
+          "docs": [
+            "Seller destination (must match listing.seller)"
+          ],
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "mpl_core_program"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "expire_session",
       "discriminator": [
         102,
@@ -1913,6 +2313,13 @@
               {
                 "kind": "const",
                 "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
                   118,
                   97,
                   117,
@@ -1972,6 +2379,13 @@
               {
                 "kind": "const",
                 "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
                   118,
                   97,
                   117,
@@ -2138,6 +2552,117 @@
       "args": []
     },
     {
+      "name": "initialize_marketplace_vault",
+      "discriminator": [
+        30,
+        152,
+        172,
+        80,
+        126,
+        155,
+        40,
+        92
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "vault_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_authority",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "marketplace_fee_bps",
+          "type": "u16"
+        },
+        {
+          "name": "core_collection",
+          "type": {
+            "option": "pubkey"
+          }
+        },
+        {
+          "name": "usdc_mint",
+          "type": {
+            "option": "pubkey"
+          }
+        }
+      ]
+    },
+    {
       "name": "initialize_vault",
       "discriminator": [
         48,
@@ -2275,6 +2800,13 @@
               {
                 "kind": "const",
                 "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
                   118,
                   97,
                   117,
@@ -2361,6 +2893,13 @@
               {
                 "kind": "const",
                 "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
                   118,
                   97,
                   117,
@@ -2386,7 +2925,8 @@
           }
         },
         {
-          "name": "system_program"
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
         },
         {
           "name": "mpl_core_program"
@@ -3279,33 +3819,33 @@
     },
     {
       "code": 6006,
+      "name": "InvalidListingState",
+      "msg": "Listing invalid state"
+    },
+    {
+      "code": 6007,
       "name": "SessionExists",
       "msg": "Session already exists"
     },
     {
-      "code": 6007,
+      "code": 6008,
       "name": "InvalidSessionState",
       "msg": "Invalid session state"
     },
     {
-      "code": 6008,
+      "code": 6009,
       "name": "SessionExpired",
       "msg": "Session expired"
     },
     {
-      "code": 6009,
+      "code": 6010,
       "name": "SessionNotExpired",
       "msg": "Session not expired"
     },
     {
-      "code": 6010,
+      "code": 6011,
       "name": "CardNotReserved",
       "msg": "Card not reserved"
-    },
-    {
-      "code": 6011,
-      "name": "InvalidListingState",
-      "msg": "Listing invalid state"
     },
     {
       "code": 6012,

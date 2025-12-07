@@ -79,7 +79,7 @@ DATABASE_URL=sqlite:///./mochi.db
 Set in `frontend/.env.local`:
 ```
 NEXT_PUBLIC_SOLANA_RPC=https://api.devnet.solana.com
-NEXT_PUBLIC_BACKEND_URL=http://localhost:8000
+NEXT_PUBLIC_BACKEND_URL=http://localhost:4000
 NEXT_PUBLIC_ADMIN_ADDRESS=CKjhhqfijtAD48cg2FDcDH5ARCVjRiQS6ppmXFBM6Lcs
 NEXT_PUBLIC_USDC_MINT=GWRsfsckjMn2vRZjUf3756AdZiNJULG6E6oTvbK6SvRu
 NEXT_PUBLIC_PROGRAM_ID=Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx

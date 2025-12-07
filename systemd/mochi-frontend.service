@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 WorkingDirectory=/root/mochi/frontend
-ExecStart=/usr/bin/npm run start -- --hostname 127.0.0.1 --port 3000
+ExecStart=/usr/bin/npm run start -- --hostname 0.0.0.0 --port 3000
 Restart=always
 User=root
 Environment=NODE_ENV=production

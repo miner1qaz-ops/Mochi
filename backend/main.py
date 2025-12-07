@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import csv
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import requests
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 import re
@@ -24,7 +26,7 @@ from solders.transaction import VersionedTransaction
 from solders.compute_budget import set_compute_unit_limit
 from solana.rpc.api import Client as SolanaClient
 from solana.rpc.types import TxOpts, MemcmpOpts
-from sqlalchemy import Index, text
+from sqlalchemy import Index, or_, text
 from sqlmodel import Field, Session, SQLModel, create_engine, select, func
 
 from tx_builder import (
@@ -46,12 +48,15 @@ from tx_builder import (
     build_open_pack_v2_ix,
     build_sellback_pack_ix,
     build_sellback_pack_v2_ix,
+    build_set_reward_config_ix,
     build_seed_claim_ix,
     build_seed_contribute_ix,
     card_record_pda,
     instruction_to_dict,
     listing_pda,
     message_from_instructions,
+    market_vault_authority_pda,
+    market_vault_state_pda,
     pack_session_pda,
     pack_session_v2_pda,
     seed_contribution_pda,
@@ -81,6 +86,7 @@ class Settings(BaseSettings):
     usdc_mint: Optional[str] = None
     mochi_token_mint: Optional[str] = None
     mochi_token_decimals: int = 6
+    mochi_pack_reward: int = 100  # whole-token amount awarded per pack open
     listing_fee_mochi: int = 0  # raw smallest-unit amount
     official_collections: Optional[str] = None  # comma-separated list of collection mints treated as official
     seed_sale_authority: Optional[str] = None
@@ -100,10 +106,14 @@ auth_settings = Settings()
 
 
 engine = create_engine(auth_settings.database_url)
-sol_client = SolanaClient(auth_settings.solana_rpc)
+# Prefer Helius RPC if provided to improve reliability.
+rpc_url = auth_settings.helius_rpc_url or auth_settings.solana_rpc
+sol_client = SolanaClient(rpc_url)
 ADMIN_KEYPAIR: Optional[SoldersKeypair] = None
-ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_string("ATokenGPvR93dZczYEdiH7kXe1JgRQ1d2Cdu9pfAFu7h")
+# Standard SPL Associated Token Program ID (same across clusters)
+ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
 SYSVAR_RENT_PUBKEY = Pubkey.from_string("SysvarRent111111111111111111111111111111111")
+SYS_PROGRAM_ID = Pubkey.from_string("11111111111111111111111111111111")
 
 
 class CardTemplate(SQLModel, table=True):
@@ -160,6 +170,17 @@ class RecycleLog(SQLModel, table=True):
     created_at: float = Field(default_factory=lambda: time.time())
 
 
+class PackRewardLog(SQLModel, table=True):
+    session_id: str = Field(primary_key=True)
+    wallet: str
+    reward_amount: int  # smallest-unit amount
+    status: str = Field(default="pending")
+    signature: Optional[str] = None
+    error: Optional[str] = None
+    created_at: float = Field(default_factory=lambda: time.time())
+    updated_at: float = Field(default_factory=lambda: time.time())
+
+
 class PriceSnapshot(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     template_id: int = Field(index=True)
@@ -195,9 +216,31 @@ def ensure_price_snapshot_schema():
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_price_snapshot_template_ts ON PriceSnapshot (template_id, collected_at DESC)"))
 
 
+def ensure_pack_reward_log_schema():
+    """Create PackRewardLog if missing (backward-compatible migration)."""
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS PackRewardLog (
+                    session_id TEXT PRIMARY KEY,
+                    wallet TEXT NOT NULL,
+                    reward_amount INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    signature TEXT,
+                    error TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+        )
+
+
 def init_db():
     SQLModel.metadata.create_all(engine)
     ensure_price_snapshot_schema()
+    ensure_pack_reward_log_schema()
 
 
 def get_session():
@@ -208,6 +251,7 @@ def get_session():
 app = FastAPI(title="Mochi v2 API", version="0.1.0")
 SERVER_SEED_HASH = hashlib.sha256(auth_settings.server_seed.encode()).hexdigest()
 PACK_CARD_COUNT = 11
+VAULT_STATE_SIZE = 207  # bytes after the 8-byte discriminator
 RARITY_LABELS = [
     "Common",
     "Uncommon",
@@ -432,11 +476,29 @@ class PricingPortfolioBreakdown(BaseModel):
     fair_value: float
     confidence_score: Optional[str] = None
     total_value_usd: float
+    image_url: Optional[str] = None
 
 
 class PricingPortfolioResponse(BaseModel):
     total_value_usd: float
     breakdown: List[PricingPortfolioBreakdown]
+
+
+class PortfolioTopHolding(BaseModel):
+    template_id: int
+    name: Optional[str] = None
+    count: int
+    fair_value: float
+    total_value_usd: float
+    image_url: Optional[str] = None
+
+
+class PortfolioSummaryResponse(BaseModel):
+    total_value_usd: float
+    total_nfts: int
+    total_virtual: int
+    sparkline: List[float]
+    top_holdings: List[PortfolioTopHolding]
 
 
 class PricingStatsResponse(BaseModel):
@@ -466,6 +528,47 @@ class PricingSearchItem(BaseModel):
 class PricingSparkline(BaseModel):
     template_id: int
     points: List[PricingHistoryPoint]
+
+
+class MarketCardListing(BaseModel):
+    core_asset: str
+    price_lamports: int
+    seller: Optional[str] = None
+    currency_mint: Optional[str] = None
+    is_fake: bool = False
+
+
+class MarketCardSummary(BaseModel):
+    template_id: int
+    name: str
+    set_name: Optional[str] = None
+    rarity: Optional[str] = None
+    image_url: Optional[str] = None
+    fair_price: Optional[float] = None
+    lowest_listing: Optional[float] = None
+    listing_count: int = 0
+    sparkline: List[PricingHistoryPoint] = []
+    is_fake: bool = False
+
+
+class MarketCardDetailResponse(BaseModel):
+    template_id: int
+    name: str
+    set_name: Optional[str] = None
+    rarity: Optional[str] = None
+    image_url: Optional[str] = None
+    fair_price: Optional[float] = None
+    confidence: Optional[str] = None
+    change_24h: Optional[float] = None
+    change_7d: Optional[float] = None
+    change_30d: Optional[float] = None
+    history: List[PricingHistoryPoint]
+    listings: List[MarketCardListing]
+    my_assets: Optional[List[str]] = None
+    lowest_listing: Optional[float] = None
+    listing_count: int = 0
+    is_fake: bool = False
+    is_fake: bool = False
 
 
 class SeedContributionView(BaseModel):
@@ -615,6 +718,17 @@ class ConfirmClaimRequest(BaseModel):
 class ClaimCleanupRequest(BaseModel):
     wallet: str
     session_id: Optional[str] = None
+
+
+class RewardRetryRequest(BaseModel):
+    wallet: str
+    session_id: Optional[str] = None
+
+
+class RewardConfigRequest(BaseModel):
+    mochi_mint: str
+    reward_per_pack: Optional[int] = None  # whole token units
+    raw_amount: Optional[int] = None  # smallest units; overrides reward_per_pack if provided
 
 class RecycleItem(BaseModel):
     template_id: int
@@ -1006,6 +1120,7 @@ def build_portfolio_breakdown(wallet: str, db: Session) -> Tuple[List[PricingPor
                 fair_value=fair_value,
                 confidence_score=confidence,
                 total_value_usd=value,
+                image_url=tmpl.image_url if tmpl else None,
             )
         )
 
@@ -1034,6 +1149,55 @@ def get_snapshot_as_of(template_id: int, as_of_ts: float, db: Session) -> Option
         .limit(1)
     )
     return db.exec(stmt).first()
+
+
+def get_active_listings_by_template(db: Session) -> Dict[int, List[MarketCardListing]]:
+    vault_state = market_vault_state_pda()
+    listing_disc = hashlib.sha256(b"account:Listing").digest()[:8]
+    memcmp = MemcmpOpts(offset=0, bytes=listing_disc)
+    try:
+        resp = sol_client.get_program_accounts(
+            PROGRAM_ID,
+            encoding="base64",
+            filters=[memcmp],
+        )
+        accounts = resp.value or []
+    except Exception:
+        accounts = []
+    mapping: Dict[int, List[MarketCardListing]] = {}
+    seen_assets: set[str] = set()
+    for acc in accounts:
+        info = acc.account
+        if not info or info.owner != PROGRAM_ID:
+            continue
+        listing_data = None
+        try:
+            listing_data = parse_listing_account(bytes(info.data))
+        except Exception:
+            listing_data = None
+        if not listing_data:
+            continue
+        if str(listing_data.get("vault_state")) != str(vault_state):
+            continue
+        status = (listing_data.get("status") or "").lower()
+        if status and status not in ("active", "listed"):
+            continue
+        core_asset = str(listing_data.get("core_asset"))
+        if core_asset in seen_assets:
+            continue
+        seen_assets.add(core_asset)
+        row = db.exec(select(MintRecord).where(MintRecord.asset_id == core_asset)).first()
+        is_fake_flag = True if row is None else bool(getattr(row, "is_fake", False))
+        tmpl_id = row.template_id if row and row.template_id else 0
+        listing = MarketCardListing(
+            core_asset=core_asset,
+            price_lamports=listing_data.get("price_lamports", 0),
+            seller=str(listing_data.get("seller")) if listing_data.get("seller") else None,
+            currency_mint=str(listing_data.get("currency_mint")) if listing_data.get("currency_mint") else None,
+            is_fake=is_fake_flag,
+        )
+        mapping.setdefault(tmpl_id, []).append(listing)
+    return mapping
 
 
 @app.post("/pricing/fetch", response_model=dict)
@@ -1190,6 +1354,98 @@ def low_tier_virtual_items(rarities: List[str], template_ids: List[Optional[int]
             continue
         items.append((tmpl, rarity))
     return items
+
+
+def maybe_spawn_pack_reward(wallet: str, session_id: str, db: Session) -> dict:
+    """
+    Mint the configured MOCHI token reward to the user's ATA.
+    On-chain reward (VaultState.reward_per_pack) is treated as canonical; this
+    legacy off-chain mint is used only as a fallback when no on-chain reward is
+    configured.
+    """
+    ensure_pack_reward_log_schema()
+    try:
+        vault_state = vault_state_pda()
+        resp = sol_client.get_account_info(vault_state)
+        if resp.value and resp.value.data:
+            parsed = parse_vault_state_account(bytes(resp.value.data))
+            if parsed and parsed.get("reward_per_pack", 0) > 0 and parsed.get("mochi_mint"):
+                return {
+                    "status": "on_chain",
+                    "mochi_mint": str(parsed["mochi_mint"]),
+                    "reward_per_pack": parsed["reward_per_pack"],
+                    "vault_authority": str(parsed["vault_authority"]),
+                }
+    except Exception:
+        # If we cannot read on-chain config, fall back to legacy behavior below.
+        pass
+
+    reward_tokens = getattr(auth_settings, "mochi_pack_reward", 0) or 0
+    mint_str = getattr(auth_settings, "mochi_token_mint", None)
+    existing = db.get(PackRewardLog, session_id)
+    if existing and existing.status == "success":
+        return {
+            "status": "success",
+            "signature": existing.signature,
+            "amount": existing.reward_amount,
+        }
+    if reward_tokens <= 0 or not mint_str:
+        return {"status": "skipped", "reason": "Reward disabled or mint not configured"}
+
+    try:
+        admin_kp = load_admin_keypair()
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "failed", "reason": f"Admin key unavailable: {exc}"}
+
+    admin_pub = admin_kp.pubkey()
+    mint_pub = to_pubkey(mint_str)
+    user_pub = to_pubkey(wallet)
+    dest_ata = derive_ata(user_pub, mint_pub)
+    instructions: List[Instruction] = []
+    needs_ata = False
+    try:
+        ata_info = sol_client.get_account_info(dest_ata)
+        needs_ata = ata_info.value is None
+    except Exception:
+        needs_ata = True
+    if needs_ata:
+        instructions.append(build_create_ata_ix(admin_pub, user_pub, mint_pub, dest_ata))
+    raw_amount = int(reward_tokens) * (10 ** auth_settings.mochi_token_decimals)
+    instructions.append(build_mint_to_ix(mint_pub, dest_ata, admin_pub, raw_amount))
+
+    status = "pending"
+    signature = None
+    error = None
+    now = time.time()
+    try:
+        blockhash = get_latest_blockhash()
+        message = MessageV0.try_compile(admin_pub, instructions, [], Hash.from_string(blockhash))
+        tx = VersionedTransaction(message, [admin_kp])
+        resp = sol_client.send_raw_transaction(bytes(tx), opts=TxOpts(skip_preflight=False))
+        signature = resp.get("result") if isinstance(resp, dict) else str(resp)
+        status = "success"
+    except Exception as exc:  # noqa: BLE001
+        status = "failed"
+        error = str(exc)
+
+    log = existing or PackRewardLog(
+        session_id=session_id,
+        wallet=wallet,
+        reward_amount=raw_amount,
+        status=status,
+        signature=signature,
+        error=error,
+        created_at=now,
+        updated_at=now,
+    )
+    log.status = status
+    log.signature = signature
+    log.error = error
+    log.reward_amount = raw_amount
+    log.updated_at = time.time()
+    db.add(log)
+    db.commit()
+    return {"status": status, "signature": signature, "error": error, "amount": raw_amount}
 
 
 def choose_assets_for_templates(
@@ -1367,6 +1623,59 @@ def parse_pack_session_v2_account(data: bytes) -> Optional[dict]:
     }
 
 
+def parse_vault_state_account(data: bytes) -> Optional[dict]:
+    """Lightweight parser for the on-chain VaultState account."""
+    if len(data) < 8 + VAULT_STATE_SIZE:
+        return None
+    offset = 8  # skip discriminator
+    admin = Pubkey.from_bytes(data[offset : offset + 32])
+    offset += 32
+    vault_authority = Pubkey.from_bytes(data[offset : offset + 32])
+    offset += 32
+    pack_price_sol = int.from_bytes(data[offset : offset + 8], "little")
+    offset += 8
+    pack_price_usdc = int.from_bytes(data[offset : offset + 8], "little")
+    offset += 8
+    buyback_bps = int.from_bytes(data[offset : offset + 2], "little")
+    offset += 2
+    claim_window_seconds = int.from_bytes(data[offset : offset + 8], "little", signed=True)
+    offset += 8
+    marketplace_fee_bps = int.from_bytes(data[offset : offset + 2], "little")
+    offset += 2
+
+    def _read_option(buf: bytes, idx: int) -> tuple[Optional[Pubkey], int]:
+        flag = buf[idx]
+        idx += 1
+        pk = None
+        if flag == 1:
+            pk = Pubkey.from_bytes(buf[idx : idx + 32])
+        idx += 32
+        return pk, idx
+
+    core_collection, offset = _read_option(data, offset)
+    usdc_mint, offset = _read_option(data, offset)
+    mochi_mint, offset = _read_option(data, offset)
+
+    reward_per_pack = int.from_bytes(data[offset : offset + 8], "little")
+    offset += 8
+    vault_authority_bump = data[offset] if offset < len(data) else 0
+
+    return {
+        "admin": admin,
+        "vault_authority": vault_authority,
+        "pack_price_sol": pack_price_sol,
+        "pack_price_usdc": pack_price_usdc,
+        "buyback_bps": buyback_bps,
+        "claim_window_seconds": claim_window_seconds,
+        "marketplace_fee_bps": marketplace_fee_bps,
+        "core_collection": core_collection,
+        "usdc_mint": usdc_mint,
+        "mochi_mint": mochi_mint,
+        "reward_per_pack": reward_per_pack,
+        "vault_authority_bump": vault_authority_bump,
+    }
+
+
 def parse_listing_account(data: bytes) -> Optional[dict]:
     if len(data) < 8:
         return None
@@ -1445,6 +1754,7 @@ def build_create_ata_ix(payer: Pubkey, owner: Pubkey, mint: Pubkey, ata: Pubkey)
         AccountMeta(pubkey=mint, is_signer=False, is_writable=False),
         AccountMeta(pubkey=SYS_PROGRAM_ID, is_signer=False, is_writable=False),
         AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=SYSVAR_RENT_PUBKEY, is_signer=False, is_writable=False),
     ]
     return Instruction(program_id=ASSOCIATED_TOKEN_PROGRAM_ID, data=bytes([0]), accounts=metas)
 
@@ -1817,14 +2127,35 @@ def build_pack_v2(req: PackBuildV2Request, db: Session = Depends(get_session)):
             raise HTTPException(status_code=400, detail="Token currency requires token accounts")
     vault_state = vault_state_pda()
     pack_session = pack_session_v2_pda(vault_state, to_pubkey(req.wallet))
-    if pda_exists(pack_session):
-        resp = sol_client.get_account_info(pack_session)
-        info = parse_pack_session_v2_account(bytes(resp.value.data)) if resp.value and resp.value.data else None
-        if info and info.get("state") == "pending":
+    # Guardrail: verify on-chain vault authority matches the PDA we derive so we fail fast instead of
+    # surfacing a seeds error later in the transaction simulation.
+    try:
+        vault_info = sol_client.get_account_info(vault_state)
+        parsed_vault = (
+            parse_vault_state_account(bytes(vault_info.value.data)) if vault_info.value and vault_info.value.data else None
+        )
+        derived_vault_auth = vault_authority_pda(vault_state)
+        if not parsed_vault or str(parsed_vault.get("vault_authority")) != str(derived_vault_auth):
             raise HTTPException(
-                status_code=400,
-                detail="A v2 pack session already exists. Claim, sell back, or expire it before opening another.",
+                status_code=500,
+                detail="Vault authority mismatch on-chain; please migrate or re-initialize vault_state",
             )
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=f"RPC error reading vault_state: {exc}") from exc
+    vault_authority = vault_authority_pda(vault_state)
+    try:
+        if pda_exists(pack_session):
+            resp = sol_client.get_account_info(pack_session)
+            info = parse_pack_session_v2_account(bytes(resp.value.data)) if resp.value and resp.value.data else None
+            if info and info.get("state") == "pending":
+                raise HTTPException(
+                    status_code=400,
+                    detail="A v2 pack session already exists. Claim, sell back, or expire it before opening another.",
+                )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=f"RPC error checking existing session: {exc}") from exc
 
     nonce = compute_nonce(req.client_seed)
     rng = build_rng(auth_settings.server_seed, req.client_seed)
@@ -1832,20 +2163,57 @@ def build_pack_v2(req: PackBuildV2Request, db: Session = Depends(get_session)):
     template_ids = pick_template_ids(rng, rarities, db)
     rare_indices, rare_templates, rare_assets = choose_rare_assets_only(template_ids, rarities, req.wallet, db)
     rare_card_records = [card_record_pda(vault_state, to_pubkey(asset)) for asset in rare_assets]
-    for cr in rare_card_records:
-        if not pda_exists(cr):
-            raise HTTPException(status_code=400, detail=f"CardRecord PDA missing on-chain: {cr}")
+    try:
+        for cr in rare_card_records:
+            if not pda_exists(cr):
+                raise HTTPException(status_code=400, detail=f"CardRecord PDA missing on-chain: {cr}")
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=f"RPC error verifying card records: {exc}") from exc
 
     client_seed_hash = hashlib.sha256(req.client_seed.encode()).digest()
     currency = "Sol" if is_sol else "Token"
     user_token_account = to_pubkey(req.user_token_account) if req.user_token_account else None
     vault_token_account = to_pubkey(req.vault_token_account) if req.vault_token_account else None
+    mochi_mint_str = getattr(auth_settings, "mochi_token_mint", None)
+    if not mochi_mint_str:
+        raise HTTPException(status_code=500, detail="MOCHI_TOKEN_MINT not configured for rewards")
+    mochi_mint = to_pubkey(mochi_mint_str)
+    user_mochi_token = derive_ata(to_pubkey(req.wallet), mochi_mint)
+
+    # Ensure user MOCHI ATA exists; prepend create ix if missing.
+    instructions: List[Instruction] = []
+    try:
+        ata_info = sol_client.get_account_info(user_mochi_token)
+        if ata_info.value is None:
+            instructions.append(
+                build_create_ata_ix(
+                    payer=to_pubkey(req.wallet),
+                    owner=to_pubkey(req.wallet),
+                    mint=mochi_mint,
+                    ata=user_mochi_token,
+                )
+            )
+    except Exception:
+        # fallback: try to create anyway
+        instructions.append(
+            build_create_ata_ix(
+                payer=to_pubkey(req.wallet),
+                owner=to_pubkey(req.wallet),
+                mint=mochi_mint,
+                ata=user_mochi_token,
+            )
+        )
+
     open_ix = build_open_pack_v2_ix(
         user=to_pubkey(req.wallet),
         vault_state=vault_state,
         pack_session=pack_session,
         vault_authority=vault_authority_pda(vault_state),
         vault_treasury=treasury_pubkey(),
+        mochi_mint=mochi_mint,
+        user_mochi_token=user_mochi_token,
         rare_card_records=rare_card_records,
         currency=currency,
         client_seed_hash=client_seed_hash,
@@ -1854,7 +2222,7 @@ def build_pack_v2(req: PackBuildV2Request, db: Session = Depends(get_session)):
         vault_currency_token=vault_token_account,
     )
     compute_ix = set_compute_unit_limit(units=350_000)
-    instructions = [compute_ix, open_ix]
+    instructions.extend([compute_ix, open_ix])
     blockhash = get_latest_blockhash()
     tx_b64 = message_from_instructions(instructions, to_pubkey(req.wallet), blockhash)
     tx_v0_b64 = versioned_tx_b64(to_pubkey(req.wallet), blockhash, instructions)
@@ -2223,7 +2591,12 @@ def confirm_open_v2(req: ConfirmOpenRequest, db: Session = Depends(get_session))
     # Add low-tier virtuals on open (only if we have a usable lineup).
     if rarities and template_ids:
         mutate_virtual_cards(wallet, low_tier_virtual_items(rarities, template_ids), db, direction=1)
-    return {"state": on_state, "assets": rare_assets}
+    reward = {}
+    try:
+        reward = maybe_spawn_pack_reward(wallet, session_id, db)
+    except Exception as exc:  # noqa: BLE001
+        reward = {"status": "failed", "error": str(exc)}
+    return {"state": on_state, "assets": rare_assets, "reward": reward}
 
 
 @app.post("/program/claim/confirm")
@@ -2301,6 +2674,48 @@ def claim_cleanup(req: ClaimCleanupRequest, db: Session = Depends(get_session)):
         db.delete(mirror)
         db.commit()
     return {"state": "cleared", "cleared": True}
+
+
+@app.post("/admin/reward/retry")
+def retry_reward(req: RewardRetryRequest, db: Session = Depends(get_session)):
+    """
+    Admin helper to replay the MOCHI pack reward mint.
+    """
+    wallet = req.wallet
+    session_id = req.session_id
+    if not session_id:
+        vault_state = vault_state_pda()
+        session_id = str(pack_session_v2_pda(vault_state, to_pubkey(wallet)))
+    ensure_pack_reward_log_schema()
+    result = maybe_spawn_pack_reward(wallet, session_id, db)
+    return {"session_id": session_id, "reward": result}
+
+
+@app.post("/admin/reward/config")
+def set_reward_config(req: RewardConfigRequest):
+    admin_keypair = load_admin_keypair()
+    admin_pub = admin_keypair.pubkey()
+    vault_state = vault_state_pda()
+    vault_authority = vault_authority_pda(vault_state)
+    mint = to_pubkey(req.mochi_mint)
+    raw_amount = req.raw_amount
+    if raw_amount is None:
+        if req.reward_per_pack is None:
+            raise HTTPException(status_code=400, detail="Provide reward_per_pack or raw_amount")
+        raw_amount = int(req.reward_per_pack) * (10 ** auth_settings.mochi_token_decimals)
+    ix = build_set_reward_config_ix(
+        admin=admin_pub,
+        vault_state=vault_state,
+        vault_authority=vault_authority,
+        mochi_mint=mint,
+        reward_per_pack=raw_amount,
+    )
+    blockhash = get_latest_blockhash()
+    message = MessageV0.try_compile(admin_pub, [ix], [], Hash.from_string(blockhash))
+    tx = VersionedTransaction(message, [admin_keypair])
+    sig = sol_client.send_raw_transaction(bytes(tx), opts=TxOpts(skip_preflight=False))
+    sig_str = sig.get("result") if isinstance(sig, dict) else str(sig)
+    return {"mint": str(mint), "reward_per_pack": raw_amount, "signature": sig_str}
 
 
 @app.post("/program/sellback/confirm")
@@ -2509,6 +2924,76 @@ def profile(wallet: str):
     assets = helius_get_assets(wallet, auth_settings.core_collection_address)
     return {"wallet": wallet, "assets": assets}
 
+
+# ----------- Metadata bridge (mochims.fun -> getmochi.fun) -----------
+_MEGA_META: Dict[str, dict] = {}
+_ENERGY_IMAGES: Dict[str, str] = {
+    "189": "https://getmochi.fun/img/meg_web/energy_grass.png",
+    "190": "https://getmochi.fun/img/meg_web/energy_fire.png",
+    "191": "https://getmochi.fun/img/meg_web/energy_water.png",
+    "192": "https://getmochi.fun/img/meg_web/energy_lightning.png",
+    "193": "https://getmochi.fun/img/meg_web/energy_psychic.png",
+    "194": "https://getmochi.fun/img/meg_web/energy_fighting.png",
+    "195": "https://getmochi.fun/img/meg_web/energy_darkness.png",
+    "196": "https://getmochi.fun/img/meg_web/energy_metal.png",
+}
+
+
+def load_mega_csv():
+    """Load mega evolution metadata rows once for dynamic JSON responses."""
+    if _MEGA_META:
+        return
+    csv_path = os.path.join(os.path.dirname(__file__), "..", "frontend", "public", "data", "mega_evolutions.csv")
+    if not os.path.exists(csv_path):
+        return
+    with open(csv_path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            tid = row.get("token_id") or row.get("Number")
+            if not tid:
+                continue
+            _MEGA_META[str(int(tid)).zfill(3)] = row
+
+
+@app.get("/nft/metadata/mega-evolutions/{token_id}.json")
+def mega_metadata(token_id: str):
+    load_mega_csv()
+    tid = token_id.zfill(3)
+    row = _MEGA_META.get(tid, {})
+    is_energy = int(tid) >= 189
+    image = row.get("image_url")
+    if is_energy:
+        image = _ENERGY_IMAGES.get(tid, image)
+    if not image:
+        # If still missing, fall back to card back
+        image = f"https://getmochi.fun/card_back.png"
+    name = row.get("name") or ("Energy" if is_energy else f"Card #{tid}")
+    rarity = (row.get("rarity") or ("Energy" if is_energy else "")).title()
+    description = row.get("description") or ("Energy" if is_energy else "Mochi Mega Evolutions")
+    attributes = [
+        {"trait_type": "template_id", "value": int(tid)},
+    ]
+    if rarity:
+        attributes.append({"trait_type": "rarity", "value": rarity})
+    if row.get("types"):
+        attributes.append({"trait_type": "types", "value": row["types"]})
+    if row.get("category"):
+        attributes.append({"trait_type": "category", "value": row["category"]})
+    meta = {
+        "name": name,
+        "symbol": "MOCHI",
+        "description": description,
+        "image": image,
+        "attributes": attributes,
+        "properties": {
+            "files": [
+                {"uri": image, "type": "image/png"},
+            ],
+        },
+        "collection": {"name": row.get("set_name", "Mega Evolution"), "family": "Mochi"},
+    }
+    return JSONResponse(meta)
+
 @app.get("/program/v2/session/pending", response_model=PendingSessionResponse)
 def get_pending_session_v2(wallet: str, db: Session = Depends(get_session)):
     now = time.time()
@@ -2688,7 +3173,7 @@ def marketplace_listings(db: Session = Depends(get_session)):
     Fall back to on-chain listing PDAs so drifted DB status won't hide items.
     Keep this light: no price snapshot aggregation to avoid DB pool exhaustion.
     """
-    vault_state = vault_state_pda()
+    vault_state = market_vault_state_pda()
     # Listing account discriminator
     listing_disc = hashlib.sha256(b"account:Listing").digest()[:8]
     memcmp = MemcmpOpts(offset=0, bytes=listing_disc)
@@ -2729,6 +3214,7 @@ def marketplace_listings(db: Session = Depends(get_session)):
 
         row = db.exec(select(MintRecord).where(MintRecord.asset_id == core_asset)).first()
         card_meta = db.get(CardTemplate, row.template_id) if row and row.template_id else None
+        is_fake_flag = True if row is None else bool(getattr(row, "is_fake", False))
         results.append(
             ListingView(
                 core_asset=core_asset,
@@ -2740,7 +3226,7 @@ def marketplace_listings(db: Session = Depends(get_session)):
                 rarity=row.rarity if row else None,
                 name=card_meta.card_name if card_meta else None,
                 image_url=card_meta.image_url if card_meta else None,
-                is_fake=bool(getattr(row, "is_fake", False)) if row else False,
+                is_fake=is_fake_flag,
                 current_mid=None,
                 high_90d=None,
                 low_90d=None,
@@ -2755,7 +3241,7 @@ def admin_garbage_listings():
     Surface listing PDAs that are pointing at the wrong vault_state so we can clean them up.
     Only returns entries whose vault_state != the canonical vault_state_pda().
     """
-    canonical = vault_state_pda()
+    canonical = market_vault_state_pda()
     listing_disc = hashlib.sha256(b"account:Listing").digest()[:8]
     memcmp = MemcmpOpts(offset=0, bytes=listing_disc)
     try:
@@ -2797,9 +3283,9 @@ def admin_garbage_listings():
 
 @app.post("/marketplace/list/build", response_model=TxResponse)
 def marketplace_list(req: ListRequest, db: Session = Depends(get_session)):
-    vault_state = vault_state_pda()
-    canonical_vault = vault_state_pda()
-    vault_authority = vault_authority_pda(vault_state)
+    vault_state = market_vault_state_pda()
+    canonical_vault = vault_state
+    vault_authority = market_vault_authority_pda(vault_state)
     card_record = card_record_pda(vault_state, to_pubkey(req.core_asset))
     listing = listing_pda(vault_state, to_pubkey(req.core_asset))
     core_asset = to_pubkey(req.core_asset)
@@ -2893,10 +3379,11 @@ def marketplace_list(req: ListRequest, db: Session = Depends(get_session)):
 
 @app.post("/marketplace/fill/build", response_model=TxResponse)
 def marketplace_fill(req: MarketplaceActionRequest, db: Session = Depends(get_session)):
-    vault_state = vault_state_pda()
-    vault_authority = vault_authority_pda(vault_state)
-    card_record = card_record_pda(vault_state, to_pubkey(req.core_asset))
-    listing = listing_pda(vault_state, to_pubkey(req.core_asset))
+    vault_state = market_vault_state_pda()
+    vault_authority = market_vault_authority_pda(vault_state)
+    core_asset = to_pubkey(req.core_asset)
+    card_record = card_record_pda(vault_state, core_asset)
+    listing = listing_pda(vault_state, core_asset)
     treasury = treasury_pubkey()
     if not pda_exists(card_record):
         raise HTTPException(status_code=400, detail="CardRecord PDA missing on-chain")
@@ -2931,6 +3418,7 @@ def marketplace_fill(req: MarketplaceActionRequest, db: Session = Depends(get_se
         seller=seller_pubkey,
         vault_state=vault_state,
         card_record=card_record,
+        core_asset=core_asset,
         listing=listing,
         vault_authority=vault_authority,
         vault_treasury=treasury,
@@ -2950,8 +3438,8 @@ def marketplace_fill(req: MarketplaceActionRequest, db: Session = Depends(get_se
 
 @app.post("/marketplace/cancel/build", response_model=TxResponse)
 def marketplace_cancel(req: MarketplaceActionRequest, db: Session = Depends(get_session)):
-    vault_state = vault_state_pda()
-    vault_authority = vault_authority_pda(vault_state)
+    vault_state = market_vault_state_pda()
+    vault_authority = market_vault_authority_pda(vault_state)
     card_record = card_record_pda(vault_state, to_pubkey(req.core_asset))
     listing = listing_pda(vault_state, to_pubkey(req.core_asset))
     core_asset = to_pubkey(req.core_asset)
@@ -3148,8 +3636,34 @@ def pricing_sparklines(template_ids: str, points: int = 30, db: Session = Depend
     return items
 
 
+def pct_change_over_window(points: List[PricingHistoryPoint], window_hours: float) -> Optional[float]:
+    if not points:
+        return None
+    now_ts = time.time()
+    cutoff = now_ts - window_hours * 3600
+    # points are newest first from fetch_history_points; ensure sorted descending
+    sorted_pts = sorted(points, key=lambda p: p.collected_at, reverse=True)
+    latest = sorted_pts[0]
+    base = None
+    for pt in sorted_pts:
+        if pt.collected_at <= cutoff:
+            base = pt
+            break
+    if not base:
+        base = sorted_pts[-1]
+    if not base or base.fair_value == 0:
+        return None
+    return ((latest.fair_value - base.fair_value) / base.fair_value) * 100.0
+
+
 @app.get("/pricing/portfolio", response_model=PricingPortfolioResponse)
 def pricing_portfolio(wallet: str, db: Session = Depends(get_session)):
+    breakdown, total_value = build_portfolio_breakdown(wallet, db)
+    return PricingPortfolioResponse(total_value_usd=total_value, breakdown=breakdown)
+
+
+@app.get("/portfolio/holdings", response_model=PricingPortfolioResponse)
+def portfolio_holdings(wallet: str, db: Session = Depends(get_session)):
     breakdown, total_value = build_portfolio_breakdown(wallet, db)
     return PricingPortfolioResponse(total_value_usd=total_value, breakdown=breakdown)
 
@@ -3172,6 +3686,191 @@ def pricing_stats(wallet: str, db: Session = Depends(get_session)):
         change_24h=change_pct,
         last_valuation_at=now_ts,
         breakdown=breakdown,
+    )
+
+
+@app.get("/portfolio/summary", response_model=PortfolioSummaryResponse)
+def portfolio_summary(wallet: str, db: Session = Depends(get_session)):
+    breakdown, total_value = build_portfolio_breakdown(wallet, db)
+    total_nfts = db.exec(select(func.count()).select_from(MintRecord).where(MintRecord.owner == wallet)).one()[0]
+    total_virtual = sum(v.count for v in db.exec(select(VirtualCard).where(VirtualCard.wallet == wallet)).all())
+    # Build aggregate sparkline from holdings (up to 10 points, by index across histories)
+    points = 10
+    aggregate = [0.0 for _ in range(points)]
+    for b in breakdown:
+        hist = fetch_history_points(b.template_id, db, limit=points)
+        # fetch_history_points returns newest-first; align by index
+        for idx, h in enumerate(hist):
+            aggregate[idx] += (h.fair_value or h.mid_price or 0) * b.count
+    # If aggregate is all zeros, keep empty list
+    if all(v == 0 for v in aggregate):
+        aggregate = []
+    top = sorted(breakdown, key=lambda x: x.total_value_usd, reverse=True)[:5]
+    top_holdings = [
+        PortfolioTopHolding(
+            template_id=t.template_id,
+            name=t.name,
+            count=t.count,
+            fair_value=t.fair_value,
+            total_value_usd=t.total_value_usd,
+            image_url=t.image_url,
+        )
+        for t in top
+    ]
+    return PortfolioSummaryResponse(
+        total_value_usd=total_value,
+        total_nfts=total_nfts,
+        total_virtual=total_virtual,
+        sparkline=aggregate,
+        top_holdings=top_holdings,
+    )
+
+
+@app.get("/market/cards", response_model=List[MarketCardSummary])
+def market_cards(
+    q: Optional[str] = None,
+    set_name: Optional[str] = None,
+    rarity: Optional[str] = None,
+    sort: Optional[str] = None,
+    listed_only: bool = False,
+    db: Session = Depends(get_session),
+):
+    listings_map = get_active_listings_by_template(db)
+    template_less_listings = listings_map.get(0, [])
+    q_clean = (q or "").strip()
+    is_search = bool(q_clean)
+    if is_search and len(q_clean) < 2:
+        raise HTTPException(status_code=400, detail="Query too short")
+
+    def template_query_base():
+        stmt = select(CardTemplate)
+        if set_name:
+            stmt = stmt.where(func.lower(CardTemplate.set_name) == set_name.strip().lower())
+        if rarity:
+            stmt = stmt.where(func.lower(CardTemplate.rarity) == rarity.strip().lower())
+        return stmt
+
+    templates: List[CardTemplate] = []
+    if is_search:
+        stmt = template_query_base()
+        q_norm = f"%{q_clean.lower()}%"
+        clauses = [func.lower(CardTemplate.card_name).like(q_norm), func.lower(CardTemplate.set_name).like(q_norm)]
+        if q_clean.isdigit():
+            clauses.append(CardTemplate.template_id == int(q_clean))
+        stmt = stmt.where(or_(*clauses))
+        # Limit results to avoid loading entire catalog when no search term is provided.
+        templates = db.exec(stmt.limit(200)).all()
+    else:
+        if not listed_only:
+            raise HTTPException(status_code=400, detail="Query too short")
+        template_ids = list(listings_map.keys())
+        if not template_ids:
+            return []
+        stmt = template_query_base().where(CardTemplate.template_id.in_(template_ids))
+        templates = db.exec(stmt.limit(500)).all()
+    results: List[MarketCardSummary] = []
+    # include template-less listings as a fake bucket
+    if template_less_listings:
+        lowest_listing = min([l.price_lamports for l in template_less_listings]) / 1_000_000_000
+        results.append(
+            MarketCardSummary(
+                template_id=0,
+                name="Unverified asset",
+                set_name="Unknown",
+                rarity="Unknown",
+                image_url=None,
+                fair_price=None,
+                lowest_listing=lowest_listing,
+                listing_count=len(template_less_listings),
+                sparkline=[],
+                is_fake=True,
+            )
+        )
+    for tmpl in templates:
+        listings = listings_map.get(tmpl.template_id, [])
+        if listed_only and not listings:
+            continue
+        pv = compute_price_view(tmpl.template_id, db)
+        fair_price = pv.get("fair_value") if pv else None
+        spark = fetch_history_points(tmpl.template_id, db, limit=30)
+        lowest_listing = None
+        if listings:
+            lowest_listing = min([l.price_lamports for l in listings]) / 1_000_000_000
+        results.append(
+            MarketCardSummary(
+                template_id=tmpl.template_id,
+                name=tmpl.card_name,
+                set_name=tmpl.set_name,
+                rarity=tmpl.rarity,
+                image_url=tmpl.image_url,
+                fair_price=fair_price,
+                lowest_listing=lowest_listing,
+                listing_count=len(listings),
+                sparkline=spark,
+                is_fake=any(l.is_fake for l in listings),
+            )
+        )
+    # sorting
+    key = (sort or "").lower()
+    if key == "lowest":
+        results.sort(key=lambda r: (r.lowest_listing or 1e9))
+    elif key == "highest":
+        results.sort(key=lambda r: (r.lowest_listing or 0), reverse=True)
+    elif key == "name":
+        results.sort(key=lambda r: r.name or "")
+    else:
+        # best value: lowest listing vs fair price ratio
+        def value_score(r: MarketCardSummary):
+            if r.lowest_listing and r.fair_price and r.fair_price > 0:
+                return r.lowest_listing / r.fair_price
+            return 9999.0
+        results.sort(key=value_score)
+    return results
+
+
+@app.get("/market/card/{template_id}", response_model=MarketCardDetailResponse)
+def market_card_detail(
+    template_id: int,
+    days: int = 180,
+    wallet: Optional[str] = None,
+    db: Session = Depends(get_session),
+):
+    tmpl = db.get(CardTemplate, template_id) if template_id != 0 else None
+    is_fake_card = template_id == 0
+    pv = compute_price_view(template_id, db) if not is_fake_card else None
+    fair_price = pv.get("fair_value") if pv else None
+    confidence = pv.get("confidence") if pv else None
+    limit_points = max(30, min(180, days))
+    history = fetch_history_points(template_id, db, limit=limit_points) if not is_fake_card else []
+    change_24h = pct_change_over_window(history, 24) if history else None
+    change_7d = pct_change_over_window(history, 24 * 7) if history else None
+    change_30d = pct_change_over_window(history, 24 * 30) if history else None
+    listings_map = get_active_listings_by_template(db)
+    listings = listings_map.get(template_id, [])
+    lowest_listing = None
+    if listings:
+        lowest_listing = min([l.price_lamports for l in listings]) / 1_000_000_000
+    my_assets: List[str] = []
+    if wallet and not is_fake_card:
+        rows = db.exec(select(MintRecord).where(MintRecord.owner == wallet).where(MintRecord.template_id == template_id)).all()
+        my_assets = [r.asset_id for r in rows]
+    return MarketCardDetailResponse(
+        template_id=template_id,
+        name=tmpl.card_name if tmpl else "Unverified asset",
+        set_name=tmpl.set_name if tmpl else "Unknown",
+        rarity=tmpl.rarity if tmpl else "Unknown",
+        image_url=tmpl.image_url if tmpl else None,
+        fair_price=fair_price,
+        confidence=confidence,
+        change_24h=change_24h,
+        change_7d=change_7d,
+        change_30d=change_30d,
+        history=history,
+        listings=listings,
+        my_assets=my_assets or None,
+        lowest_listing=lowest_listing,
+        listing_count=len(listings),
+        is_fake=is_fake_card or any(l.is_fake for l in listings),
     )
 
 
@@ -3432,12 +4131,12 @@ def admin_force_cancel_listings(req: AdminForceCancelListings):
 
     ok = []
     errors = []
-    canonical_vault = vault_state_pda() if not req.vault_state else to_pubkey(req.vault_state)
+    canonical_vault = market_vault_state_pda() if not req.vault_state else to_pubkey(req.vault_state)
     for asset in req.assets:
         try:
             core = to_pubkey(asset)
             vault_state = canonical_vault
-            vault_authority = vault_authority_pda(vault_state)
+            vault_authority = market_vault_authority_pda(vault_state)
             card_record = card_record_pda(vault_state, core)
             listing = listing_pda(vault_state, core)
             resp = sol_client.get_account_info(listing)
@@ -3760,4 +4459,5 @@ def admin_inventory_refresh(db: Session = Depends(get_session)):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    # Match production port (4000) when running directly.
+    uvicorn.run("main:app", host="0.0.0.0", port=4000, reload=True)

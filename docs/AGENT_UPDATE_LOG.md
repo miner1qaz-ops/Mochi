@@ -66,9 +66,9 @@ Next steps:
 - Frontend deps pinned to registry-available set: `@solana/wallet-adapter-react@0.15.39`, `react-ui@0.9.39`, `wallets@0.19.37`, `@solana/web3.js@1.98.0`; `npm install` now completes.
 
 ## 2025-11-25T15:03:33Z – Codex
-- Nginx installed and configured `/etc/nginx/sites-available/mochi` to proxy `mochims.fun`/`www` to frontend (127.0.0.1:3000) and `/api/` to backend (0.0.0.0:8000); config enabled and reloaded.
+- Nginx installed and configured `/etc/nginx/sites-available/mochi` to proxy `mochims.fun`/`www` to frontend (127.0.0.1:3000) and `/api/` to backend (0.0.0.0:4000); config enabled and reloaded.
 - Added systemd services:
-  - `mochi-backend.service` (uvicorn on 0.0.0.0:8000, uses `backend/.env`).
+  - `mochi-backend.service` (uvicorn on 0.0.0.0:4000, uses `backend/.env`).
   - `mochi-frontend.service` (Next.js start on 127.0.0.1:3000, uses `frontend/.env.local`).
   Both are enabled to start on boot; frontend binding conflicts resolved and service now active.
 - Frontend manual process replaced by systemd-managed instance; backend previously running manually now managed by systemd.
@@ -104,7 +104,7 @@ Next steps:
   ssh -T git@github.com          # should succeed after key is added
   git push -u origin main
   ```
-- Current services: Next prod server on 127.0.0.1:3000, FastAPI on 0.0.0.0:8000, nginx proxying `/` → 3000 and `/api/` → 8000.
+- Current services: Next prod server on 127.0.0.1:3000, FastAPI on 0.0.0.0:4000, nginx proxying `/` → 3000 and `/api/` → 4000.
 
 ## 2025-11-26T04:46:00Z – Codex
 - Homepage hero rebuilt with a glass desk + fanned meg_web card backs, hover tilt/rotation with pointer tracking, and mobile rail layout; CTA buttons now glow with neon bloom and glass outlines.
@@ -136,7 +136,7 @@ Next steps:
 ## 2025-11-27T08:06:00+08:00 – Codex
 - Reran the full mint/deposit pipeline to seed a second copy of the entire Mega Evolution roster (4 × `CORE_TEMPLATE_OFFSET` batches covering 0–188). Result: vault PDA now holds **400** Pokémon cards (196 unique template IDs × 2 copies, including the earlier duplicates).
 - Minted an additional Energy set (templates 189–196) so there are two of each basic Energy; metadata continues to live under `https://mochims.fun/nft/metadata/mega-evolutions/189-196.json`.
-- Refreshed backend inventory (`curl -X POST http://127.0.0.1:8000/admin/inventory/refresh`), which now reports `{"Energy":8}` per set and **400 total MintRecords** (`curl /admin/inventory/assets | jq 'length'`).
+- Refreshed backend inventory (`curl -X POST http://127.0.0.1:4000/admin/inventory/refresh`), which now reports `{"Energy":8}` per set and **400 total MintRecords** (`curl /admin/inventory/assets | jq 'length'`).
 - Helius DAS verifies the holdings: `getAssetsByOwner(FKALjGX...)` now returns 400 items.
 
 ## 2025-11-27T08:12:00+08:00 – Codex
@@ -158,6 +158,11 @@ Next steps:
 - Backend now exposes `POST /admin/sessions/force_expire`, loads the admin keypair from `ADMIN_KEYPAIR_PATH`, sends the CPI, and resets MintRecords + SessionMirrors.
 - Admin dashboard gained a “Force expire all” button hooked to that endpoint; success/error messages render inline above the sessions list.
 - Updated docs to mention the new env var/endpoint and refreshed the frontend reference.
+
+## 2025-02-XX – Codex
+- Fixed `admin_prune_listing`: it now serializes the Listing once (no double discriminator) when force-cancelling malformed listings.
+- Rebuilt and redeployed `mochi_v2_vault` to devnet (program `Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx`, deploy sig `2gasn8utmKUQVmzrFnpRc8iTtfARvK887dZHy465TgMLdZDSbqyyUZSzkKLfT2kHmSoCCaJDXHx5ynob2wKsbF2X`).
+- Ran `admin_prune_listing` on 10 garbage listings in legacy vault `FgUMTovRTzDSnvKHPFe8AVy8ZfhXcj6B6iiiYvjrxQSP` (seller `3wYr8aMeN1EMU5pZUKc7iXXgjzs3rvr2eUnWoTA4QyKd`/`...ec6NCsNxkinb`), marking them `Cancelled` with zeroed seller/core so the UI stops showing them as Active.
 
 ## 2025-11-27T13:00:00+08:00 – Codex
 - Added backend diagnostics endpoints (`GET /admin/sessions/diagnostic`, `GET /admin/inventory/reserved`) plus a repair endpoint `POST /admin/inventory/unreserve` that flips any non-available MintRecords back to the vault and marks pending/settled sessions as expired.
@@ -193,10 +198,21 @@ Next steps:
 - `/program/session/pending` and `/program/open/build` both call this backfill helper, so hitting the Resume button (or simply retrying Claim/Sell-back) surfaces the active pack instead of blocking with “wallet already has a session”.
 - Verified the hot wallet `63KMUfAuxy…` now returns session `3sxb…` from `/program/session/pending`; admin pagination also shows the pending row so ops can force-expire if needed.
 
+## 2025-12-05T10:15:00Z – Codex
+- Simplified marketplace `list_card`: `card_record` and `listing` PDAs are now `init_if_needed` (no PDA signatures), with canonical vault enforcement baked in. This removes the `AccountDidNotSerialize (0xbbc)` failures seen on listing.
+- Regenerated IDL (`anchor-program/idl/mochi_v2_vault.json`) and redeployed `mochi_v2_vault` to devnet (sig `46KoTXDZ9aNkEPvkJZA1TQXqRCvzo6WSZ5Gdogc7xaxHxsxVM61uq5mqxhrqrhbwxdFZDPfXjErkgtyLLDQnA4aB`).
+- Updated `scripts/test_listing_flow.ts` (card_record/listing no longer signers) and confirmed end-to-end on devnet: minted Core asset `FK5X2C7G21Lqzyj1NQUR49Kt6kuMw3vq3bsYbVCM1m3d`, listed successfully (tx `2aBViFHyUmLALdGT6mXavZEkQavDQZxMYhMNHruLoK9WSQJDeuSfvundGiYkiZUV1Memvttys7R6Bfi2nxdqwEXw`).
+
 ## 2025-11-27T20:05:00+08:00 – Codex
 - Added `/program/expire/build` so wallets can sign an `expire_session` instruction the moment the 1h window lapses; the frontend now shows an **Expire session** button next to Claim/Sell when the countdown hits zero.
 - Fixed both the user and admin force-expire flows by marking `vault_authority` writable in the CPI builders, and updated the resume/backfill logic so pending sessions with missing DB rows are re-created automatically.
 - Rebuilt the frontend and restarted both services after the changes.
+
+## 2025-12-05T07:24:00Z – Codex
+- Split vault domains on-chain: gacha stays on `[b"vault_state"/"vault_authority"]`; marketplace now uses `[b"market_vault_state"/"market_vault_authority"]`. Listings derive off the marketplace seeds; CardRecords derive off their owning vault_state.
+- Added admin guardrails: `emergency_return_asset` (returns escrowed Core asset to `listing.seller`, destination locked) and `admin_rescue_legacy_listing` (pulls assets from legacy vault_state/authority back to seller). Added `initialize_marketplace_vault` for the canonical market vault.
+- Regenerated IDL to include the new instructions/seeds; updated rescue script `scripts/rescue_legacy_listings.ts` (populate RESCUE_TARGETS, set MARKETPLACE_VAULT_STATE, RPC_URL, ADMIN_KEYPAIR).
+- Docs refreshed (`docs/AGENT_GUIDE.md`) to reflect the two-vault architecture, on-chain-first marketplace, and new rescue/emergency flows.
 
 ## 2025-12-05 – Codex
 - Pricing 2.0: reset `PriceSnapshot` (purged corrupted rows) and made it append-only with new fields `market_price` (recent sales) and `direct_low` plus an index on `(template_id, collected_at)` for high-frequency inserts.
@@ -204,6 +220,12 @@ Next steps:
 - `/pricing/card/{id}` and search/set endpoints return `fair_value`, `confidence_score`, and sparkline points; portfolio calculations now use fair_value + confidence.
 - Frontend pricing page redesigned with investment dashboard, per-row sparklines (green/red trend), and “Live Market Card” hover showing fair value, last-updated badge, and volatility warning.
 - Docs updated (Agent Guide) to reflect append-only import flow and new pricing API surface; `scripts/fetch_tcg_prices.py` writes the new fields without deletes.
+
+## 2025-12-05 – Codex (Market fusion)
+- Fused Marketplace + Pricing into a single Market flow: nav now Home | Gacha | Market | Stadium | Profile | Admin; `/pricing` redirects to `/market`.
+- Backend: new `/market/cards` (search/filter/sort; returns card metadata, fair_price, sparkline, lowest_listing, listing_count) and `/market/card/{id}` (metadata, confidence, 24h/7d/30d change, history, active listings, wallet-owned assets). Listings pulled from on-chain PDAs; fair-price from oracle.
+- Frontend: new `/market` grid (card-level tiles with fair price + lowest listing + sparkline), `/market/card/[id]` detail with listings left, price insights + chart right, buy/list actions using existing tx builders.
+- Profile now shows portfolio fair-value total and per-card breakdown (from `/pricing/stats`) linking into the Market card pages.
 
 ## 2025-11-27T21:30:00+08:00 – Codex
 - Added a reproducible Docker toolchain for Anchor builds: `Dockerfile.anchor` now installs Solana CLI 1.18.20 from the GitHub tarball, Rust stable, and Anchor CLI 0.30.1 (with time crate patch). Symlinks place Solana binaries on PATH.
@@ -320,3 +342,9 @@ Next steps:
 - Frontend home seed-sale widget now calls backend builders (`/seed_sale/state`, `/seed_sale/contribute/build`, `/seed_sale/claim/build`) instead of hand-built txs; shows live caps/progress/your stake via the API.
 - Updated `frontend/.env.local` to use `NEXT_PUBLIC_BACKEND_URL=https://getmochi.fun/api` so the site hits the new domain.
 - Contribute/claim flows deserialize backend v0 txs and submit via wallet adapter; balances/tokens owed respect mint decimals. Rebuild + service restart pending after these changes.
+
+## 2025-12-05T10:25:00Z – Codex
+- Fixed marketplace buy flow: `build_fill_listing_ix` now includes `core_asset` and `mpl_core_program` accounts (previously missing, causing post-signature failures), and `/marketplace/fill/build` passes the core asset through. Buy buttons should submit valid transactions now. Backend restart required after pulling this change.
+
+## 2025-12-06T09:30:00Z – Codex
+- Domain migration note: legacy metadata/images are still served from `https://mochims.fun/nft/...` while the live site runs at `https://getmochi.fun`. Frontend no longer rewrites URLs; keep both domains serving the same files or add redirects, and mint future batches with `getmochi.fun` in the manifest to avoid broken images.

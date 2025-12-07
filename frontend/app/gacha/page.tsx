@@ -15,6 +15,7 @@ import {
   confirmOpen,
   confirmClaim,
   confirmExpire,
+  fetchInventoryRarity,
 } from '../../lib/api';
 import { buildV0Tx } from '../../lib/tx';
 import { deriveAta } from '../../lib/ata';
@@ -196,6 +197,8 @@ export default function GachaPage() {
   const [openSignature, setOpenSignature] = useState<string | null>(null);
   const [confirmDone, setConfirmDone] = useState(false);
   const [opening, setOpening] = useState(false);
+  const [inventoryCounts, setInventoryCounts] = useState<Record<string, number> | null>(null);
+  const [inventoryError, setInventoryError] = useState<string | null>(null);
   const packOptions = useMemo(
     () => [
       { id: 'meg_web_alt', name: 'Mega Evolutions Pack', priceSol: 0.12, priceUsdc: 12, image: '/img/pack_alt.jpg' },
@@ -224,6 +227,18 @@ export default function GachaPage() {
     }
     return () => clearInterval(timer);
   }, [countdown]);
+
+  useEffect(() => {
+    fetchInventoryRarity()
+      .then((data) => {
+        setInventoryCounts(data);
+        setInventoryError(null);
+      })
+      .catch(() => {
+        setInventoryCounts(null);
+        setInventoryError('Inventory status unavailable');
+      });
+  }, []);
 
   useEffect(() => {
     // Load card templates for each pack from CSV
@@ -747,6 +762,34 @@ export default function GachaPage() {
           </div>
         </div>
       )}
+      <div className="card-blur rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-white/80">
+        <div className="flex items-center justify-between mb-2">
+          <div className="text-base font-semibold">On-chain stock (Mega Evolution)</div>
+          {inventoryError && <span className="text-xs text-amber-300">{inventoryError}</span>}
+        </div>
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 text-xs">
+          {[
+            { key: 'Rare', label: 'Rare' },
+            { key: 'Double rare', label: 'DoubleRare' },
+            { key: 'Ultra Rare', label: 'UltraRare' },
+            { key: 'Illustration rare', label: 'IllustrationRare' },
+            { key: 'Special illustration rare', label: 'SpecialIllustration' },
+            { key: 'Mega Hyper Rare', label: 'MegaHyper' },
+          ].map(({ key, label }) => {
+            const val =
+              inventoryCounts?.[key] ??
+              inventoryCounts?.[key.toLowerCase()] ??
+              inventoryCounts?.[label] ??
+              0;
+            return (
+              <div key={key} className="rounded-xl bg-white/5 border border-white/10 p-2 text-center">
+                <div className="text-[11px] text-white/60">{label}</div>
+                <div className="text-lg font-semibold">{inventoryCounts ? val : '—'}</div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
       <div className="card-blur rounded-3xl p-6 border border-white/5 grid lg:grid-cols-[1.1fr,0.9fr] gap-6 items-center">
         <div className="space-y-3">
           <div className="flex items-center gap-3">

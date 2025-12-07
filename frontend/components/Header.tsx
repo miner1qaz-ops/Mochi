@@ -8,8 +8,7 @@ import { usePathname } from 'next/navigation';
 const links = [
   { href: '/', label: 'Home' },
   { href: '/gacha', label: 'Gacha' },
-  { href: '/marketplace', label: 'Marketplace' },
-  { href: '/pricing', label: 'Pricing' },
+  { href: '/market', label: 'Market' },
   { href: '/stadium', label: 'Stadium' },
   { href: '/profile', label: 'Profile' },
   { href: '/admin', label: 'Admin' }
@@ -25,15 +24,18 @@ export function Header() {
           <span className="text-xl font-semibold tracking-tight">Mochi</span>
         </Link>
         <nav className="flex gap-4 text-sm">
-          {links.map((link) => (
-            <Link
-              key={link.href}
-              href={link.href}
-              className={`px-3 py-1 rounded-full transition ${pathname === link.href ? 'bg-white/10' : 'hover:bg-white/5'}`}
-            >
-              {link.label}
-            </Link>
-          ))}
+          {links.map((link) => {
+            const active = pathname === link.href || pathname.startsWith(`${link.href}/`);
+            return (
+              <Link
+                key={link.href}
+                href={link.href}
+                className={`px-3 py-1 rounded-full transition ${active ? 'bg-white/10' : 'hover:bg-white/5'}`}
+              >
+                {link.label}
+              </Link>
+            );
+          })}
         </nav>
         <WalletMultiButton className="!bg-sakura !text-ink !font-semibold" />
       </div>

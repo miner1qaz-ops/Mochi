@@ -13,6 +13,8 @@ PROGRAM_ID = Pubkey.from_string("Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx")
 SYS_PROGRAM_ID = Pubkey.from_string("11111111111111111111111111111111")
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 MPL_CORE_PROGRAM_ID = Pubkey.from_string("CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d")
+MARKETPLACE_VAULT_SEED = b"market_vault_state"
+MARKETPLACE_VAULT_AUTHORITY_SEED = b"market_vault_authority"
 
 # Seed sale program (devnet mock)
 SEED_SALE_PROGRAM_ID = Pubkey.from_string("2mt9FhkfhrkC5RL29MVPfMGVzpFR3eupGCMqKVYssiue")
@@ -68,9 +70,15 @@ def to_pubkey(value: str) -> Pubkey:
 def vault_state_pda() -> Pubkey:
     return Pubkey.find_program_address([b"vault_state"], PROGRAM_ID)[0]
 
+def market_vault_state_pda() -> Pubkey:
+    return Pubkey.find_program_address([MARKETPLACE_VAULT_SEED], PROGRAM_ID)[0]
+
 
 def vault_authority_pda(vault_state: Pubkey) -> Pubkey:
     return Pubkey.find_program_address([b"vault_authority", bytes(vault_state)], PROGRAM_ID)[0]
+
+def market_vault_authority_pda(vault_state: Pubkey) -> Pubkey:
+    return Pubkey.find_program_address([MARKETPLACE_VAULT_AUTHORITY_SEED, bytes(vault_state)], PROGRAM_ID)[0]
 
 
 def card_record_pda(vault_state: Pubkey, core_asset: Pubkey) -> Pubkey:
@@ -150,6 +158,10 @@ def encode_open_pack_v2(currency: str, client_seed_hash: bytes, rare_templates: 
         }
     )
     return sighash("open_pack") + data
+
+
+def encode_set_reward_config(mochi_mint: Pubkey, reward_per_pack: int) -> bytes:
+    return sighash("set_reward_config") + bytes(mochi_mint) + int(reward_per_pack).to_bytes(8, "little")
 
 
 def encode_claim_pack() -> bytes:
@@ -398,6 +410,8 @@ def build_open_pack_v2_ix(
     pack_session: Pubkey,
     vault_authority: Pubkey,
     vault_treasury: Pubkey,
+    mochi_mint: Pubkey,
+    user_mochi_token: Pubkey,
     rare_card_records: List[Pubkey],
     currency: str,
     client_seed_hash: bytes,
@@ -411,6 +425,8 @@ def build_open_pack_v2_ix(
         AccountMeta(pubkey=pack_session, is_signer=False, is_writable=True),
         AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=True),
         AccountMeta(pubkey=vault_treasury, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=mochi_mint, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=user_mochi_token, is_signer=False, is_writable=True),
         AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
         AccountMeta(pubkey=SYS_PROGRAM_ID, is_signer=False, is_writable=False),
     ]
@@ -758,6 +774,23 @@ def build_admin_force_close_v2_ix(
         accounts.append(AccountMeta(pubkey=cr, is_signer=False, is_writable=True))
     return Instruction(program_id=PROGRAM_ID, data=encode_admin_force_close_v2(), accounts=accounts)
 
+
+def build_set_reward_config_ix(
+    admin: Pubkey,
+    vault_state: Pubkey,
+    vault_authority: Pubkey,
+    mochi_mint: Pubkey,
+    reward_per_pack: int,
+) -> Instruction:
+    accounts = [
+        AccountMeta(pubkey=admin, is_signer=True, is_writable=True),
+        AccountMeta(pubkey=vault_state, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
+    ]
+    data = encode_set_reward_config(mochi_mint, reward_per_pack)
+    return Instruction(program_id=PROGRAM_ID, data=data, accounts=accounts)
+
 def build_admin_force_cancel_listing_ix(
     admin: Pubkey,
     vault_state: Pubkey,
@@ -871,6 +904,7 @@ def build_fill_listing_ix(
     seller: Pubkey,
     vault_state: Pubkey,
     card_record: Pubkey,
+    core_asset: Pubkey,
     listing: Pubkey,
     vault_authority: Pubkey,
     vault_treasury: Pubkey,
@@ -880,10 +914,12 @@ def build_fill_listing_ix(
         AccountMeta(pubkey=seller, is_signer=False, is_writable=True),
         AccountMeta(pubkey=vault_state, is_signer=False, is_writable=True),
         AccountMeta(pubkey=card_record, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=core_asset, is_signer=False, is_writable=True),
         AccountMeta(pubkey=listing, is_signer=False, is_writable=True),
-        AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=True),
         AccountMeta(pubkey=vault_treasury, is_signer=False, is_writable=True),
         AccountMeta(pubkey=SYS_PROGRAM_ID, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=MPL_CORE_PROGRAM_ID, is_signer=False, is_writable=False),
     ]
     return Instruction(program_id=PROGRAM_ID, data=encode_fill_listing(), accounts=accounts)
 
