@@ -22,8 +22,23 @@ type Listing = {
   template_id?: number | null;
 };
 
-const VAULT_AUTH = 'FKALjGXodzs1RhSGYKL72xnnQjB35nK9e6dtZ9fTLj3g';
+const programIdEnv = process.env.NEXT_PUBLIC_PROGRAM_ID;
+if (!programIdEnv) {
+  throw new Error('NEXT_PUBLIC_PROGRAM_ID must be set for the admin dashboard.');
+}
+
+const vaultAuthorityEnv = process.env.NEXT_PUBLIC_VAULT_AUTHORITY;
+if (!vaultAuthorityEnv) {
+  throw new Error('NEXT_PUBLIC_VAULT_AUTHORITY must be set for the admin dashboard.');
+}
+
+const seedSaleProgramId = process.env.NEXT_PUBLIC_SEED_SALE_PROGRAM_ID;
+const seedVaultTokenAccount = process.env.NEXT_PUBLIC_SEED_VAULT_TOKEN_ACCOUNT;
+
+const programId: string = programIdEnv;
+const VAULT_AUTH: string = vaultAuthorityEnv;
 const LOW_STOCK_THRESHOLD = 3;
+type KnownWallet = { label: string; address: string };
 
 export default function AdminPage() {
   const tabs = ['overview', 'vault', 'sessions', 'market', 'seed', 'wallets'] as const;
@@ -139,7 +154,7 @@ export default function AdminPage() {
     const conn = new Connection(process.env.NEXT_PUBLIC_SOLANA_RPC || 'https://api.devnet.solana.com', 'confirmed');
     async function loadBalances() {
       try {
-        const addrs = knownWallets.map((w) => w.address);
+        const addrs = knownWallets.map((w) => w.address).filter(Boolean) as string[];
         const pubkeys = addrs.map((a) => new PublicKey(a));
         const res = await conn.getMultipleAccountsInfo(pubkeys);
         const map: Record<string, number> = {};
@@ -242,16 +257,20 @@ export default function AdminPage() {
   const inventoryTotal = Object.values(inventory).reduce((a, b) => a + b, 0) || 0;
   const reservedCount = reserved.length;
   const stuckCount = stuckSessions.length;
-  const knownWallets = useMemo(
-    () => [
+  const knownWallets = useMemo(() => {
+    const list: KnownWallet[] = [
       { label: 'Treasury / Admin', address: 'CKjhhqfijtAD48cg2FDcDH5ARCVjRiQS6ppmXFBM6Lcs' },
       { label: 'Vault authority PDA', address: VAULT_AUTH },
-      { label: 'Program (vault)', address: 'Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx' },
-      { label: 'Seed sale PDA', address: '8S39Fqt73RvakApyQq7mcnPQTQ7MqKVRB4Y6JRzaWviY' },
-      { label: 'Seed vault token account', address: '9pSNuqZjx15rzc9mP4tvFGcZYJrczDtLMm6B19s3trY5' },
-    ],
-    [],
-  );
+      { label: 'Program (vault)', address: programId },
+    ];
+    if (seedSaleProgramId) {
+      list.push({ label: 'Seed sale PDA', address: seedSaleProgramId });
+    }
+    if (seedVaultTokenAccount) {
+      list.push({ label: 'Seed vault token account', address: seedVaultTokenAccount });
+    }
+    return list;
+  }, [programId, seedSaleProgramId, seedVaultTokenAccount]);
 
   return (
     <div className="space-y-6">

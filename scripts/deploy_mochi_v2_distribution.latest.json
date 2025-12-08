@@ -1,0 +1,76 @@
+{
+  "mint": "GS99uG5mWq3YtENvdxDdkrixtez3vUvAykZWoqfJETZv",
+  "decimals": 6,
+  "total_supply_raw": 1000000000000000,
+  "master": {
+    "pubkey": "Dy2b6bzpX9XYLUowS4BgYiYEHrtqrsD895zxddQvLH1M",
+    "ata": "B6uZjLMHGMooQpYf4LmZv729Mq8knniDLsMeRsdhDkci",
+    "mint_sig": "",
+    "balance_raw": 0
+  },
+  "allocations": [
+    {
+      "bucket": "team_locked.json",
+      "pubkey": "AnEnfEhCVuPoJKssfgmBQrRVyrMv7XbC6UPNKybwhBts",
+      "ata": "CZPzTEKDMNM3aPEmQ16hNMobzXMSC6vzPKcw7AqUmGem",
+      "amount": 300000000,
+      "signature": "",
+      "final_balance_raw": 300000000000000,
+      "final_balance_tokens": 300000000.0,
+      "transferred_raw": 0
+    },
+    {
+      "bucket": "community_master.json",
+      "pubkey": "5CQgvbRy5HHXKBWa1Z8HcjSqsMjgqJG95eQ2bXZuMRKH",
+      "ata": "5bDb2peW1VRPfuuQ3TeR6sPBCCZxSdrsUNVCnXg66yGx",
+      "amount": 400000000,
+      "signature": "",
+      "final_balance_raw": 390000000000000,
+      "final_balance_tokens": 390000000.0,
+      "transferred_raw": 0
+    },
+    {
+      "bucket": "presale_distributor.json",
+      "pubkey": "5TPjayvy3ZfVYZhDqvVgrYBgX1NMJ83EMHQ5t111uxpr",
+      "ata": "GpHdcarzt3Qhmq1YK79CJaZvm3mgv2zkVbPQszdNgiu5",
+      "amount": 100000000,
+      "signature": "",
+      "final_balance_raw": 100000000000000,
+      "final_balance_tokens": 100000000.0,
+      "transferred_raw": 0
+    },
+    {
+      "bucket": "liquidity_reserve.json",
+      "pubkey": "49jd4BCkkVeHic2hYvCyiT9aoxxshNZgbSwSTJtHovie",
+      "ata": "HGMmNbBruM9Za79hCaQeNrbJx8E1AD2AHuQLaNLxTq1A",
+      "amount": 100000000,
+      "signature": "3CeZc45dqWRrTNxnwb8itm19WdaDtzxZLWEuJ6LKRiriyBfP9rCNXnKrDdUoKao1dtRejW1Bf4nwMNKyp4wNMy46",
+      "final_balance_raw": 100000000000000,
+      "final_balance_tokens": 100000000.0,
+      "transferred_raw": 100000000000000
+    },
+    {
+      "bucket": "treasury_reserve.json",
+      "pubkey": "9oa4LnNRt62gKyb6xZaL1Z8Ynxra5Q4k511F6WkACTKy",
+      "ata": "3oYGxsK9X2D84Uoz5zpehPd7ByC8rayq4PbGFtCwVNMF",
+      "amount": 100000000,
+      "signature": "4DZzx5xDxL4A1LMxTkxZVcqJD4ajQx9hJ3YYHTjM2U5MsfUaUwcW5riwFjsNJoPC636uYgz5iWq4Y5M8vAnG62Fg",
+      "final_balance_raw": 100000000000000,
+      "final_balance_tokens": 100000000.0,
+      "transferred_raw": 100000000000000
+    }
+  ],
+  "operations_funding": {
+    "amount": 10000000,
+    "admin_ata": "831fnahUncbMNznw79BtqAbsKGvvDZ2HefEhmQrv8CqW",
+    "signature": "2PyZQTPD9ZudDmsiQpJtPGMr1JfJX44YriSJtopQ5w7aYLXQNRNhLJFuKcB1YMny6VKuHvMwymAM48J4hde61pNv",
+    "final_admin_balance_raw": 10000000000000,
+    "final_admin_balance_tokens": 10000000.0
+  },
+  "mint_info": {
+    "supply": 1000000000000000,
+    "decimals": 6,
+    "mint_authority": "Dy2b6bzpX9XYLUowS4BgYiYEHrtqrsD895zxddQvLH1M",
+    "freeze_authority": "Dy2b6bzpX9XYLUowS4BgYiYEHrtqrsD895zxddQvLH1M"
+  }
+}

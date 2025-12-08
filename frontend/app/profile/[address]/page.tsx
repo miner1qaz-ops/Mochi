@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useParams } from 'next/navigation';
 import { useConnection, useWallet } from '@solana/wallet-adapter-react';
-import { PublicKey, VersionedTransaction } from '@solana/web3.js';
+import { PublicKey, VersionedTransaction, VersionedMessage } from '@solana/web3.js';
 import { Buffer } from 'buffer';
 import {
   api,
@@ -44,7 +44,7 @@ export default function ProfilePage() {
   const { publicKey, signTransaction, sendTransaction } = useWallet();
   const { connection } = useConnection();
   const mochiMint = useMemo(
-    () => new PublicKey(process.env.NEXT_PUBLIC_MOCHI_TOKEN_MINT || '3gqKrJoVx3gUXLHCsNQfpyZAuVagLHQFGtYgbtY3VEsn'),
+    () => new PublicKey(process.env.NEXT_PUBLIC_MOCHI_TOKEN_MINT || 'GS99uG5mWq3YtENvdxDdkrixtez3vUvAykZWoqfJETZv'),
     []
   );
   const mochiDecimals = useMemo(() => Number(process.env.NEXT_PUBLIC_MOCHI_TOKEN_DECIMALS || 6), []);
@@ -263,25 +263,46 @@ export default function ProfilePage() {
         items: recycleItems,
         user_token_account: userAta.toBase58(),
       });
-      let tx: VersionedTransaction;
-      if (data.tx_v0_b64) {
-        tx = VersionedTransaction.deserialize(Buffer.from(data.tx_v0_b64, 'base64'));
-      } else {
-        tx = buildV0Tx(publicKey, data.recent_blockhash, data.instructions);
+      if (!data.message_b64) {
+        throw new Error('Transaction payload missing message');
       }
+
+      const message = VersionedMessage.deserialize(Buffer.from(data.message_b64, 'base64'));
+      const tx = new VersionedTransaction(message);
+
+      // Defensive: ensure the payer in the message matches the connected wallet.
+      const signerPubkeys = message.staticAccountKeys.slice(0, message.header.numRequiredSignatures);
+      const payerKey = signerPubkeys[0];
+      if (!payerKey.equals(publicKey)) {
+        throw new Error(`Payer mismatch. Tx expects ${payerKey.toBase58()}, wallet is ${publicKey.toBase58()}.`);
+      }
+
       const signed = await signTransaction(tx);
-      const sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
-      await connection.confirmTransaction(sig, 'confirmed');
-      await api.post('/profile/recycle/confirm', {
+
+      // Verify wallet signature is present on its slot.
+      const userSignerIndex = signerPubkeys.findIndex((k) => k.equals(publicKey));
+      if (
+        userSignerIndex === -1 ||
+        !signed.signatures[userSignerIndex] ||
+        !signed.signatures[userSignerIndex].some((b: number) => b !== 0)
+      ) {
+        throw new Error('Wallet signature missing; make sure you approved with the connected wallet.');
+      }
+
+      const signedTxB64 = Buffer.from(signed.serialize()).toString('base64');
+      const submit = await api.post('/profile/recycle/submit', {
         wallet: publicKey.toBase58(),
-        signature: sig,
+        signed_tx_b64: signedTxB64,
         items: recycleItems,
       });
-      setRecycleStatus(`Recycled! Tx: ${sig}`);
+      const sig = submit.data?.signature;
+      setRecycleStatus(sig ? `Recycled! Tx: ${sig}` : 'Recycled!');
       fetchVirtualCards(publicKey.toBase58()).then(setVirtualCards).catch(() => {});
     } catch (e) {
       console.error('recycle error', e);
-      setRecycleStatus('Recycle failed. Check balance and selection.');
+      setRecycleStatus(
+        `Recycle failed. ${(e as Error)?.message || ''}`.trim() || 'Recycle failed. Check balance and selection.'
+      );
     } finally {
       setRecycleLoading(false);
     }

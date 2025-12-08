@@ -43,7 +43,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body className={space.className}>
         <WalletProvider>
           <Header />
-          <main className="max-w-6xl mx-auto px-6 py-10 space-y-10">{children}</main>
+          <main className="mx-auto w-full max-w-6xl lg:max-w-7xl 2xl:max-w-[90rem] px-6 lg:px-8 xl:px-12 py-10 space-y-10">
+            {children}
+          </main>
         </WalletProvider>
       </body>
     </html>

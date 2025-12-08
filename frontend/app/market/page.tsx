@@ -1,42 +1,12 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { fetchListings, fetchMarketCards, fetchPricingSets, type Listing, type MarketCardSummary } from '../../lib/api';
 
 const formatUsd = (v?: number | null) =>
   v || v === 0 ? `$${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '—';
 const formatSol = (v?: number | null) => (v ? `${v.toFixed(4)} SOL` : '—');
-
-function Sparkline({ points }: { points: MarketCardSummary['sparkline'] }) {
-  if (!points?.length) return <div className="text-[11px] text-white/50">No data</div>;
-  const sorted = [...points].sort((a, b) => a.collected_at - b.collected_at);
-  const values = sorted.map((p) => p.fair_value ?? p.mid_price);
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const range = max - min || 1;
-  const up = values[values.length - 1] >= values[0];
-  const width = 120;
-  const height = 40;
-  const coords = sorted.map((p, i) => {
-    const x = (i / Math.max(1, sorted.length - 1)) * width;
-    const val = values[i];
-    const y = height - ((val - min) / range) * height;
-    return `${x},${y}`;
-  });
-  return (
-    <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-10">
-      <polyline
-        fill="none"
-        stroke={up ? '#34d399' : '#f87171'}
-        strokeWidth="2"
-        points={coords.join(' ')}
-        strokeLinejoin="round"
-        strokeLinecap="round"
-      />
-    </svg>
-  );
-}
 
 const rarityGlowClass = (rarity?: string | null) => {
   if (!rarity) return 'rarity-glow rarity-glow--common';
@@ -54,39 +24,6 @@ const rarityGlowClass = (rarity?: string | null) => {
   };
   return map[key] || 'rarity-glow rarity-glow--common';
 };
-
-function TiltCard({ children }: { children: ReactNode }) {
-  const ref = useRef<HTMLDivElement>(null);
-  const [tilt, setTilt] = useState({ rx: 0, ry: 0 });
-
-  const handleMove = (e: React.MouseEvent<HTMLDivElement>) => {
-    const card = ref.current;
-    if (!card) return;
-    const rect = card.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    const midX = rect.width / 2;
-    const midY = rect.height / 2;
-    const ry = ((x - midX) / midX) * 5;
-    const rx = -((y - midY) / midY) * 5;
-    setTilt({ rx, ry });
-  };
-
-  const reset = () => setTilt({ rx: 0, ry: 0 });
-
-  return (
-    <div
-      ref={ref}
-      onMouseMove={handleMove}
-      onMouseLeave={reset}
-      style={{ '--rx': `${tilt.rx}deg`, '--ry': `${tilt.ry}deg` } as CSSProperties}
-      className="group relative overflow-hidden rounded-2xl border border-white/10 bg-gradient-to-br from-white/5 via-white/5 to-white/0 shadow-[0_25px_40px_-30px_rgba(0,0,0,0.8)] transition duration-300 [transform:perspective(900px)_rotateX(var(--rx))_rotateY(var(--ry))] hover:border-white/20 hover:shadow-[0_25px_40px_-25px_rgba(67,217,173,0.35)]"
-    >
-      <div className="absolute inset-0 pointer-events-none opacity-0 group-hover:opacity-70 transition duration-300 bg-[radial-gradient(circle_at_20%_20%,rgba(52,211,153,0.2),transparent_35%),radial-gradient(circle_at_80%_0%,rgba(244,114,182,0.15),transparent_30%)]" />
-      <div className="relative">{children}</div>
-    </div>
-  );
-}
 
 export default function MarketPage() {
   const [query, setQuery] = useState('');
@@ -314,79 +251,68 @@ export default function MarketPage() {
         </div>
       )}
 
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+      <div className="grid grid-cols-2 max-[520px]:grid-cols-1 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-5 gap-3">
         {filtered.map((card) => (
-          <Link key={`${card.template_id}-${card.name}`} href={`/market/card/${card.template_id}`} className="block">
-            <TiltCard>
-              <div className="flex flex-col gap-1 p-2 origin-top">
-                <div className={`relative overflow-hidden rounded-xl bg-black/40 border border-white/10 ${rarityGlowClass(card.rarity)}`}>
+          <div key={`${card.template_id}-${card.name}`} className="h-full">
+            <div className={`card-blur h-full rounded-2xl p-3 border border-white/5 space-y-3 flex flex-col ${rarityGlowClass(card.rarity)}`}>
+              <Link href={`/market/card/${card.template_id}`} className="space-y-2 block">
+                <div className="relative aspect-[3/4] rounded-xl overflow-hidden border border-white/10 bg-black/30">
                   {card.image_url ? (
                     <img
                       src={card.image_url}
                       alt={card.name}
-                      className="w-full aspect-[3/4] object-contain transition duration-300 ease-out group-hover:scale-105"
+                      className="w-full h-full object-cover"
+                      loading="lazy"
                     />
                   ) : (
-                    <div className="w-full aspect-[3/4] rounded-xl bg-black/30 border border-white/10 flex items-center justify-center text-xs text-white/50">
-                      No art
-                    </div>
+                    <div className="w-full h-full flex items-center justify-center text-xs text-white/60">No art</div>
                   )}
-                  <div className="absolute inset-0 opacity-0 group-hover:opacity-70 transition duration-300 bg-[radial-gradient(circle_at_20%_20%,rgba(52,211,153,0.25),transparent_40%),radial-gradient(circle_at_80%_0%,rgba(244,114,182,0.22),transparent_35%)]" />
-                  <div className="absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-black/70 to-transparent" />
-                </div>
-
-                <div className="flex items-center justify-between text-[11px] text-white/60">
-                  <div className="flex items-center gap-2">
-                    <span className="px-2 py-1 rounded-full bg-white/10 border border-white/10">
+                  <div className="absolute inset-0 bg-gradient-to-t from-black/70 to-transparent" />
+                  <div className="absolute top-2 left-2 flex gap-2 text-[11px]">
+                    <span className="glass-chip glass-chip--tiny bg-white/10 border-white/20">
                       {card.listing_count > 0 ? `${card.listing_count} live` : 'No listing'}
                     </span>
-                    {card.fair_price ? (
-                      <span className="px-2 py-1 rounded-full bg-emerald-500/10 border border-emerald-400/30 text-emerald-200">
-                        Fair {formatUsd(card.fair_price)}
-                      </span>
-                    ) : null}
-                  </div>
-                  <span className="px-2 py-1 rounded-full bg-white/5 border border-white/10">
-                    {card.listing_count > 0 ? 'Buy' : 'Price only'}
-                  </span>
-                </div>
-
-                <div className="space-y-0.5">
-                  <div className="text-base font-semibold truncate">{card.name}</div>
-                  <div className="text-sm font-semibold text-emerald-300">
-                    {card.listing_count > 0 ? formatSol(card.lowest_listing ?? undefined) : formatUsd(card.fair_price ?? undefined)}
-                  </div>
-                  <div className="text-xs text-white/60 flex gap-2">
-                    <span className="px-2 py-1 rounded-md bg-white/5 border border-white/10 truncate">{card.set_name || 'Unknown set'}</span>
-                    <span className="px-2 py-1 rounded-md bg-white/5 border border-white/10">{card.rarity || '—'}</span>
                     {card.is_fake && (
-                      <span className="px-2 py-1 rounded-md bg-rose-500/20 border border-rose-400/60 text-rose-100">
-                        Unverified
-                      </span>
+                      <span className="glass-chip glass-chip--tiny bg-rose-500/20 border-rose-400/60 text-rose-100">Unverified</span>
                     )}
                   </div>
                 </div>
-
-                <div className="flex items-center justify-between text-sm">
-                  <div className="flex flex-col leading-tight">
-                    <span className="text-[11px] text-white/60">{card.listing_count > 0 ? 'Listings live' : 'Price only'}</span>
-                    <span className="font-semibold">
-                      {card.listing_count > 0 ? formatSol(card.lowest_listing ?? undefined) : formatUsd(card.fair_price ?? undefined)}
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="font-semibold text-base truncate">{card.name}</p>
+                    <span className="glass-chip glass-chip--tiny">{card.rarity || '—'}</span>
+                  </div>
+                  <p className="text-sm font-semibold text-emerald-300">
+                    {card.listing_count > 0 ? formatSol(card.lowest_listing ?? undefined) : formatUsd(card.fair_price ?? undefined)}
+                  </p>
+                  <div className="text-xs text-white/60 flex gap-2 flex-wrap">
+                    <span className="glass-chip glass-chip--tiny bg-white/5 border-white/10 truncate">{card.set_name || 'Unknown set'}</span>
+                    <span className="glass-chip glass-chip--tiny bg-white/5 border-white/10">
+                      {card.listing_count > 0 ? 'Buy' : 'Price only'}
                     </span>
                   </div>
-                  <span
-                    className={`px-4 py-2 rounded-full border text-sm ${
-                      card.listing_count > 0
-                        ? 'border-emerald-300 text-emerald-100 bg-emerald-400/10'
-                        : 'border-white/20 text-white/70 bg-white/5'
-                    }`}
-                  >
-                    {card.listing_count > 0 ? 'Buy' : 'View'}
-                  </span>
                 </div>
+              </Link>
+              <div className="mt-auto flex items-center gap-2 text-sm">
+                <div className="flex-1 rounded-xl bg-white/5 border border-white/10 px-3 py-2">
+                  <p className="text-[11px] text-white/60">{card.listing_count > 0 ? 'Lowest listing' : 'Fair price'}</p>
+                  <p className="font-semibold text-white">
+                    {card.listing_count > 0 ? formatSol(card.lowest_listing ?? undefined) : formatUsd(card.fair_price ?? undefined)}
+                  </p>
+                </div>
+                <Link
+                  href={`/market/card/${card.template_id}`}
+                  className={`px-3 py-2 rounded-xl font-semibold text-center flex-1 ${
+                    card.listing_count > 0
+                      ? 'bg-aurora text-ink hover:brightness-110'
+                      : 'bg-white/10 border border-white/20 text-white hover:border-aurora/50'
+                  }`}
+                >
+                  {card.listing_count > 0 ? 'Buy' : 'View'}
+                </Link>
               </div>
-            </TiltCard>
-          </Link>
+            </div>
+          </div>
         ))}
         {!loading && hasSearched && !filtered.length && <div className="text-white/60 text-sm">No cards found.</div>}
       </div>

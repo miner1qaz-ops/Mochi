@@ -1,6 +1,6 @@
 /**
  * Prototype script: mint Metaplex Core assets and deposit CardRecords.
- * - Reads public/data/meg_web_expanded.csv for template_id/name/rarity/image.
+ * - Reads public/data/phantasmal_flames.csv for template_id/name/rarity/image.
  * - Mints Core assets to the vault_authority PDA (owner).
  * - Calls deposit_card on the mochi_v2_vault program to create CardRecord PDAs.
  *
@@ -20,20 +20,25 @@ import { Idl, Program, AnchorProvider, Wallet, BN } from '@coral-xyz/anchor';
 import { createUmi } from '@metaplex-foundation/umi-bundle-defaults';
 import { createSignerFromKeypair, generateSigner, keypairIdentity, publicKey as umiPublicKey } from '@metaplex-foundation/umi';
 import idl from '../anchor-program/target/idl/mochi_v2_vault.json';
+import bs58 from 'bs58';
 
 const PROGRAM_ID = new PublicKey('Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx');
+const PACK_ID = process.env.PACK_ID || 'phantasmal_flames';
+const TEMPLATE_OFFSET = Number(process.env.TEMPLATE_OFFSET || 2000);
 const CSV_PATH =
   process.env.CORE_TEMPLATE_CSV ||
-  path.join(__dirname, '../../nft_pipeline/data/mega-evolutions.csv');
+  path.join(__dirname, '../frontend/public/data/phantasmal_flames.csv');
 const KEYPAIR_PATH = path.join(__dirname, '../anchor-program/keys/dev-authority.json');
 const RPC = process.env.SOLANA_RPC || 'https://api.devnet.solana.com';
 const JSON_BASE =
-  process.env.CORE_METADATA_BASE || 'https://mochims.fun/nft/metadata/mega-evolutions';
+  process.env.CORE_METADATA_BASE || 'https://mochims.fun/nft/metadata/phantasmal_flames';
 
 interface TemplateRow {
   templateId: number;
   name: string;
   rarity: string;
+  variant?: string;
+  supply: number;
 }
 
 function loadKeypair(p: string): Keypair {
@@ -41,21 +46,47 @@ function loadKeypair(p: string): Keypair {
   return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(raw)));
 }
 
+function normalizeRarity(value: string): string {
+  return value.replace(/\s+/g, '').replace(/_/g, '').toLowerCase();
+}
+
+function supplyForRarity(rarity: string): number {
+  const key = normalizeRarity(rarity);
+  if (key === 'common' || key === 'uncommon') return 0;
+  if (key === 'specialillustrationrare' || key === 'megahyperrare') return 1;
+  return 6;
+}
+
 function loadTemplates(): TemplateRow[] {
   const text = fs.readFileSync(CSV_PATH, 'utf-8');
   const rows = parse(text, { columns: true, skip_empty_lines: true });
   const templates: TemplateRow[] = [];
   for (const r of rows) {
-    const templateRaw = r.template_id ?? r.token_id ?? r.Number;
-    if (!templateRaw) continue;
-    const templateId = Number(templateRaw);
+    const templateRaw = r.template_id ?? r.token_id ?? r.Number ?? r.serial_number;
+    let baseId: number | null = null;
+    if (templateRaw) {
+      const numeric = String(templateRaw).split('/')[0];
+      const parsed = Number(numeric);
+      if (Number.isFinite(parsed)) {
+        baseId = parsed;
+      }
+    }
+    if (baseId === null) continue;
+    const templateId = TEMPLATE_OFFSET + Number(baseId);
     if (!Number.isFinite(templateId)) continue;
     const rarity = (r.rarity || r.Rarity || 'Common').trim();
     const name = (r.card_name || r.name || r.Name || `Card ${templateId}`).trim();
+    const variant = (r.variant || r.Variant || r.holo_type || '').trim() || undefined;
+    const supply = supplyForRarity(rarity);
+    if (supply <= 0) {
+      continue; // virtual-only
+    }
     templates.push({
       templateId,
       name,
       rarity,
+      variant,
+      supply,
     });
   }
   // Deduplicate on template id (keep first occurrence)
@@ -66,10 +97,22 @@ function loadTemplates(): TemplateRow[] {
     seen.add(tmpl.templateId);
     unique.push(tmpl);
   }
-  const allowlist = new Set(
-    ['rare', 'double rare', 'double_rare', 'doublerare', 'ultra rare', 'ultra_rare', 'ultrarare', 'illustration rare', 'illustration_rare', 'illustrationrare', 'special illustration rare', 'special_illustration_rare', 'specialillustrationrare', 'mega hyper rare', 'mega_hyper_rare', 'megahyperrare'].map((s) => s.replace(/\\s+/g, '').toLowerCase())
-  );
-  return unique.filter((t) => allowlist.has(t.rarity.replace(/\\s+/g, '').toLowerCase()));
+  return unique;
+}
+
+async function countExistingCardRecords(connection: Connection, templateId: number): Promise<number> {
+  // CardRecord layout: 8 disc + 32 vault_state + 32 core_asset + 4 template_id + 1 rarity + 1 status + 32 owner = 110 bytes
+  const filters = [
+    { dataSize: 110 },
+    {
+      memcmp: {
+        offset: 72, // 8 discriminator + 32 vault_state + 32 core_asset
+        bytes: bs58.encode(Buffer.from(new Uint8Array(new Uint32Array([templateId]).buffer))),
+      },
+    },
+  ];
+  const accounts = await connection.getProgramAccounts(PROGRAM_ID, { filters });
+  return accounts.length;
 }
 
 async function vaultPdas(program: Program, vaultState: PublicKey) {
@@ -180,20 +223,26 @@ async function main() {
   await ensureVaultInitialized(program, vaultState, vaultAuth, usdcMint || undefined);
 
   const templates = loadTemplates().sort((a, b) => a.templateId - b.templateId);
-  const maxCount = process.env.CORE_TEMPLATE_LIMIT ? Number(process.env.CORE_TEMPLATE_LIMIT) : null;
-  const offset = process.env.CORE_TEMPLATE_OFFSET ? Number(process.env.CORE_TEMPLATE_OFFSET) : 0;
-  const copies = process.env.CORE_TEMPLATE_COPIES ? Number(process.env.CORE_TEMPLATE_COPIES) : 3;
+  const offset = Number(process.env.CORE_TEMPLATE_OFFSET || 0);
+  const limit = Number(process.env.CORE_TEMPLATE_LIMIT || 0);
   const sliced = offset > 0 ? templates.slice(offset) : templates;
-  const selected = maxCount && maxCount > 0 ? sliced.slice(0, maxCount) : sliced;
+  const selected = limit > 0 ? sliced.slice(0, limit) : sliced;
   console.log(
-    `Minting ${selected.length * copies} assets (copies=${copies}) to vault authority ${vaultAuth.toBase58()} (offset ${offset})`
+    `Minting ${selected.length} template rows (offset ${offset}, limit ${limit || 'all'}) for pack ${PACK_ID} with rarity-based supply to vault authority ${vaultAuth.toBase58()}`
   );
 
   for (const row of selected) {
     const tokenId = String(row.templateId).padStart(3, '0');
     const jsonUri = `${JSON_BASE}/${tokenId}.json`;
     const name = `${row.name} #${tokenId}`;
-    for (let copy = 0; copy < copies; copy += 1) {
+    const existing = await countExistingCardRecords(connection, row.templateId);
+    const toMint = Math.max(0, row.supply - existing);
+    if (toMint <= 0) {
+      console.log(`Template ${row.templateId} (${row.rarity}) fully minted (${existing}/${row.supply}), skipping.`);
+      continue;
+    }
+    console.log(`Template ${row.templateId} (${row.rarity}) minting ${toMint} (have ${existing}, target ${row.supply})`);
+    for (let copy = 0; copy < toMint; copy += 1) {
       const coreAsset = await mintCoreToVault(connection, payer, vaultAuth, jsonUri, name);
       const [cardRecord] = PublicKey.findProgramAddressSync(
         [Buffer.from('card_record'), vaultState.toBuffer(), coreAsset.toBuffer()],

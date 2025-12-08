@@ -9,7 +9,11 @@ import { buildV0Tx } from '../../lib/tx';
 import { deriveAta } from '../../lib/ata';
 import { LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js';
 
-const PROGRAM_ID = new PublicKey(process.env.NEXT_PUBLIC_PROGRAM_ID || 'Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx');
+const programIdFromEnv = process.env.NEXT_PUBLIC_PROGRAM_ID;
+if (!programIdFromEnv) {
+  throw new Error('NEXT_PUBLIC_PROGRAM_ID is required for marketplace flows.');
+}
+const PROGRAM_ID = new PublicKey(programIdFromEnv);
 const POLL_MS = 12_000;
 
 interface Listing {

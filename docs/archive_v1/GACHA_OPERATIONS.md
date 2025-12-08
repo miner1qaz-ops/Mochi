@@ -5,7 +5,7 @@ This doc explains how the pack (gacha) flow works, what needs to be configured, 
 ## High-level flow
 1) Frontend calls `POST /program/v2/open/build` to build the open transaction.
 2) User signs and sends the open transaction (payment + session creation + on-chain MOCHI reward mint).
-3) Frontend calls `POST /program/v2/open/confirm` with the signature; backend mirrors on-chain session to DB (legacy off-chain reward hook also runs but is now redundant).
+3) Frontend calls `POST /program/v2/open/confirm` with the signature; backend mirrors on-chain session to DB (legacy off-chain reward hook is gated by `ENABLE_LEGACY_OFFCHAIN_REWARDS` and defaults to off; on-chain reward is authoritative).
 4) User reveals cards, then either:
    - Claim: `POST /program/v2/claim/build` → sign/send → `POST /program/v2/claim/confirm`
    - Sellback: `POST /program/v2/sellback/build` → sign/send → `POST /program/v2/sellback/confirm`
@@ -24,7 +24,7 @@ This doc explains how the pack (gacha) flow works, what needs to be configured, 
 
 ## Backend (FastAPI: `backend/main.py`)
 - `/program/v2/open/build`: RNG + lineup, picks rare assets, constructs `open_pack_v2` ix including MOCHI mint/ATA accounts. Prepends MOCHI ATA creation if missing; adds compute budget ix.
-- `/program/v2/open/confirm`: Waits for tx confirmation, mirrors session + CardRecords to DB. (Legacy off-chain reward hook still runs but on-chain reward is authoritative.)
+- `/program/v2/open/confirm`: Waits for tx confirmation, mirrors session + CardRecords to DB. Off-chain reward hook runs only when `ENABLE_LEGACY_OFFCHAIN_REWARDS` is enabled; otherwise rely solely on on-chain reward.
 - `/program/v2/claim/build` / `.../confirm`: Builds and finalizes claim; updates DB `MintRecord` to `user_owned`.
 - Inventory sync: `/admin/inventory/refresh` pulls vault-owned assets via Helius and upserts into `MintRecord` as `available`.
 - Admin reward config: `/admin/reward/config` calls on-chain `set_reward_config` to set `mochi_mint` and `reward_per_pack`.
@@ -37,8 +37,9 @@ This doc explains how the pack (gacha) flow works, what needs to be configured, 
 
 ## Configuration (backend `.env` under `backend/`)
 - `SOLANA_RPC`, `HELIUS_RPC_URL` (required for inventory refresh).
-- `ADMIN_ADDRESS`, `ADMIN_KEYPAIR_PATH` (must match; used for admin endpoints and legacy reward hook).
-- `MOCHI_TOKEN_MINT`, `MOCHI_TOKEN_DECIMALS`, `MOCHI_PACK_REWARD` (legacy).
+- `ADMIN_ADDRESS`, `ADMIN_KEYPAIR_PATH` (must match; used for admin endpoints).
+- `ENABLE_LEGACY_OFFCHAIN_REWARDS` (default `false`; when `true`, enables the legacy MOCHI mint hook in `/program/v2/open/confirm`).
+- `MOCHI_TOKEN_MINT`, `MOCHI_TOKEN_DECIMALS`, `MOCHI_PACK_REWARD` (legacy; only used when legacy rewards are enabled).
 - `USDC_MINT`, `PLATFORM_WALLET`, `TREASURY_WALLET`.
 - `DATABASE_URL` (SQLite by default).
 

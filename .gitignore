@@ -35,6 +35,8 @@ pip-wheel-metadata/
 target/
 .anchor/
 anchor-program/keys/
+keys/
+KEY_LOCATION_MAP.txt
 
 # Databases / artifacts
 *.db

@@ -169,6 +169,12 @@ Next steps:
 - Surfaced those diagnostics and a new “Unreserve all” button in the admin UI so you can inspect/clear stuck cards before retrying a pack buy.
 - Restarted backend/frontends and updated docs accordingly.
 
+## 2025-12-08 – Codex
+- Executed Mochi V2 TGE via `scripts/deploy_mochi_v2_distribution.py` (summary in `scripts/deploy_mochi_v2_distribution.latest.json`). New mint `GS99uG5mWq3YtENvdxDdkrixtez3vUvAykZWoqfJETZv` (decimals=6); supply 1B distributed to allocation keys under `keys/allocation/` (team 300M, community 390M after ops, presale 100M, liquidity 100M, treasury reserve 100M). Admin treasury ATA `831fnahUncbMNznw79BtqAbsKGvvDZ2HefEhmQrv8CqW` funded with 10M for recycle/reward flows.
+- Disabled on-chain pack rewards by setting `reward_per_pack = 0` via `set_reward_config` (sig `66vYeQwa8UKjHC7juUyqqBRviAUmvqt883QLvxX2KNqbt92igzT6p43RrgtiBTSFye5t4tX9tB56TUnmzeD3Kv79`); mochi_mint now points to the V2 mint.
+- Backend `/program/v2/open/confirm` now treasury-transfers pack rewards from the admin wallet instead of minting via PDA; `MOCHI_PACK_REWARD` governs the whole-token amount (default 100). Reward flow reuses recycle-style SPL transfers and logs PackRewardLog entries.
+- Env updates: backend `.env` and frontend `.env.local` switched to the V2 mint; profile page fallback mint updated. Added `agent.md` and `docs/MIGRATION_V2.md` to document V2 tokenomics and allocation transparency.
+
 ## 2025-11-27T13:55:00+08:00 – Codex
 - Anchor pack instructions now slice `remaining_accounts` as `[11 CardRecords][11 Core assets][optional SPL token ATAs]`, so SOL purchases no longer provide dummy token accounts and sell-back only requires them when `currency == Token`.
 - `backend/tx_builder.py` appends the MPL Core program, every core asset account, and optional SPL ATAs in that order for open/claim/sellback/admin-force instructions; claim/sellback builders now take both account vectors explicitly.

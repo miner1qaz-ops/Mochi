@@ -18,6 +18,16 @@ export type PendingSession = {
   lineup: PackSlot[];
   asset_ids: string[];
   provably_fair: Record<string, string>;
+  pack_type?: string | null;
+};
+
+export type PackStock = {
+  template_id: number;
+  name: string;
+  rarity: string;
+  variant?: string | null;
+  remaining: number;
+  total: number;
 };
 
 export type VirtualCard = { template_id: number; rarity: string; count: number; name?: string; image_url?: string; is_energy?: boolean };
@@ -223,7 +233,7 @@ export type MarketCardDetail = {
 
 export async function previewPack(client_seed: string, wallet: string, pack_type: string = 'meg_web') {
   const { data } = await api.post('/program/open/preview', { client_seed, wallet, pack_type });
-  return data as { server_seed_hash: string; server_nonce: string; entropy_proof: string; slots: PackSlot[] };
+  return data as { server_seed_hash: string; server_nonce: string; entropy_proof: string; slots: PackSlot[]; pack_type?: string };
 }
 
 export async function buildPack(
@@ -233,6 +243,7 @@ export async function buildPack(
   user_token_account?: string,
   vault_token_account?: string,
   currency_mint?: string,
+  pack_type: string = 'meg_web',
 ) {
   const { data } = await api.post('/program/v2/open/build', {
     client_seed,
@@ -241,6 +252,7 @@ export async function buildPack(
     user_token_account,
     vault_token_account,
     currency_mint,
+    pack_type,
   });
   return data as {
     tx_b64: string;
@@ -250,6 +262,7 @@ export async function buildPack(
     lineup: PackSlot[];
     provably_fair: Record<string, string>;
     instructions: InstructionMeta[];
+    pack_type?: string;
   };
 }
 
@@ -263,9 +276,14 @@ export async function sellbackPack(wallet: string, user_token_account?: string, 
   return data as { tx_b64: string; tx_v0_b64: string; recent_blockhash: string; instructions: InstructionMeta[] };
 }
 
-export async function fetchInventoryRarity(): Promise<Record<string, number>> {
-  const { data } = await api.get('/admin/inventory/rarity');
+export async function fetchInventoryRarity(pack_type?: string): Promise<Record<string, number>> {
+  const { data } = await api.get('/admin/inventory/rarity', { params: pack_type ? { pack_type } : undefined });
   return data as Record<string, number>;
+}
+
+export async function fetchInventoryStock(pack_type: string): Promise<PackStock[]> {
+  const { data } = await api.get('/admin/inventory/pack_stock', { params: { pack_type } });
+  return data as PackStock[];
 }
 
 export async function expirePack(wallet: string) {

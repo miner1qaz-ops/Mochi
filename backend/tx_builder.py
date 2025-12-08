@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import os
 from typing import List, Optional
 
 from borsh_construct import CStruct, Enum, Option, U16, U32, U64, U8, Vec
@@ -9,7 +10,18 @@ from solders.hash import Hash
 from solders.transaction import VersionedTransaction
 from solders.pubkey import Pubkey
 
-PROGRAM_ID = Pubkey.from_string("Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx")
+
+def load_pubkey(env_name: str) -> Pubkey:
+    value = os.environ.get(env_name)
+    if not value:
+        raise RuntimeError(f"{env_name} must be set to a valid program id")
+    try:
+        return Pubkey.from_string(value)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"{env_name} is not a valid pubkey: {exc}") from exc
+
+
+PROGRAM_ID = load_pubkey("PROGRAM_ID")
 SYS_PROGRAM_ID = Pubkey.from_string("11111111111111111111111111111111")
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 MPL_CORE_PROGRAM_ID = Pubkey.from_string("CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d")
@@ -17,7 +29,7 @@ MARKETPLACE_VAULT_SEED = b"market_vault_state"
 MARKETPLACE_VAULT_AUTHORITY_SEED = b"market_vault_authority"
 
 # Seed sale program (devnet mock)
-SEED_SALE_PROGRAM_ID = Pubkey.from_string("2mt9FhkfhrkC5RL29MVPfMGVzpFR3eupGCMqKVYssiue")
+SEED_SALE_PROGRAM_ID = load_pubkey("SEED_SALE_PROGRAM_ID")
 
 
 CurrencyLayout = Enum("Sol" / CStruct(), "Token" / CStruct(), enum_name="Currency")

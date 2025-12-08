@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useMemo, useCallback } from 'react';
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useWallet } from '@solana/wallet-adapter-react';
 import {
@@ -11,11 +11,13 @@ import {
   sellbackPack,
   expirePack,
   PackSlot,
+  PackStock,
   fetchActiveSession,
   confirmOpen,
   confirmClaim,
   confirmExpire,
   fetchInventoryRarity,
+  fetchInventoryStock,
 } from '../../lib/api';
 import { buildV0Tx } from '../../lib/tx';
 import { deriveAta } from '../../lib/ata';
@@ -24,7 +26,11 @@ import { PublicKey } from '@solana/web3.js';
 import type { AxiosError } from 'axios';
 
 // vault_authority PDA derives from program id; until we pull it from backend, we reconstruct here
-const PROGRAM_ID = new PublicKey('Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx');
+const programIdFromEnv = process.env.NEXT_PUBLIC_PROGRAM_ID;
+if (!programIdFromEnv) {
+  throw new Error('NEXT_PUBLIC_PROGRAM_ID must be set for gacha flows.');
+}
+const PROGRAM_ID = new PublicKey(programIdFromEnv);
 const VAULT_STATE_SEED = 'vault_state';
 
 function vaultAuthorityPk() {
@@ -84,6 +90,22 @@ const rarityGlowClass = (rarity?: string | null) => {
   };
   return map[key] || 'rarity-glow rarity-glow--common';
 };
+
+const packVideoMap: Record<string, string> = {
+  default: '/media/Pack_opening_me01.mp4',
+  meg_web: '/media/Pack_opening_me01.mp4',
+  phantasmal_flames: '/media/Pack_opening_me01.mp4',
+};
+
+const PACK_TEMPLATE_OFFSETS: Record<string, number> = {
+  meg_web: 0,
+  phantasmal_flames: 2000,
+};
+
+const packThumbClass = 'h-12 w-12 rounded-xl object-contain bg-black/40 p-1';
+const packHeroImageClass = 'h-full w-full max-h-48 object-contain rounded-2xl';
+
+type OpeningStep = 'idle' | 'video' | 'animation' | 'reveal';
 
 const FlipModalCard = ({
   backImage,
@@ -190,7 +212,7 @@ export default function GachaPage() {
   const [revealIndex, setRevealIndex] = useState<number>(-1);
   const [revealMode, setRevealMode] = useState<'fast' | 'one'>('one'); // fast mode temporarily disabled in UI
   const [showOneModal, setShowOneModal] = useState(false);
-  const [templatesByPack, setTemplatesByPack] = useState<Record<string, Record<number, { name: string; image: string; rarity: string }>>>({});
+  const [templatesByPack, setTemplatesByPack] = useState<Record<string, Record<number, { name: string; image: string; rarity: string; variant?: string }>>>({});
   const [revealed, setRevealed] = useState<boolean[]>([]);
   const [modalFaceBack, setModalFaceBack] = useState(true);
   const [resumeLoading, setResumeLoading] = useState(false);
@@ -199,14 +221,29 @@ export default function GachaPage() {
   const [opening, setOpening] = useState(false);
   const [inventoryCounts, setInventoryCounts] = useState<Record<string, number> | null>(null);
   const [inventoryError, setInventoryError] = useState<string | null>(null);
+  const [packStock, setPackStock] = useState<PackStock[] | null>(null);
+  const [packStockError, setPackStockError] = useState<string | null>(null);
+  const [showOpeningVideo, setShowOpeningVideo] = useState(false);
+  const [openingVideoSrc, setOpeningVideoSrc] = useState<string>(packVideoMap.default);
+  const [openingStep, setOpeningStep] = useState<OpeningStep>('idle');
+  const openingTimers = useRef<NodeJS.Timeout[]>([]);
   const packOptions = useMemo(
     () => [
-      { id: 'meg_web_alt', name: 'Mega Evolutions Pack', priceSol: 0.12, priceUsdc: 12, image: '/img/pack_alt.jpg' },
+      { id: 'meg_web', name: 'Mega Evolutions Pack', priceSol: 0.12, priceUsdc: 12, image: '/img/pack_alt.jpg' },
+      { id: 'phantasmal_flames', name: 'Phantasmal Flames Pack', priceSol: 0.12, priceUsdc: 12, image: '/img/ptcg-pfl-bp.png' },
     ],
     []
   );
-  const [selectedPack, setSelectedPack] = useState<string>('meg_web_alt');
+  const [selectedPack, setSelectedPack] = useState<string>('meg_web');
+  const clearOpeningTimers = useCallback(() => {
+    openingTimers.current.forEach((t) => clearTimeout(t));
+    openingTimers.current = [];
+  }, []);
   const resetSessionState = useCallback(() => {
+    clearOpeningTimers();
+    setOpeningStep('idle');
+    setShowOpeningVideo(false);
+    setOpeningVideoSrc(packVideoMap.default);
     setSessionId(null);
     setSlots([]);
     setRevealed([]);
@@ -218,7 +255,43 @@ export default function GachaPage() {
     setPackStage('idle');
     setOpenSignature(null);
     setConfirmDone(false);
-  }, []);
+  }, [clearOpeningTimers]);
+  const runPackAnimation = useCallback(() => {
+    clearOpeningTimers();
+    setOpeningStep('animation');
+    setPackStage('swing');
+    const tearTimer = setTimeout(() => setPackStage('tear'), 800);
+    const revealTimer = setTimeout(() => {
+      setPackStage('reveal');
+      setModalFaceBack(true);
+      if (revealMode === 'one') {
+        setShowOneModal(true);
+      }
+      setOpeningStep('reveal');
+    }, 1500);
+    openingTimers.current = [tearTimer, revealTimer];
+  }, [clearOpeningTimers, revealMode]);
+  const startOpeningCinematics = useCallback(
+    (packId?: string | null) => {
+      const key = packId || selectedPack || 'default';
+      clearOpeningTimers();
+      setShowOneModal(false);
+      setOpeningVideoSrc(packVideoMap[key] || packVideoMap.default);
+      setOpeningStep('video');
+      setShowOpeningVideo(true);
+      setPackStage('idle');
+      setModalFaceBack(true);
+    },
+    [clearOpeningTimers, selectedPack],
+  );
+  const handleVideoFinished = useCallback(() => {
+    if (openingStep === 'animation' || openingStep === 'reveal') {
+      setShowOpeningVideo(false);
+      return;
+    }
+    setShowOpeningVideo(false);
+    runPackAnimation();
+  }, [openingStep, runPackAnimation]);
 
   useEffect(() => {
     let timer: NodeJS.Timeout;
@@ -227,30 +300,54 @@ export default function GachaPage() {
     }
     return () => clearInterval(timer);
   }, [countdown]);
+  useEffect(() => {
+    return () => clearOpeningTimers();
+  }, [clearOpeningTimers]);
 
   useEffect(() => {
-    fetchInventoryRarity()
+    let cancelled = false;
+    setInventoryCounts(null);
+    setInventoryError(null);
+    setPackStock(null);
+    setPackStockError(null);
+    fetchInventoryRarity(selectedPack)
       .then((data) => {
+        if (cancelled) return;
         setInventoryCounts(data);
         setInventoryError(null);
       })
       .catch(() => {
+        if (cancelled) return;
         setInventoryCounts(null);
         setInventoryError('Inventory status unavailable');
       });
-  }, []);
+    fetchInventoryStock(selectedPack)
+      .then((data) => {
+        if (cancelled) return;
+        setPackStock(data);
+        setPackStockError(null);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setPackStock(null);
+        setPackStockError('Stock list unavailable');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedPack]);
 
   useEffect(() => {
     // Load card templates for each pack from CSV
     const loadTemplates = async () => {
       try {
-        const packs: Record<string, Record<number, { name: string; image: string; rarity: string }>> = {};
+        const packs: Record<string, Record<number, { name: string; image: string; rarity: string; variant?: string }>> = {};
 
         // meg_web default
         const resMeg = await fetch('/data/meg_web_expanded.csv');
         const textMeg = await resMeg.text();
         const linesMeg = textMeg.trim().split('\n').slice(1);
-        const mapMeg: Record<number, { name: string; image: string; rarity: string }> = {};
+        const mapMeg: Record<number, { name: string; image: string; rarity: string; variant?: string }> = {};
         for (const line of linesMeg) {
           const [num, name, rarity, _variant, image] = line.split(',');
           const id = Number(num);
@@ -261,42 +358,26 @@ export default function GachaPage() {
         }
         packs['meg_web'] = mapMeg;
 
-        // mega evolutions
-        const resMega = await fetch('/data/mega_evolutions.csv');
-        if (resMega.ok) {
-          const textMega = await resMega.text();
-          const linesMega = textMega.trim().split('\n').slice(1);
-          const mapMega: Record<number, { name: string; image: string; rarity: string }> = {};
-          for (const raw of linesMega) {
+        // phantasmal flames
+        const resPfl = await fetch('/data/phantasmal_flames.csv');
+        if (resPfl.ok) {
+          const textPfl = await resPfl.text();
+          const linesPfl = textPfl.trim().split('\n').slice(1);
+          const mapPfl: Record<number, { name: string; image: string; rarity: string; variant?: string }> = {};
+          linesPfl.forEach((raw, idx) => {
             const line = raw.trim();
-            if (!line) continue;
-            // token_id,name,description,image_url,source_id,rarity,...
-            const cells: string[] = [];
-            let current = '';
-            let inQuotes = false;
-            for (let i = 0; i < line.length; i++) {
-              const ch = line[i];
-              if (ch === '"' && line[i + 1] === '"') {
-                current += '"';
-                i++;
-              } else if (ch === '"') {
-                inQuotes = !inQuotes;
-              } else if (ch === ',' && !inQuotes) {
-                cells.push(current);
-                current = '';
-              } else {
-                current += ch;
-              }
-            }
-            cells.push(current);
-            const [tokenId, name, _desc, imageUrl, _sourceId, rarity] = cells;
-            const id = Number(tokenId);
-            if (!id || !imageUrl) continue;
-            if (!mapMega[id]) {
-              mapMega[id] = { name: name || `Card ${id}`, image: imageUrl, rarity: rarity || 'Common' };
-            }
-          }
-          packs['meg_web_alt'] = mapMega;
+            if (!line) return;
+            const cells = line.split(',');
+            const [serial, name, rarity, printType] = cells;
+            const baseIdRaw = Number(serial?.split('/')?.[0] ?? idx + 1);
+            const baseId = Number.isFinite(baseIdRaw) ? baseIdRaw : idx + 1;
+            const templateId = (PACK_TEMPLATE_OFFSETS['phantasmal_flames'] || 0) + baseId;
+            const serialSlug = (serial?.split('/')?.[0] || `${baseId}`).padStart(3, '0');
+            const nameSlug = (name || `card-${idx + 1}`).replace(/[^A-Za-z0-9]+/g, '_');
+            const image = `/img/phantasmal_flames/${serialSlug}-${nameSlug}.jpg`;
+            mapPfl[templateId] = { name: name || `Card ${templateId}`, image, rarity: rarity || 'Common', variant: printType };
+          });
+          packs['phantasmal_flames'] = mapPfl;
         }
 
         setTemplatesByPack(packs);
@@ -308,7 +389,12 @@ export default function GachaPage() {
   }, []);
 
   const hydrateSession = useCallback(
-    async ({ interactive = false, fresh = false }: { interactive?: boolean; fresh?: boolean } = {}) => {
+    async ({
+      interactive = false,
+      fresh = false,
+      startCinematics = false,
+      packIdForVideo,
+    }: { interactive?: boolean; fresh?: boolean; startCinematics?: boolean; packIdForVideo?: string } = {}) => {
       if (!publicKey) return;
       if (interactive) {
         setResumeLoading(true);
@@ -316,13 +402,16 @@ export default function GachaPage() {
       }
       try {
         const pending = await fetchActiveSession(publicKey.toBase58());
+        if (pending.pack_type && packOptions.find((p) => p.id === pending.pack_type)) {
+          setSelectedPack(pending.pack_type);
+        }
         setSessionId(pending.session_id);
         setSlots(pending.lineup);
         setRevealed(Array(pending.lineup.length).fill(fresh ? false : true));
         setRevealIndex(fresh ? 0 : pending.lineup.length - 1);
         setModalFaceBack(fresh ? true : false);
-        setShowOneModal(fresh ? revealMode === 'one' : false);
-        setPackStage('reveal');
+        setShowOneModal(false);
+        setPackStage(fresh ? 'idle' : 'reveal');
         setCountdown(pending.countdown_seconds);
         const fair = pending.provably_fair || {};
         setProof({
@@ -332,6 +421,17 @@ export default function GachaPage() {
         });
         setClientProofSeed('');
         setConfirmDone(true); // session exists on-chain; allow claim/sell
+        if (fresh && startCinematics) {
+          startOpeningCinematics(packIdForVideo);
+        } else if (fresh) {
+          setPackStage('reveal');
+          if (revealMode === 'one') {
+            setShowOneModal(true);
+          }
+        }
+        if (!fresh) {
+          setPackStage('reveal');
+        }
         if (interactive) {
           setStatusKind('info');
           setStatusMsg(fresh ? 'Pack opened and locked. Reveal, then claim or sell back.' : 'Resumed your pending pack session. Claim or sell back before the timer ends.');
@@ -355,7 +455,7 @@ export default function GachaPage() {
         }
       }
     },
-    [publicKey, resetSessionState, revealMode],
+    [publicKey, resetSessionState, revealMode, startOpeningCinematics, packOptions],
   );
 
   const waitForSession = useCallback(
@@ -391,7 +491,7 @@ export default function GachaPage() {
     setStatusKind('info');
     const seed = clientSeed || crypto.randomUUID();
     setClientSeed(seed);
-    const res = await previewPack(seed, publicKey?.toBase58() || '', selectedPack === 'meg_web_alt' ? 'meg_web' : selectedPack);
+    const res = await previewPack(seed, publicKey?.toBase58() || '', selectedPack);
     setSlots(res.slots);
     setRevealed(Array(res.slots.length).fill(false));
     setRevealIndex(-1);
@@ -402,6 +502,8 @@ export default function GachaPage() {
 
   const handleOpen = async () => {
     if (!connected || !publicKey || openLoading) return;
+    const packChoice = selectedPack;
+    setOpeningStep('idle');
     if (sessionId) {
       setStatusKind('error');
       setStatusMsg('Finish or cancel your current pack before buying another.');
@@ -430,7 +532,8 @@ export default function GachaPage() {
         useUsdc ? 'USDC' : 'SOL',
         userToken,
         vaultToken,
-        currencyMint
+        currencyMint,
+        selectedPack
       );
       const raritiesForConfirm = buildRes.lineup.map((s) => s.rarity);
       const templateIdsForConfirm = buildRes.lineup.map((s) => (s.template_id === undefined ? null : s.template_id));
@@ -478,7 +581,7 @@ export default function GachaPage() {
           throw new Error('Confirm failed – no state returned.');
         }
         setConfirmDone(true);
-        await hydrateSession({ interactive: true, fresh: true });
+        await hydrateSession({ interactive: true, fresh: true, startCinematics: true, packIdForVideo: packChoice });
         setStatusKind('info');
         setStatusMsg('Pack opened and locked. Reveal, then claim or sell back.');
       } catch (err) {
@@ -492,11 +595,11 @@ export default function GachaPage() {
           }
           setSessionId(pending.session_id);
           setSlots(pending.lineup);
-          setRevealed(Array(pending.lineup.length).fill(true));
-          setRevealIndex(pending.lineup.length - 1);
-          setModalFaceBack(false);
+          setRevealed(Array(pending.lineup.length).fill(false));
+          setRevealIndex(0);
+          setModalFaceBack(true);
           setShowOneModal(false);
-          setPackStage('reveal');
+          setPackStage('idle');
           setCountdown(pending.countdown_seconds);
           const fair = pending.provably_fair || {};
           setProof({
@@ -505,6 +608,7 @@ export default function GachaPage() {
             entropy_proof: fair.entropy_proof || fair.assets || '',
           });
           setConfirmDone(true);
+          startOpeningCinematics(packChoice);
           setStatusKind('info');
           setStatusMsg('Session detected on-chain. Reveal, then claim or sell back.');
         } catch (resumeErr) {
@@ -638,7 +742,7 @@ export default function GachaPage() {
     setRevealed(Array(dummySlots.length).fill(false));
     setRevealIndex(0);
     setModalFaceBack(true);
-    if (revealMode === 'one') setShowOneModal(true);
+    setShowOneModal(false);
     setSessionId('test-session');
     setCountdown(3600);
     setProof({
@@ -647,9 +751,8 @@ export default function GachaPage() {
       entropy_proof: 'test-entropy',
     });
     setClientProofSeed('test-seed');
-    setPackStage('swing');
-    setTimeout(() => setPackStage('tear'), 800);
-    setTimeout(() => setPackStage('reveal'), 1500);
+    setPackStage('idle');
+    startOpeningCinematics(selectedPack);
   };
 
   const enrichedSlots = useMemo(() => {
@@ -658,10 +761,13 @@ export default function GachaPage() {
     return slots.map((slot, idx) => {
       const template = slot.template_id ? templateMap[slot.template_id] : undefined;
       const isRevealed = revealed[idx];
-      const isNft = !!slot.is_nft || ['rare','doublerare','ultrarare','illustrationrare','specialillustrationrare','megahyperrare'].includes((slot.rarity || '').replace(/\\s+/g,'').toLowerCase());
+      const displayName = template
+        ? `${template.name}${template.variant ? ` (${template.variant})` : ''}`
+        : `Template ${slot.template_id ?? 'TBD'}`;
+      const isNft = !!slot.is_nft || ['rare','doublerare','ultrarare','illustrationrare','specialillustrationrare','megahyperrare'].includes((slot.rarity || '').replace(/\s+/g,'').toLowerCase());
       return {
         ...slot,
-        displayName: template?.name || `Template ${slot.template_id ?? 'TBD'}`,
+        displayName,
         image: isRevealed ? template?.image || '/card_back.png' : '/card_back.png',
         revealed: isRevealed,
         is_nft: isNft,
@@ -754,8 +860,43 @@ export default function GachaPage() {
 
   return (
     <div className="space-y-8">
+      <AnimatePresence>
+        {showOpeningVideo && (
+          <motion.div
+            className="fixed inset-0 z-[60] bg-black/90 backdrop-blur-sm flex items-center justify-center"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+          >
+            <div className="absolute inset-0 pointer-events-none bg-[radial-gradient(circle_at_20%_20%,rgba(244,114,182,0.18),transparent_35%),radial-gradient(circle_at_80%_0%,rgba(52,211,153,0.12),transparent_35%)]" />
+            <div className="relative h-full w-full">
+              <video
+                key={openingVideoSrc}
+                src={openingVideoSrc}
+                className="absolute inset-0 h-full w-full object-cover"
+                autoPlay
+                muted
+                playsInline
+                onEnded={handleVideoFinished}
+                onError={handleVideoFinished}
+              />
+              <div className="absolute inset-0 bg-gradient-to-b from-black/30 via-black/40 to-black/70" />
+              <div className="relative h-full w-full flex flex-col items-center justify-end pb-10 px-4 gap-4 text-center">
+                <p className="text-sm text-white/80">Summoning pack… hang tight</p>
+                <button
+                  type="button"
+                  className="rounded-xl border border-white/30 bg-black/50 px-5 py-2 text-sm font-semibold text-white shadow-lg shadow-black/30 hover:border-aurora/70"
+                  onClick={handleVideoFinished}
+                >
+                  Skip animation
+                </button>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
       {opening && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 backdrop-blur-sm">
           <div className="rounded-2xl border border-white/10 bg-white/10 px-6 py-4 text-white space-y-2">
             <p className="text-lg font-semibold">Opening pack…</p>
             <p className="text-sm text-white/70">Waiting for the transaction to confirm on-chain.</p>
@@ -764,7 +905,7 @@ export default function GachaPage() {
       )}
       <div className="card-blur rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-white/80">
         <div className="flex items-center justify-between mb-2">
-          <div className="text-base font-semibold">On-chain stock (Mega Evolution)</div>
+          <div className="text-base font-semibold">On-chain stock ({selectedPackInfo.name})</div>
           {inventoryError && <span className="text-xs text-amber-300">{inventoryError}</span>}
         </div>
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 text-xs">
@@ -789,13 +930,31 @@ export default function GachaPage() {
             );
           })}
         </div>
+        <div className="mt-4">
+          <div className="text-xs uppercase text-white/60 mb-1">Stock list</div>
+          <div className="max-h-60 overflow-y-auto space-y-1 pr-1">
+            {packStockError && <div className="text-amber-300 text-xs">{packStockError}</div>}
+            {!packStock && !packStockError && <div className="text-white/60 text-xs">Loading…</div>}
+            {packStock && packStock.length === 0 && <div className="text-white/60 text-xs">No on-chain supply for this pack yet.</div>}
+            {packStock &&
+              packStock
+                .filter((s) => s.total > 0)
+                .sort((a, b) => a.template_id - b.template_id)
+                .map((s) => (
+                  <div key={s.template_id} className="text-xs text-white/80">
+                    {s.name} ({s.rarity}{s.variant ? ` ${s.variant}` : ''}):{' '}
+                    <span className="font-semibold">{s.remaining}</span> / {s.total} remaining
+                  </div>
+                ))}
+          </div>
+        </div>
       </div>
       <div className="card-blur rounded-3xl p-6 border border-white/5 grid lg:grid-cols-[1.1fr,0.9fr] gap-6 items-center">
         <div className="space-y-3">
           <div className="flex items-center gap-3">
             <img src="/mochi_icon.png" alt="Mochi icon" className="h-10 w-10 rounded-full" />
             <div>
-              <p className="text-sm uppercase text-white/60 tracking-[0.2em]">Mega Evolutions Pack</p>
+              <p className="text-sm uppercase text-white/60 tracking-[0.2em]">{selectedPackInfo.name}</p>
               <p className="text-xl font-semibold">11 cards</p>
             </div>
           </div>
@@ -810,7 +969,7 @@ export default function GachaPage() {
           }`}
         >
           {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src={pack.image} alt={pack.name} className="h-12 w-12 rounded-xl object-cover" />
+          <img src={pack.image} alt={pack.name} className={packThumbClass} />
           <div className="text-left">
             <p className="font-semibold">{pack.name}</p>
                   <p className="text-xs text-white/60">{pack.priceSol} SOL / {pack.priceUsdc} USDC</p>
@@ -818,16 +977,16 @@ export default function GachaPage() {
               </button>
             ))}
           </div>
-          <div className="flex gap-3">
-            <div className="p-3 rounded-xl bg-white/5 border border-white/10">
+          <div className="flex flex-wrap gap-3">
+            <div className="p-3 rounded-xl bg-white/5 border border-white/10 min-w-[160px] flex-1">
               <p className="text-xs uppercase text-white/60">Price</p>
               <p className="text-lg font-semibold">{selectedPackInfo.priceSol} SOL / {selectedPackInfo.priceUsdc} USDC</p>
             </div>
-            <div className="p-3 rounded-xl bg-white/5 border border-white/10">
+            <div className="p-3 rounded-xl bg-white/5 border border-white/10 min-w-[160px] flex-1">
               <p className="text-xs uppercase text-white/60">Buyback</p>
               <p className="text-lg font-semibold">90% full-pack</p>
             </div>
-            <div className="p-3 rounded-xl bg-white/5 border border-white/10">
+            <div className="p-3 rounded-xl bg-white/5 border border-white/10 min-w-[160px] flex-1">
               <p className="text-xs uppercase text-white/60">Timer</p>
               <p className="text-lg font-semibold">{countdown !== null ? `${Math.max(countdown, 0)}s` : 'Start a session'}</p>
             </div>
@@ -836,10 +995,10 @@ export default function GachaPage() {
         <div className="relative h-48 sm:h-60">
           <div className="absolute inset-0 bg-gradient-to-r from-sakura/30 to-aurora/20 blur-3xl" />
           <motion.div
-            className="relative h-full w-full rounded-3xl overflow-hidden border border-white/10 bg-black/60"
-            whileHover={{ rotateY: 6, rotateX: -3, scale: 1.02 }}
-            transition={{ type: 'spring', stiffness: 120, damping: 14 }}
-          >
+                className="relative h-full w-full rounded-3xl overflow-hidden border border-white/10 bg-black/60"
+                whileHover={{ rotateY: 6, rotateX: -3, scale: 1.02 }}
+                transition={{ type: 'spring', stiffness: 120, damping: 14 }}
+              >
             <div className="absolute inset-0 bg-[radial-gradient(circle_at_20%_20%,rgba(255,255,255,0.08),transparent_35%),radial-gradient(circle_at_80%_0%,rgba(255,100,200,0.1),transparent_45%)]" />
             <div className="h-full flex items-center justify-center">
               <motion.div
@@ -851,7 +1010,7 @@ export default function GachaPage() {
                 <img
                   src={selectedPackInfo.image}
                   alt={selectedPackInfo.name}
-                  className="h-full w-full object-contain rounded-2xl"
+                  className={packHeroImageClass}
                 />
               </motion.div>
             </div>
@@ -866,28 +1025,28 @@ export default function GachaPage() {
           placeholder="Client seed for provably-fair RNG"
           className="flex-1 px-4 py-3 rounded-xl bg-white/5 border border-white/10"
         />
-        <div className="flex items-center gap-2 text-sm text-white/70">
+        <div className="flex items-center gap-2 text-sm text-white/70 rounded-xl border border-white/10 bg-white/5 px-3 py-2">
           <input type="checkbox" checked={useUsdc} onChange={(e) => setUseUsdc(e.target.checked)} />
           <span>Pay with USDC</span>
         </div>
         <button
           onClick={handlePreview}
-          className="px-4 py-3 rounded-xl bg-white/10 border border-white/10"
+          className="px-4 py-3 rounded-xl bg-white/10 border border-white/10 w-full md:w-auto"
         >
           Preview RNG
         </button>
         <button
           onClick={handleOpen}
           disabled={!connected || openLoading || !!sessionId}
-          className="px-5 py-3 rounded-xl bg-sakura text-ink font-semibold shadow-glow disabled:opacity-50 disabled:cursor-not-allowed"
+          className="px-5 py-3 rounded-xl bg-sakura text-ink font-semibold shadow-glow disabled:opacity-50 disabled:cursor-not-allowed w-full md:w-auto"
         >
           {sessionId ? 'Session active' : openLoading ? 'Awaiting wallet…' : 'Buy pack'}
         </button>
       </div>
-      <div className="flex gap-3">
+      <div className="flex flex-wrap gap-3 items-center">
         <button
           onClick={handleTestPurchase}
-          className="px-4 py-2 rounded-xl bg-white/10 border border-white/10 text-sm"
+          className="px-4 py-2 rounded-xl bg-white/10 border border-white/10 text-sm w-full sm:w-auto"
           type="button"
         >
           Demo / Test Pack – No Deduction
@@ -895,11 +1054,11 @@ export default function GachaPage() {
         {testModeMsg && <p className="text-sm text-white/60">{testModeMsg}</p>}
       </div>
       {connected && (
-        <div className="flex gap-3">
+        <div className="flex flex-wrap gap-3 items-center">
           <button
             type="button"
             onClick={() => hydrateSession({ interactive: true })}
-            className="px-4 py-2 rounded-xl bg-white/10 border border-white/10 text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+            className="px-4 py-2 rounded-xl bg-white/10 border border-white/10 text-sm disabled:opacity-50 disabled:cursor-not-allowed w-full sm:w-auto"
             disabled={resumeLoading || !publicKey}
           >
             {resumeLoading ? 'Resuming…' : 'Resume pending pack'}
@@ -956,7 +1115,7 @@ export default function GachaPage() {
         </button>
       </div>
 
-      <div className="grid md:grid-cols-4 lg:grid-cols-5 gap-4">
+      <div className="grid grid-cols-2 max-[520px]:grid-cols-1 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">
         {revealCards.map((card, i) => (
           <div
             key={i}
@@ -1063,25 +1222,25 @@ export default function GachaPage() {
         </div>
       )}
 
-      <div className="flex gap-3">
+      <div className="flex flex-wrap gap-3">
         <button
           onClick={handleClaim}
           disabled={!sessionId || claimLoading || !confirmDone}
-          className="px-5 py-3 rounded-xl bg-aurora text-ink font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
+          className="px-5 py-3 rounded-xl bg-aurora text-ink font-semibold disabled:opacity-50 disabled:cursor-not-allowed w-full sm:w-auto"
         >
           {claimLoading ? 'Claiming…' : confirmDone ? 'Keep cards' : 'Confirm cards first'}
         </button>
         <button
           onClick={handleSellback}
           disabled={!sessionId || sellbackLoading || !confirmDone}
-          className="px-5 py-3 rounded-xl border border-white/20 hover:border-sakura text-white disabled:opacity-50 disabled:cursor-not-allowed"
+          className="px-5 py-3 rounded-xl border border-white/20 hover:border-sakura text-white disabled:opacity-50 disabled:cursor-not-allowed w-full sm:w-auto"
         >
           {sellbackLoading ? 'Processing…' : 'Instant sell-back (90%)'}
         </button>
         <button
           onClick={handleExpire}
           disabled={!sessionId || !publicKey || (countdown !== null && countdown > 0) || expireLoading}
-          className="px-5 py-3 rounded-xl border border-white/20 text-white disabled:opacity-50 disabled:cursor-not-allowed"
+          className="px-5 py-3 rounded-xl border border-white/20 text-white disabled:opacity-50 disabled:cursor-not-allowed w-full sm:w-auto"
         >
           {expireLoading ? 'Expiring…' : 'Expire session'}
         </button>

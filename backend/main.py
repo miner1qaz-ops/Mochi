@@ -26,7 +26,7 @@ from solders.transaction import VersionedTransaction
 from solders.compute_budget import set_compute_unit_limit
 from solana.rpc.api import Client as SolanaClient
 from solana.rpc.types import TxOpts, MemcmpOpts
-from sqlalchemy import Index, or_, text
+from sqlalchemy import Index, and_, or_, text
 from sqlmodel import Field, Session, SQLModel, create_engine, select, func
 
 from tx_builder import (
@@ -274,6 +274,7 @@ RARE_PLUS = {
     "SpecialIllustrationRare",
     "MegaHyperRare",
 }
+RARE_PLUS_NORMALIZED = {r.replace(" ", "").replace("_", "").lower() for r in RARE_PLUS}
 PACK_STATE_LABELS = [
     "uninitialized",
     "pending",
@@ -329,6 +330,98 @@ RARITY_PRICE_LAMPORTS = {
     "Energy": 1_000_000,
 }
 
+# Registry of supported pack sets. template_offset reserves an ID range to avoid collisions.
+PACK_REGISTRY: Dict[str, dict] = {
+    "meg_web": {
+        "name": "Mega Evolution",
+        "csv_path": os.path.join(os.path.dirname(__file__), "..", "frontend", "public", "data", "mega_evolutions.csv"),
+        "pack_image": "/img/pack_alt.jpg",
+        "set_code": "meg_web",
+        "template_offset": 0,
+    },
+    # Metadata bridge uses the same CSV but a different URL shape.
+    "mega_evolutions": {
+        "name": "Mega Evolution",
+        "csv_path": os.path.join(os.path.dirname(__file__), "..", "frontend", "public", "data", "mega_evolutions.csv"),
+        "pack_image": "/img/pack_alt.jpg",
+        "set_code": "meg_web",
+        "template_offset": 0,
+    },
+    "phantasmal_flames": {
+        "name": "Phantasmal Flames",
+        "csv_path": os.path.join(os.path.dirname(__file__), "..", "frontend", "public", "data", "phantasmal_flames.csv"),
+        "pack_image": "/img/ptcg-pfl-bp.png",
+        "set_code": "phantasmal_flames",
+        "template_offset": 2000,
+    },
+}
+
+# Cache for loaded CSV metadata (keyed by pack id).
+_PACK_META: Dict[str, Dict[str, dict]] = {}
+
+
+def get_pack_config(pack_type: str) -> dict:
+    cfg = PACK_REGISTRY.get(pack_type)
+    if not cfg:
+        raise HTTPException(status_code=400, detail=f"Unsupported pack type: {pack_type}")
+    return cfg
+
+
+def pack_set_code(pack_type: Optional[str]) -> Optional[str]:
+    if not pack_type:
+        return None
+    cfg = PACK_REGISTRY.get(pack_type)
+    if cfg:
+        return cfg.get("set_code")
+    # Allow using a raw set_code directly to stay backward compatible.
+    return pack_type
+
+
+def load_pack_data(pack_id: str) -> Dict[str, dict]:
+    """
+    Load and cache CSV rows for a given pack id. Keys are zero-padded numeric tokens.
+    """
+    cfg = PACK_REGISTRY.get(pack_id)
+    if not cfg:
+        return {}
+    if pack_id in _PACK_META:
+        return _PACK_META[pack_id]
+    csv_path = cfg.get("csv_path")
+    if not csv_path or not os.path.exists(csv_path):
+        return {}
+    meta: Dict[str, dict] = {}
+    with open(csv_path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            token = (
+                row.get("token_id")
+                or row.get("Number")
+                or row.get("template_id")
+                or row.get("serial_number")
+            )
+            if not token:
+                continue
+            token_str = str(token)
+            # Use the numeric prefix before any slash to keep compatibility with legacy files.
+            try:
+                numeric = int(token_str.split("/")[0])
+                tid = str(numeric).zfill(3)
+            except Exception:
+                tid = token_str
+            meta[tid] = row
+    _PACK_META[pack_id] = meta
+    return meta
+
+
+def detect_pack_type_from_templates(template_ids: Sequence[Optional[int]], db: Session) -> str:
+    for tmpl_id in template_ids:
+        if tmpl_id is None:
+            continue
+        tmpl = db.get(CardTemplate, tmpl_id)
+        if tmpl and tmpl.set_code:
+            return tmpl.set_code
+    return "meg_web"
+
 # Seed sale constants
 MIN_SEED_CONTRIB_LAMPORTS = 10_000_000  # 0.01 SOL
 SEED_CONTRIBUTION_DISCRIMINATOR = bytes.fromhex("b6bb0e6f48a7f2d4")
@@ -352,6 +445,7 @@ class PackPreviewResponse(BaseModel):
     server_nonce: str
     entropy_proof: str
     slots: List[PackSlot]
+    pack_type: Optional[str] = None
 
 
 class PackBuildRequest(BaseModel):
@@ -372,6 +466,7 @@ class PackBuildResponse(BaseModel):
     lineup: List[PackSlot]
     provably_fair: Dict[str, str]
     instructions: List["InstructionMeta"]
+    pack_type: Optional[str] = None
 
 
 class SessionActionRequest(BaseModel):
@@ -387,6 +482,7 @@ class PackBuildV2Request(BaseModel):
     currency: str = "SOL"
     user_token_account: Optional[str] = None
     vault_token_account: Optional[str] = None
+    pack_type: str = "meg_web"
 
 
 class SessionActionV2Request(BaseModel):
@@ -421,6 +517,7 @@ class PendingSessionResponse(BaseModel):
     lineup: List[PackSlot]
     asset_ids: List[str]
     provably_fair: Dict[str, str]
+    pack_type: Optional[str] = None
 
 
 class KeyMeta(BaseModel):
@@ -440,10 +537,13 @@ class MultiTxResponse(BaseModel):
     txs: List[TxResponse]
 
 class TxResponse(BaseModel):
-    tx_b64: str
-    tx_v0_b64: str
-    recent_blockhash: str
-    instructions: List[InstructionMeta]
+    tx_b64: Optional[str] = None
+    tx_v0_b64: Optional[str] = None
+    message_b64: Optional[str] = None
+    recent_blockhash: Optional[str] = None
+    instructions: List[InstructionMeta] = []
+    admin_signature: Optional[str] = None
+    admin_pubkey: Optional[str] = None
 
 
 class PricingCardResponse(BaseModel):
@@ -1299,23 +1399,42 @@ def rarity_is_low_tier(value: str) -> bool:
     return not rarity_is_rare_plus(value)
 
 
-def pick_template_ids(rng: random.Random, rarities: List[str], db: Session) -> List[Optional[int]]:
+def _template_query_for_rarity(rarity: str):
+    if rarity == "Energy":
+        return select(CardTemplate).where(CardTemplate.is_energy == True)  # noqa: E712
+    norm_value = normalized_rarity(rarity)
+    normalized_column = func.lower(
+        func.replace(
+            func.replace(CardTemplate.rarity, " ", ""),
+            "_",
+            "",
+        )
+    )
+    return select(CardTemplate).where(normalized_column == norm_value)
+
+
+def pick_template_ids(
+    rng: random.Random,
+    rarities: List[str],
+    db: Session,
+    pack_type: Optional[str] = None,
+) -> List[Optional[int]]:
+    """
+    Choose template_ids matching the requested rarities and pack.
+    """
     result: List[Optional[int]] = []
+    pack_code = pack_set_code(pack_type)
     for rarity in rarities:
-        stmt = select(CardTemplate).where(CardTemplate.rarity == rarity)
-        if rarity == "Energy":
-            stmt = select(CardTemplate).where(CardTemplate.is_energy == True)  # noqa: E712
-        else:
-            norm_value = normalized_rarity(rarity)
-            normalized_column = func.lower(
-                func.replace(
-                    func.replace(CardTemplate.rarity, " ", ""),
-                    "_",
-                    "",
-                )
-            )
-            stmt = select(CardTemplate).where(normalized_column == norm_value)
+        stmt = _template_query_for_rarity(rarity)
+        if pack_code:
+            stmt = stmt.where(CardTemplate.set_code == pack_code)
         templates = db.exec(stmt).all()
+        if not templates and pack_code == "meg_web":
+            # Legacy fallback: allow templates without set_code for the default pack.
+            templates = db.exec(_template_query_for_rarity(rarity).where(CardTemplate.set_code.is_(None))).all()
+        if not templates and (pack_code is None or pack_code == "meg_web"):
+            # Final fallback to keep the default pack usable even if the DB is sparse.
+            templates = db.exec(_template_query_for_rarity(rarity)).all()
         if not templates:
             result.append(None)
             continue
@@ -1361,28 +1480,11 @@ def low_tier_virtual_items(rarities: List[str], template_ids: List[Optional[int]
 
 def maybe_spawn_pack_reward(wallet: str, session_id: str, db: Session) -> dict:
     """
-    Mint the configured MOCHI token reward to the user's ATA.
-    On-chain reward (VaultState.reward_per_pack) is treated as canonical; this
-    legacy off-chain mint is used only as a fallback when no on-chain reward is
-    configured.
+    Treasury-transfer the configured MOCHI token reward to the user's ATA.
+    On-chain reward is ignored; V2 uses the server admin treasury as the source
+    of rewards for auditability.
     """
     ensure_pack_reward_log_schema()
-    try:
-        vault_state = vault_state_pda()
-        resp = sol_client.get_account_info(vault_state)
-        if resp.value and resp.value.data:
-            parsed = parse_vault_state_account(bytes(resp.value.data))
-            if parsed and parsed.get("reward_per_pack", 0) > 0 and parsed.get("mochi_mint"):
-                return {
-                    "status": "on_chain",
-                    "mochi_mint": str(parsed["mochi_mint"]),
-                    "reward_per_pack": parsed["reward_per_pack"],
-                    "vault_authority": str(parsed["vault_authority"]),
-                }
-    except Exception:
-        # If we cannot read on-chain config, fall back to legacy behavior below.
-        pass
-
     reward_tokens = getattr(auth_settings, "mochi_pack_reward", 0) or 0
     mint_str = getattr(auth_settings, "mochi_token_mint", None)
     existing = db.get(PackRewardLog, session_id)
@@ -1403,6 +1505,7 @@ def maybe_spawn_pack_reward(wallet: str, session_id: str, db: Session) -> dict:
     admin_pub = admin_kp.pubkey()
     mint_pub = to_pubkey(mint_str)
     user_pub = to_pubkey(wallet)
+    admin_ata = derive_ata(admin_pub, mint_pub)
     dest_ata = derive_ata(user_pub, mint_pub)
     instructions: List[Instruction] = []
     needs_ata = False
@@ -1414,7 +1517,15 @@ def maybe_spawn_pack_reward(wallet: str, session_id: str, db: Session) -> dict:
     if needs_ata:
         instructions.append(build_create_ata_ix(admin_pub, user_pub, mint_pub, dest_ata))
     raw_amount = int(reward_tokens) * (10 ** auth_settings.mochi_token_decimals)
-    instructions.append(build_mint_to_ix(mint_pub, dest_ata, admin_pub, raw_amount))
+    try:
+        bal_resp = sol_client.get_token_account_balance(admin_ata)
+        bal_amount = int(bal_resp["result"]["value"]["amount"]) if isinstance(bal_resp, dict) else int(bal_resp.value.amount)
+    except Exception:
+        return {"status": "failed", "reason": "Failed to fetch admin treasury balance"}
+    if bal_amount < raw_amount:
+        return {"status": "failed", "reason": "Admin Treasury Insufficient Funds"}
+
+    instructions.append(build_spl_transfer_ix(admin_ata, dest_ata, admin_pub, raw_amount))
 
     status = "pending"
     signature = None
@@ -1483,7 +1594,18 @@ def choose_rare_assets_only(
     rarities: List[str],
     wallet: str,
     db: Session,
-):
+) -> tuple[List[int], List[int], List[str]]:
+    return choose_rare_assets_only_for_pack(template_ids, rarities, wallet, db, None)
+
+
+def choose_rare_assets_only_for_pack(
+    template_ids: List[Optional[int]],
+    rarities: List[str],
+    wallet: str,
+    db: Session,
+    pack_type: Optional[str] = None,
+) -> tuple[List[int], List[int], List[str]]:
+    pack_code = pack_set_code(pack_type) or detect_pack_type_from_templates(template_ids, db)
     rare_indices: List[int] = []
     rare_templates: List[int] = []
     rare_assets: List[str] = []
@@ -1494,8 +1616,44 @@ def choose_rare_assets_only(
         tmpl = template_ids[idx]
         if tmpl is None:
             raise HTTPException(status_code=400, detail=f"Missing template for rare slot {idx}")
-        stmt = select(MintRecord).where(MintRecord.template_id == tmpl, MintRecord.status == "available")
+        rarity_filter = func.lower(
+            func.replace(
+                func.replace(MintRecord.rarity, " ", ""),
+                "_",
+                "",
+            )
+        )
+        stmt = (
+            select(MintRecord)
+            .join(CardTemplate, CardTemplate.template_id == MintRecord.template_id)
+            .where(
+                MintRecord.template_id == tmpl,
+                MintRecord.status == "available",
+                rarity_filter.in_(RARE_PLUS_NORMALIZED),
+            )
+        )
+        if pack_code:
+            stmt = stmt.where(
+                CardTemplate.set_code == pack_code,
+                func.lower(
+                    func.replace(
+                        func.replace(CardTemplate.rarity, " ", ""),
+                        "_",
+                        "",
+                    )
+                ).in_(RARE_PLUS_NORMALIZED),
+            )
         record = db.exec(stmt).first()
+        if not record and pack_code:
+            # Fallback for legacy rows without set_code populated.
+            record = (
+                db.exec(
+                    select(MintRecord).where(
+                        MintRecord.template_id == tmpl,
+                        MintRecord.status == "available",
+                    )
+                ).first()
+            )
         if not record:
             raise HTTPException(status_code=400, detail=f"No available asset for template {tmpl} (rare slot {idx})")
         rare_templates.append(tmpl)
@@ -2100,12 +2258,11 @@ def seed_sale_claim(req: SeedClaimRequest):
 
 @app.post("/program/open/preview", response_model=PackPreviewResponse)
 def preview_pack(req: PackPreviewRequest, db: Session = Depends(get_session)):
-    if req.pack_type != "meg_web":
-        raise HTTPException(status_code=400, detail="Unsupported pack type")
+    get_pack_config(req.pack_type)
     nonce = compute_nonce(req.client_seed)
     rng = build_rng(auth_settings.server_seed, req.client_seed)
     rarities = slot_rarities(rng)
-    template_ids = pick_template_ids(rng, rarities, db)
+    template_ids = pick_template_ids(rng, rarities, db, pack_type=req.pack_type)
     slots = [
         PackSlot(slot_index=i, rarity=rarity, template_id=template_ids[i]) for i, rarity in enumerate(rarities)
     ]
@@ -2114,6 +2271,7 @@ def preview_pack(req: PackPreviewRequest, db: Session = Depends(get_session)):
         server_nonce=nonce,
         entropy_proof=entropy_hex(req.client_seed, nonce),
         slots=slots,
+        pack_type=req.pack_type,
     )
 
 
@@ -2124,6 +2282,7 @@ def build_pack(req: PackBuildRequest, db: Session = Depends(get_session)):
 
 @app.post("/program/v2/open/build", response_model=PackBuildResponse)
 def build_pack_v2(req: PackBuildV2Request, db: Session = Depends(get_session)):
+    get_pack_config(req.pack_type)
     is_sol = req.currency.upper() == "SOL"
     if not is_sol:
         if not (req.user_token_account and req.vault_token_account):
@@ -2163,13 +2322,21 @@ def build_pack_v2(req: PackBuildV2Request, db: Session = Depends(get_session)):
     nonce = compute_nonce(req.client_seed)
     rng = build_rng(auth_settings.server_seed, req.client_seed)
     rarities = slot_rarities(rng)
-    template_ids = pick_template_ids(rng, rarities, db)
-    rare_indices, rare_templates, rare_assets = choose_rare_assets_only(template_ids, rarities, req.wallet, db)
+    template_ids = pick_template_ids(rng, rarities, db, pack_type=req.pack_type)
+    rare_indices, rare_templates, rare_assets = choose_rare_assets_only_for_pack(
+        template_ids, rarities, req.wallet, db, req.pack_type
+    )
     rare_card_records = [card_record_pda(vault_state, to_pubkey(asset)) for asset in rare_assets]
     try:
         for cr in rare_card_records:
-            if not pda_exists(cr):
+            resp = sol_client.get_account_info(cr)
+            if resp.value is None or resp.value.data is None:
                 raise HTTPException(status_code=400, detail=f"CardRecord PDA missing on-chain: {cr}")
+            info = parse_card_record_account(bytes(resp.value.data))
+            if not info:
+                raise HTTPException(status_code=400, detail=f"CardRecord unreadable on-chain: {cr}")
+            if not rarity_is_rare_plus(info.get("rarity", "")):
+                raise HTTPException(status_code=400, detail=f"CardRecord rarity too low for pack: {info.get('rarity')}")
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -2250,6 +2417,7 @@ def build_pack_v2(req: PackBuildV2Request, db: Session = Depends(get_session)):
         "templates": templates_to_csv(template_ids),
         "rarities": ",".join(rarities),
         "entropy_proof": entropy_hex(req.client_seed, nonce),
+        "pack_type": req.pack_type,
     }
     session_id = str(pack_session)
     expires_at = time.time() + auth_settings.claim_window_seconds if hasattr(auth_settings, "claim_window_seconds") else time.time() + 3600
@@ -2289,6 +2457,7 @@ def build_pack_v2(req: PackBuildV2Request, db: Session = Depends(get_session)):
         lineup=lineup,
         provably_fair=provably_fair,
         instructions=instrs_meta,
+        pack_type=req.pack_type,
     )
 
 
@@ -2594,15 +2763,10 @@ def confirm_open_v2(req: ConfirmOpenRequest, db: Session = Depends(get_session))
     # Add low-tier virtuals on open (only if we have a usable lineup).
     if rarities and template_ids:
         mutate_virtual_cards(wallet, low_tier_virtual_items(rarities, template_ids), db, direction=1)
-    reward: dict = {
-        "status": "on_chain_only",
-        "reason": "Legacy off-chain rewards disabled; rely on on-chain vault config",
-    }
-    if auth_settings.enable_legacy_offchain_rewards:
-        try:
-            reward = maybe_spawn_pack_reward(wallet, session_id, db)
-        except Exception as exc:  # noqa: BLE001
-            reward = {"status": "failed", "error": str(exc)}
+    try:
+        reward = maybe_spawn_pack_reward(wallet, session_id, db)
+    except Exception as exc:  # noqa: BLE001
+        reward = {"status": "failed", "error": str(exc)}
     return {"state": on_state, "assets": rare_assets, "reward": reward}
 
 
@@ -2933,7 +3097,6 @@ def profile(wallet: str):
 
 
 # ----------- Metadata bridge (mochims.fun -> getmochi.fun) -----------
-_MEGA_META: Dict[str, dict] = {}
 _ENERGY_IMAGES: Dict[str, str] = {
     "189": "https://getmochi.fun/img/meg_web/energy_grass.png",
     "190": "https://getmochi.fun/img/meg_web/energy_fire.png",
@@ -2946,27 +3109,11 @@ _ENERGY_IMAGES: Dict[str, str] = {
 }
 
 
-def load_mega_csv():
-    """Load mega evolution metadata rows once for dynamic JSON responses."""
-    if _MEGA_META:
-        return
-    csv_path = os.path.join(os.path.dirname(__file__), "..", "frontend", "public", "data", "mega_evolutions.csv")
-    if not os.path.exists(csv_path):
-        return
-    with open(csv_path, newline="", encoding="utf-8") as fh:
-        reader = csv.DictReader(fh)
-        for row in reader:
-            tid = row.get("token_id") or row.get("Number")
-            if not tid:
-                continue
-            _MEGA_META[str(int(tid)).zfill(3)] = row
-
-
 @app.get("/nft/metadata/mega-evolutions/{token_id}.json")
 def mega_metadata(token_id: str):
-    load_mega_csv()
+    meta = load_pack_data("mega_evolutions")
     tid = token_id.zfill(3)
-    row = _MEGA_META.get(tid, {})
+    row = meta.get(tid, {})
     is_energy = int(tid) >= 189
     image = row.get("image_url")
     if is_energy:
@@ -3037,6 +3184,7 @@ def get_pending_session_v2(wallet: str, db: Session = Depends(get_session)):
     # Build rare set from on-chain rare_cards
     rare_templates = set(info.get("rare_templates", []) or [])
     rare_indices = {idx for idx, r in enumerate(rarities) if rarity_is_rare_plus(r)}
+    pack_type = detect_pack_type_from_templates(templates, db)
     # If mirror missing, fallback minimal
     if not rarities and mirror:
         rarities = mirror.rarities.split(",") if mirror.rarities else []
@@ -3061,6 +3209,7 @@ def get_pending_session_v2(wallet: str, db: Session = Depends(get_session)):
         "assets": ",".join(assets),
         "rarities": ",".join(rarities),
         "templates": ",".join(str(t) for t in templates),
+        "pack_type": pack_type,
     }
 
     # Upsert mirror to match on-chain
@@ -3096,6 +3245,7 @@ def get_pending_session_v2(wallet: str, db: Session = Depends(get_session)):
         lineup=lineup,
         asset_ids=assets,
         provably_fair=provably_fair,
+        pack_type=pack_type,
     )
 
 
@@ -3147,43 +3297,83 @@ def recycle_build(req: RecycleBuildRequest, db: Session = Depends(get_session)):
     admin_kp = load_admin_keypair()
     admin_pub = admin_kp.pubkey()
     mint_pub = to_pubkey(mint_str)
+    user_pub = to_pubkey(req.wallet)
+    admin_ata = derive_ata(admin_pub, mint_pub)
+    # Ensure destination ATA matches the canonical PDA for the user/mint.
     dest_token = to_pubkey(req.user_token_account)
-    create_ix = None
+    expected_ata = derive_ata(user_pub, mint_pub)
+    if dest_token != expected_ata:
+        dest_token = expected_ata
+
+    # Validate admin treasury balance.
+    try:
+        bal_resp = sol_client.get_token_account_balance(admin_ata)
+        bal_amount = int(bal_resp["result"]["value"]["amount"]) if isinstance(bal_resp, dict) else int(bal_resp.value.amount)
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to fetch admin treasury balance")
+    if bal_amount < reward_amount:
+        raise HTTPException(status_code=500, detail="Admin Treasury Insufficient Funds")
+
+    instructions: List[Instruction] = []
+    needs_ata = False
     try:
         ata_info = sol_client.get_account_info(dest_token)
-        if ata_info.value is None:
-            # payer = user so user covers rent/fees
-            create_ix = build_create_ata_ix(to_pubkey(req.wallet), to_pubkey(req.wallet), mint_pub)
+        needs_ata = ata_info.value is None
     except Exception:
-        # fallback: attempt create with user as payer
-        create_ix = build_create_ata_ix(to_pubkey(req.wallet), to_pubkey(req.wallet), mint_pub)
-    mint_ix = build_mint_to_ix(mint_pub, dest_token, admin_pub, reward_amount)
+        needs_ata = True
+    if needs_ata:
+        # User is the payer to cover rent/fees for their ATA.
+        instructions.append(build_create_ata_ix(payer=user_pub, owner=user_pub, mint=mint_pub, ata=dest_token))
+
+    # Transfer from admin treasury ATA to user ATA; admin signs as owner, user pays fees.
+    instructions.append(build_spl_transfer_ix(admin_ata, dest_token, admin_pub, reward_amount))
+
     blockhash = get_latest_blockhash()
-    instructions = [ix for ix in [create_ix, mint_ix] if ix is not None]
-    # Payer = user; admin pre-signs mint authority. We partially sign for admin and leave payer slot empty for wallet.
-    message = MessageV0.try_compile(to_pubkey(req.wallet), instructions, [], Hash.from_string(blockhash))
+    message = MessageV0.try_compile(user_pub, instructions, [], Hash.from_string(blockhash))
     required = message.header.num_required_signatures
-    sigs = [Signature.default() for _ in range(required)]
     if required < 2:
         raise HTTPException(status_code=500, detail="Recycle tx missing expected signers")
-    # Assume signer order: 0 = payer (user), 1 = admin mint authority.
-    sigs[1] = admin_kp.sign_message(bytes(message))
-    tx = VersionedTransaction.populate(message, sigs)
-    tx_b64 = base64.b64encode(bytes(tx)).decode()
-    tx_v0_b64 = tx_b64  # already versioned message
-    instr = wrap_instruction_meta(instruction_to_dict(mint_ix))
+
+    sigs = [Signature.default() for _ in range(required)]
+    try:
+        # Signer slots align with the first `required` message.account_keys entries; locate admin dynamically.
+        admin_index = list(message.account_keys).index(admin_pub)
+    except ValueError:
+        raise HTTPException(status_code=500, detail="Admin mint authority missing from transaction keys")
+    if admin_index >= required:
+        raise HTTPException(status_code=500, detail="Admin signature index outside required signer set")
+
+    try:
+        # solders MessageV0 does not expose serialize(); bytes(message) yields the canonical encoding
+        message_bytes = bytes(message)
+    except Exception:
+        message_bytes = message.to_bytes() if hasattr(message, "to_bytes") else bytes(message)
+    admin_sig = admin_kp.sign_message(message_bytes)
+    sigs[admin_index] = admin_sig
+
+    message_b64 = base64.b64encode(message_bytes).decode()
+    instrs_meta = [wrap_instruction_meta(instruction_to_dict(ix)) for ix in instructions]
 
     return TxResponse(
-        tx_b64=tx_b64,
-        tx_v0_b64=tx_v0_b64,
+        tx_b64=None,
+        tx_v0_b64=None,
+        message_b64=message_b64,
         recent_blockhash=blockhash,
-        instructions=[instr],
+        instructions=instrs_meta,
+        admin_signature=None,
+        admin_pubkey=None,
     )
 
 
 class RecycleConfirmRequest(BaseModel):
     wallet: str
     signature: str
+    items: List[RecycleItem]
+
+
+class RecycleSubmitRequest(BaseModel):
+    wallet: str
+    signed_tx_b64: str
     items: List[RecycleItem]
 
 
@@ -3223,6 +3413,109 @@ def recycle_confirm(req: RecycleConfirmRequest, db: Session = Depends(get_sessio
     db.commit()
 
     return {"ok": True, "signature": req.signature, "reward_amount": reward_amount, "total_cards": total_cards}
+
+
+@app.post("/profile/recycle/submit")
+def recycle_submit(req: RecycleSubmitRequest, db: Session = Depends(get_session)):
+    if not req.items:
+        raise HTTPException(status_code=400, detail="No items provided for recycle")
+
+    # Validate inventory
+    balance: Dict[int, int] = {}
+    stmt = select(VirtualCard).where(VirtualCard.wallet == req.wallet)
+    for row in db.exec(stmt).all():
+        balance[row.template_id] = row.count
+    total_cards = 0
+    for item in req.items:
+        have = balance.get(item.template_id, 0)
+        if have < item.count:
+            raise HTTPException(status_code=400, detail=f"Not enough virtual cards for template {item.template_id}")
+        total_cards += item.count
+    if total_cards <= 0:
+        raise HTTPException(status_code=400, detail="Select at least one card to recycle")
+
+    # Decode user-signed tx
+    try:
+        tx_bytes = base64.b64decode(req.signed_tx_b64)
+        user_tx = VersionedTransaction.from_bytes(tx_bytes)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Invalid signed transaction: {exc}") from exc
+
+    admin_kp = load_admin_keypair()
+    admin_pub = admin_kp.pubkey()
+    msg = user_tx.message
+    signer_keys = list(msg.account_keys) if hasattr(msg, "account_keys") else list(msg.static_account_keys)  # type: ignore[attr-defined]
+    required = msg.header.num_required_signatures
+    if not signer_keys or len(signer_keys) < required:
+        raise HTTPException(status_code=400, detail="Transaction missing expected signer keys")
+    # Ensure wallet matches payer
+    try:
+        payer_in_tx = signer_keys[0]
+    except Exception:
+        payer_in_tx = None
+    if payer_in_tx is None or str(payer_in_tx) != req.wallet:
+        raise HTTPException(status_code=400, detail="Payer mismatch in submitted transaction")
+
+    try:
+        # solders Message/MessageV0 supports bytes() for canonical encoding
+        message_bytes = bytes(msg)
+    except Exception:
+        message_bytes = msg.to_bytes() if hasattr(msg, "to_bytes") else bytes(msg)
+    admin_sig = admin_kp.sign_message(message_bytes)
+
+    sigs: List[Signature] = list(user_tx.signatures)
+    # Pad signatures if needed
+    while len(sigs) < required:
+        sigs.append(Signature.default())
+    try:
+        admin_index = signer_keys.index(admin_pub)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Admin mint authority missing from transaction keys")
+    sigs[admin_index] = admin_sig
+
+    merged_tx = VersionedTransaction.populate(msg, sigs)
+    try:
+        # verify signatures locally before send if supported
+        if hasattr(merged_tx, "verify_with_results"):
+            merged_tx.verify_with_results()
+    except Exception:
+        # proceed to RPC which will enforce signature validity
+        pass
+
+    # Broadcast
+    try:
+        resp = sol_client.send_raw_transaction(bytes(merged_tx), opts=TxOpts(skip_preflight=False))
+        tx_sig = resp.get("result") if isinstance(resp, dict) else str(resp)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Failed to send transaction: {exc}") from exc
+
+    try:
+        sol_client.confirm_transaction(tx_sig, commitment="confirmed")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Failed to confirm transaction: {exc}") from exc
+
+    # Re-validate and deduct inventory
+    balance = {}
+    stmt = select(VirtualCard).where(VirtualCard.wallet == req.wallet)
+    for row in db.exec(stmt).all():
+        balance[row.template_id] = row.count
+    total_cards = 0
+    for item in req.items:
+        have = balance.get(item.template_id, 0)
+        if have < item.count:
+            raise HTTPException(status_code=400, detail=f"Not enough virtual cards for template {item.template_id}")
+        total_cards += item.count
+    reward_amount = total_cards * (10 ** auth_settings.mochi_token_decimals)
+
+    expanded: List[tuple[int, str]] = []
+    for item in req.items:
+        for _ in range(item.count):
+            expanded.append((item.template_id, item.rarity))
+    mutate_virtual_cards(req.wallet, expanded, db, direction=-1)
+    db.add(RecycleLog(wallet=req.wallet, total_cards=total_cards, reward_amount=reward_amount))
+    db.commit()
+
+    return {"ok": True, "signature": tx_sig, "reward_amount": reward_amount, "total_cards": total_cards}
 
 
 @app.get("/marketplace/listings", response_model=List[ListingView])
@@ -3519,17 +3812,95 @@ def marketplace_cancel(req: MarketplaceActionRequest, db: Session = Depends(get_
 
 
 @app.get("/admin/inventory/rarity")
-def admin_inventory(db: Session = Depends(get_session)):
+def admin_inventory(pack_type: Optional[str] = None, db: Session = Depends(get_session)):
+    pack_code = pack_set_code(pack_type)
     stmt = select(MintRecord)
+    if pack_code:
+        stmt = stmt.join(CardTemplate, CardTemplate.template_id == MintRecord.template_id).where(
+            or_(
+                CardTemplate.set_code == pack_code,
+                and_(pack_code == "meg_web", CardTemplate.set_code.is_(None)),
+            )
+        )
     rows = db.exec(stmt).all()
     counts: Dict[str, int] = {}
     for row in rows:
         counts[row.rarity] = counts.get(row.rarity, 0) + 1
     vrows = db.exec(select(VirtualCard)).all()
     for row in vrows:
+        tmpl = db.get(CardTemplate, row.template_id) if row.template_id is not None else None
+        if pack_code:
+            if not tmpl:
+                continue
+            allowed = {pack_code}
+            if pack_code == "meg_web":
+                allowed.add(None)
+            if tmpl.set_code not in allowed:
+                continue
         key = f"virtual_{row.rarity}"
         counts[key] = counts.get(key, 0) + row.count
     return counts
+
+
+@app.get("/admin/inventory/pack_stock")
+def admin_inventory_pack_stock(pack_type: str, db: Session = Depends(get_session)):
+    cfg = get_pack_config(pack_type)
+    pack_code = cfg.get("set_code")
+    tmpl_stmt = select(CardTemplate).where(
+        or_(
+            CardTemplate.set_code == pack_code,
+            and_(pack_code == "meg_web", CardTemplate.set_code.is_(None)),
+        )
+    )
+    templates = db.exec(tmpl_stmt).all()
+    if pack_code == "meg_web" and not templates:
+        templates = db.exec(select(CardTemplate).where(CardTemplate.set_code.is_(None))).all()
+    # Debug log to trace stock queries per pack.
+    try:
+        print(
+            f"[pack_stock_debug] pack_type={pack_type} pack_code={pack_code} template_count={len(templates)} db={auth_settings.database_url}"
+        )
+    except Exception:
+        pass
+    tmpl_lookup = {t.template_id: t for t in templates}
+    if not tmpl_lookup:
+        return []
+    tmpl_ids = list(tmpl_lookup.keys())
+    recs = db.exec(select(MintRecord).where(MintRecord.template_id.in_(tmpl_ids))).all()
+    stock: Dict[int, Dict[str, object]] = {}
+    for rec in recs:
+        tmpl_id = rec.template_id
+        if tmpl_id not in tmpl_lookup:
+            continue
+        entry = stock.setdefault(
+            tmpl_id,
+            {
+                "template_id": tmpl_id,
+                "name": tmpl_lookup[tmpl_id].card_name,
+                "rarity": tmpl_lookup[tmpl_id].rarity,
+                "variant": tmpl_lookup[tmpl_id].variant,
+                "remaining": 0,
+                "total": 0,
+            },
+        )
+        entry["total"] = int(entry.get("total", 0)) + 1
+        if rec.status == "available":
+            entry["remaining"] = int(entry.get("remaining", 0)) + 1
+    # Ensure templates without any MintRecords appear with zeros.
+    for tmpl_id, tmpl in tmpl_lookup.items():
+        stock.setdefault(
+            tmpl_id,
+            {
+                "template_id": tmpl_id,
+                "name": tmpl.card_name,
+                "rarity": tmpl.rarity,
+                "variant": tmpl.variant,
+                "remaining": 0,
+                "total": 0,
+            },
+        )
+    # Return sorted by template_id for determinism.
+    return [stock[k] for k in sorted(stock.keys())]
 
 
 @app.get("/pricing/rarity")

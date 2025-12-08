@@ -64,6 +64,7 @@ If you must scrape from the VPS directly, set `POKEMONTCG_PROXY` and rerun the s
 - Devnet-first. RPC via Helius (set `HELIUS_RPC_URL`).
 - Wallets: generated keypairs live in `anchor-program/keys/`. `passkey.json` is the authority key; `program-id.json` is the program deploy key.
 - Treasury: set `TREASURY_WALLET` (defaults to `PLATFORM_WALLET`) for marketplace fees/buyback payouts.
+- Mochi token V2: mint `GS99uG5mWq3YtENvdxDdkrixtez3vUvAykZWoqfJETZv` (decimals=6). Allocations live in `docs/MIGRATION_V2.md`; server admin ATA `831fnahUncbMNznw79BtqAbsKGvvDZ2HefEhmQrv8CqW` holds 10M for recycle/reward flows. V1 token `2iL86t...` is deprecated.
 - Backend tx builders return message base64 (`tx_b64`), unsigned v0 tx (`tx_v0_b64`), instruction metadata, and `recent_blockhash` for client signing.
 - RNG provably-fair: `server_seed_hash` (commit), `server_nonce = sha256(server_seed_hash:client_seed)[:16]`, entropy = `sha256(server_seed:client_seed:server_nonce)`. Preview/build return `server_seed_hash`, `server_nonce`, and `entropy_proof` so users can verify slot lineups.
 - Timekeeping: prefer ISO-8601 (`YYYY-MM-DDTHH:MM:SSZ`). Install MCP time server (`pip install mcp-server-time` or `uvx mcp-server-time`) to keep logs accurate; see `docs/mcp_time.md`.

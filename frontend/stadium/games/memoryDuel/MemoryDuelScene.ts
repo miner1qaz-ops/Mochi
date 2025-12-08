@@ -71,7 +71,7 @@ export class MemoryDuelScene extends Phaser.Scene {
         this.load.image(key, `/img/pokemon/${key}.png`);
       }
     });
-    this.load.image("card-back", "/img/card_back.png");
+    this.load.image("card-back", "/card_back.png");
     this.createSparkTexture();
   }
 
@@ -85,7 +85,7 @@ export class MemoryDuelScene extends Phaser.Scene {
   private addTitle() {
     const centerX = this.scale.width / 2;
     this.add
-      .text(centerX, 18, "Memory Duel", {
+      .text(centerX, 12, "Memory Duel", {
         fontSize: "26px",
         fontFamily: "Inter, 'Segoe UI', sans-serif",
         color: "#ffffff",
@@ -93,7 +93,7 @@ export class MemoryDuelScene extends Phaser.Scene {
       })
       .setOrigin(0.5, 0);
     this.add
-      .text(centerX, 50, "Flip pairs. Match to score. Bot remembers seen cards.", {
+      .text(centerX, 42, "Flip pairs. Match to score. Bot remembers seen cards.", {
         fontSize: "14px",
         fontFamily: "Inter, 'Segoe UI', sans-serif",
         color: "#dbeafe",
@@ -130,7 +130,7 @@ export class MemoryDuelScene extends Phaser.Scene {
     const gridW = this.sceneConfig.cols * cardW + (this.sceneConfig.cols - 1) * gap;
     const gridH = this.sceneConfig.rows * cardH + (this.sceneConfig.rows - 1) * gap;
     const startX = this.scale.width / 2 - gridW / 2 + cardW / 2;
-    const startY = 140 + cardH / 2;
+    const startY = 130 + cardH / 2;
 
     this.cards.forEach((card, index) => {
       const col = index % this.sceneConfig.cols;

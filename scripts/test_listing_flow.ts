@@ -1,3 +1,4 @@
+import assert from 'assert';
 import fs from 'fs';
 import path from 'path';
 import { Keypair, PublicKey, Connection, Transaction, SystemProgram, TransactionInstruction } from '@solana/web3.js';
@@ -66,6 +67,74 @@ function encodeListCard(priceLamports: bigint, currencyMint: PublicKey | null, t
   return buf.slice(0, o);
 }
 
+enum CardStatus {
+  Available = 0,
+  Reserved = 1,
+  UserOwned = 2,
+  RedeemPending = 3,
+  Burned = 4,
+  Deprecated = 5,
+}
+
+enum ListingStatus {
+  Active = 0,
+  Filled = 1,
+  Cancelled = 2,
+  Burned = 3,
+  Deprecated = 4,
+}
+
+type ListingAccount = {
+  vaultState: PublicKey;
+  seller: PublicKey;
+  coreAsset: PublicKey;
+  priceLamports: bigint;
+  currencyMint: PublicKey | null;
+  status: ListingStatus;
+};
+
+type CardRecordAccount = {
+  vaultState: PublicKey;
+  coreAsset: PublicKey;
+  templateId: number;
+  rarity: number;
+  status: CardStatus;
+  owner: PublicKey;
+};
+
+function decodeListingAccount(data: Buffer): ListingAccount {
+  if (data.length < 8 + 32 * 3 + 8 + 1 + 1) {
+    throw new Error('Listing account data too short');
+  }
+  let o = 8; // skip discriminator
+  const vaultState = new PublicKey(data.slice(o, o + 32)); o += 32;
+  const seller = new PublicKey(data.slice(o, o + 32)); o += 32;
+  const coreAsset = new PublicKey(data.slice(o, o + 32)); o += 32;
+  const priceLamports = data.readBigUInt64LE(o); o += 8;
+  const hasCurrency = data.readUInt8(o); o += 1;
+  let currencyMint: PublicKey | null = null;
+  if (hasCurrency) {
+    currencyMint = new PublicKey(data.slice(o, o + 32));
+    o += 32;
+  }
+  const status = data.readUInt8(o) as ListingStatus;
+  return { vaultState, seller, coreAsset, priceLamports, currencyMint, status };
+}
+
+function decodeCardRecord(data: Buffer): CardRecordAccount {
+  if (data.length < 8 + 32 * 3 + 4 + 1 + 1) {
+    throw new Error('CardRecord account data too short');
+  }
+  let o = 8; // skip discriminator
+  const vaultState = new PublicKey(data.slice(o, o + 32)); o += 32;
+  const coreAsset = new PublicKey(data.slice(o, o + 32)); o += 32;
+  const templateId = data.readUInt32LE(o); o += 4;
+  const rarity = data.readUInt8(o); o += 1;
+  const status = data.readUInt8(o) as CardStatus; o += 1;
+  const owner = new PublicKey(data.slice(o, o + 32));
+  return { vaultState, coreAsset, templateId, rarity, status, owner };
+}
+
 async function main() {
   const seller = loadKeypair(SELLER_PATH);
   const conn = new Connection('https://api.devnet.solana.com', 'confirmed');
@@ -100,6 +169,43 @@ async function main() {
   const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: false });
   await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, 'confirmed');
   console.log('Listed successfully, sig', sig);
+
+  const listingInfo = await conn.getAccountInfo(listing, 'confirmed');
+  const cardRecordInfo = await conn.getAccountInfo(cardRecord, 'confirmed');
+  assert(cardRecordInfo?.data, 'CardRecord account missing on-chain');
+  assert(listingInfo?.data, 'Listing account missing on-chain');
+
+  const listingAccount = decodeListingAccount(listingInfo.data);
+  const cardRecordAccount = decodeCardRecord(cardRecordInfo.data);
+
+  assert.strictEqual(
+    listingAccount.vaultState.toBase58(),
+    MARKET_VAULT_STATE.toBase58(),
+    'Listing PDA must target the canonical market vault',
+  );
+  assert.strictEqual(
+    listingAccount.seller.toBase58(),
+    seller.publicKey.toBase58(),
+    'Listing seller should be the signer',
+  );
+  assert.strictEqual(listingAccount.status, ListingStatus.Active, 'Listing status should initialize as Active');
+
+  assert.strictEqual(
+    cardRecordAccount.vaultState.toBase58(),
+    MARKET_VAULT_STATE.toBase58(),
+    'CardRecord PDA must target the canonical market vault',
+  );
+  assert.strictEqual(
+    cardRecordAccount.owner.toBase58(),
+    MARKET_VAULT_AUTH.toBase58(),
+    'CardRecord custody should transfer to vault authority on list',
+  );
+  assert.strictEqual(
+    cardRecordAccount.status,
+    CardStatus.Reserved,
+    'CardRecord status should be Reserved after listing',
+  );
+  console.log('Validated Listing and CardRecord PDAs were initialized correctly.');
 }
 
 main().catch((err) => {
