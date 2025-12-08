@@ -31,7 +31,7 @@ const CSV_PATH =
 const KEYPAIR_PATH = path.join(__dirname, '../anchor-program/keys/dev-authority.json');
 const RPC = process.env.SOLANA_RPC || 'https://api.devnet.solana.com';
 const JSON_BASE =
-  process.env.CORE_METADATA_BASE || 'https://mochims.fun/nft/metadata/phantasmal_flames';
+  process.env.CORE_METADATA_BASE || 'https://getmochi.fun/nft/metadata/phantasmal_flames';
 
 interface TemplateRow {
   templateId: number;

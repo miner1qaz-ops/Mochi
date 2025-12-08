@@ -9,6 +9,7 @@ import random
 import time
 import uuid
 from typing import Dict, List, Optional, Sequence, Tuple
+import logging
 
 import requests
 from fastapi import Depends, FastAPI, HTTPException
@@ -106,6 +107,8 @@ class Settings(BaseSettings):
 
 
 auth_settings = Settings()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("mochi")
 
 
 engine = create_engine(auth_settings.database_url)
@@ -1487,19 +1490,29 @@ def maybe_spawn_pack_reward(wallet: str, session_id: str, db: Session) -> dict:
     ensure_pack_reward_log_schema()
     reward_tokens = getattr(auth_settings, "mochi_pack_reward", 0) or 0
     mint_str = getattr(auth_settings, "mochi_token_mint", None)
+    logger.info(
+        "pack_reward_check wallet=%s session=%s reward_tokens=%s mint=%s",
+        wallet,
+        session_id,
+        reward_tokens,
+        mint_str,
+    )
     existing = db.get(PackRewardLog, session_id)
     if existing and existing.status == "success":
+        logger.info("pack_reward_skip existing_success wallet=%s session=%s sig=%s", wallet, session_id, existing.signature)
         return {
             "status": "success",
             "signature": existing.signature,
             "amount": existing.reward_amount,
         }
     if reward_tokens <= 0 or not mint_str:
+        logger.info("Pack reward skipped: MOCHI_PACK_REWARD<=0 or mint not configured (env-driven only, ignoring on-chain config)")
         return {"status": "skipped", "reason": "Reward disabled or mint not configured"}
 
     try:
         admin_kp = load_admin_keypair()
     except Exception as exc:  # noqa: BLE001
+        logger.error("pack_reward_failed admin key unavailable wallet=%s session=%s error=%s", wallet, session_id, exc, exc_info=True)
         return {"status": "failed", "reason": f"Admin key unavailable: {exc}"}
 
     admin_pub = admin_kp.pubkey()
@@ -1521,8 +1534,17 @@ def maybe_spawn_pack_reward(wallet: str, session_id: str, db: Session) -> dict:
         bal_resp = sol_client.get_token_account_balance(admin_ata)
         bal_amount = int(bal_resp["result"]["value"]["amount"]) if isinstance(bal_resp, dict) else int(bal_resp.value.amount)
     except Exception:
+        logger.error("pack_reward_failed balance_fetch wallet=%s session=%s ata=%s", wallet, session_id, admin_ata, exc_info=True)
         return {"status": "failed", "reason": "Failed to fetch admin treasury balance"}
     if bal_amount < raw_amount:
+        logger.error(
+            "pack_reward_failed insufficient_funds wallet=%s session=%s ata=%s have=%s need=%s",
+            wallet,
+            session_id,
+            admin_ata,
+            bal_amount,
+            raw_amount,
+        )
         return {"status": "failed", "reason": "Admin Treasury Insufficient Funds"}
 
     instructions.append(build_spl_transfer_ix(admin_ata, dest_ata, admin_pub, raw_amount))
@@ -1538,9 +1560,11 @@ def maybe_spawn_pack_reward(wallet: str, session_id: str, db: Session) -> dict:
         resp = sol_client.send_raw_transaction(bytes(tx), opts=TxOpts(skip_preflight=False))
         signature = resp.get("result") if isinstance(resp, dict) else str(resp)
         status = "success"
+        logger.info("Pack reward sent via treasury transfer (env MOCHI_PACK_REWARD=%s) to %s; sig=%s", reward_tokens, wallet, signature)
     except Exception as exc:  # noqa: BLE001
         status = "failed"
         error = str(exc)
+        logger.warning("Pack reward transfer failed (env MOCHI_PACK_REWARD=%s) to %s: %s", reward_tokens, wallet, exc, exc_info=True)
 
     log = existing or PackRewardLog(
         session_id=session_id,
@@ -1574,9 +1598,23 @@ def choose_assets_for_templates(
         if tmpl is None:
             asset_ids.append("")
             continue
-        stmt = select(MintRecord).where(MintRecord.template_id == tmpl, MintRecord.status == "available")
-        record = db.exec(stmt).first()
-        if not record:
+        stmt = (
+            select(MintRecord)
+            .where(
+                MintRecord.template_id == tmpl,
+                MintRecord.status == "available",
+                MintRecord.is_fake == False,  # noqa: E712
+            )
+        )
+        record = None
+        for cand in db.exec(stmt).all():
+            try:
+                to_pubkey(cand.asset_id)
+            except Exception:
+                continue
+            record = cand
+            break
+        if record is None:
             raise HTTPException(status_code=400, detail=f"No available asset for template {tmpl} (slot {idx})")
         if reserve:
             record.status = "reserved"
@@ -1630,6 +1668,7 @@ def choose_rare_assets_only_for_pack(
                 MintRecord.template_id == tmpl,
                 MintRecord.status == "available",
                 rarity_filter.in_(RARE_PLUS_NORMALIZED),
+                MintRecord.is_fake == False,  # noqa: E712
             )
         )
         if pack_code:
@@ -1643,18 +1682,25 @@ def choose_rare_assets_only_for_pack(
                     )
                 ).in_(RARE_PLUS_NORMALIZED),
             )
-        record = db.exec(stmt).first()
-        if not record and pack_code:
+        candidates = db.exec(stmt).all()
+        if not candidates and pack_code:
             # Fallback for legacy rows without set_code populated.
-            record = (
-                db.exec(
-                    select(MintRecord).where(
-                        MintRecord.template_id == tmpl,
-                        MintRecord.status == "available",
-                    )
-                ).first()
-            )
-        if not record:
+            candidates = db.exec(
+                select(MintRecord).where(
+                    MintRecord.template_id == tmpl,
+                    MintRecord.status == "available",
+                    MintRecord.is_fake == False,  # noqa: E712
+                )
+            ).all()
+        record = None
+        for cand in candidates:
+            try:
+                to_pubkey(cand.asset_id)
+            except Exception:
+                continue
+            record = cand
+            break
+        if record is None:
             raise HTTPException(status_code=400, detail=f"No available asset for template {tmpl} (rare slot {idx})")
         rare_templates.append(tmpl)
         rare_assets.append(record.asset_id)
@@ -2699,6 +2745,7 @@ def confirm_open_v2(req: ConfirmOpenRequest, db: Session = Depends(get_session))
         raise HTTPException(status_code=400, detail=f"Unexpected on-chain session state {on_state}")
 
     session_id = str(pack_session)
+    reward_session_id = f"{session_id}:{int(info.get('created_at', 0) or 0)}"
     mirror = db.get(SessionMirror, session_id)
     rarities = mirror.rarities.split(",") if mirror and mirror.rarities else []
     template_ids = parse_templates(mirror.template_ids) if mirror and mirror.template_ids else []
@@ -2764,7 +2811,7 @@ def confirm_open_v2(req: ConfirmOpenRequest, db: Session = Depends(get_session))
     if rarities and template_ids:
         mutate_virtual_cards(wallet, low_tier_virtual_items(rarities, template_ids), db, direction=1)
     try:
-        reward = maybe_spawn_pack_reward(wallet, session_id, db)
+        reward = maybe_spawn_pack_reward(wallet, reward_session_id, db)
     except Exception as exc:  # noqa: BLE001
         reward = {"status": "failed", "error": str(exc)}
     return {"state": on_state, "assets": rare_assets, "reward": reward}
@@ -2856,7 +2903,18 @@ def retry_reward(req: RewardRetryRequest, db: Session = Depends(get_session)):
     session_id = req.session_id
     if not session_id:
         vault_state = vault_state_pda()
-        session_id = str(pack_session_v2_pda(vault_state, to_pubkey(wallet)))
+        session_pda = pack_session_v2_pda(vault_state, to_pubkey(wallet))
+        session_id = str(session_pda)
+        # Attempt to include created_at in the key for uniqueness.
+        try:
+            resp = sol_client.get_account_info(session_pda)
+            if resp.value and resp.value.data:
+                info = parse_pack_session_v2_account(bytes(resp.value.data))
+                created_at = int(info.get("created_at", 0) or 0) if info else 0
+                if created_at:
+                    session_id = f"{session_id}:{created_at}"
+        except Exception:
+            pass
     ensure_pack_reward_log_schema()
     result = maybe_spawn_pack_reward(wallet, session_id, db)
     return {"session_id": session_id, "reward": result}
@@ -3096,7 +3154,7 @@ def profile(wallet: str):
     return {"wallet": wallet, "assets": assets}
 
 
-# ----------- Metadata bridge (mochims.fun -> getmochi.fun) -----------
+# ----------- Metadata bridge (getmochi.fun) -----------
 _ENERGY_IMAGES: Dict[str, str] = {
     "189": "https://getmochi.fun/img/meg_web/energy_grass.png",
     "190": "https://getmochi.fun/img/meg_web/energy_fire.png",
@@ -3420,7 +3478,7 @@ def recycle_submit(req: RecycleSubmitRequest, db: Session = Depends(get_session)
     if not req.items:
         raise HTTPException(status_code=400, detail="No items provided for recycle")
 
-    # Validate inventory
+    # Validate inventory before broadcast
     balance: Dict[int, int] = {}
     stmt = select(VirtualCard).where(VirtualCard.wallet == req.wallet)
     for row in db.exec(stmt).all():
@@ -3483,39 +3541,62 @@ def recycle_submit(req: RecycleSubmitRequest, db: Session = Depends(get_session)
         pass
 
     # Broadcast
+    tx_sig = None
     try:
         resp = sol_client.send_raw_transaction(bytes(merged_tx), opts=TxOpts(skip_preflight=False))
         tx_sig = resp.get("result") if isinstance(resp, dict) else str(resp)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"Failed to send transaction: {exc}") from exc
 
+    confirm_error = None
     try:
         sol_client.confirm_transaction(tx_sig, commitment="confirmed")
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=f"Failed to confirm transaction: {exc}") from exc
+        # Do not fail post-broadcast; log and continue to DB updates.
+        confirm_error = exc
+        logger.warning("Recycle confirm warning for tx %s: %s", tx_sig, exc, exc_info=True)
 
-    # Re-validate and deduct inventory
-    balance = {}
-    stmt = select(VirtualCard).where(VirtualCard.wallet == req.wallet)
-    for row in db.exec(stmt).all():
-        balance[row.template_id] = row.count
-    total_cards = 0
-    for item in req.items:
-        have = balance.get(item.template_id, 0)
-        if have < item.count:
-            raise HTTPException(status_code=400, detail=f"Not enough virtual cards for template {item.template_id}")
-        total_cards += item.count
+    post_tx_error = None
     reward_amount = total_cards * (10 ** auth_settings.mochi_token_decimals)
+    try:
+        # Re-validate and deduct inventory
+        balance = {}
+        stmt = select(VirtualCard).where(VirtualCard.wallet == req.wallet)
+        for row in db.exec(stmt).all():
+            balance[row.template_id] = row.count
+        total_cards = 0
+        for item in req.items:
+            have = balance.get(item.template_id, 0)
+            if have < item.count:
+                raise HTTPException(status_code=400, detail=f"Not enough virtual cards for template {item.template_id}")
+            total_cards += item.count
 
-    expanded: List[tuple[int, str]] = []
-    for item in req.items:
-        for _ in range(item.count):
-            expanded.append((item.template_id, item.rarity))
-    mutate_virtual_cards(req.wallet, expanded, db, direction=-1)
-    db.add(RecycleLog(wallet=req.wallet, total_cards=total_cards, reward_amount=reward_amount))
-    db.commit()
+        expanded: List[tuple[int, str]] = []
+        for item in req.items:
+            for _ in range(item.count):
+                expanded.append((item.template_id, item.rarity))
+        mutate_virtual_cards(req.wallet, expanded, db, direction=-1)
+        db.add(RecycleLog(wallet=req.wallet, total_cards=total_cards, reward_amount=reward_amount))
+        db.commit()
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        post_tx_error = exc
+        logger.critical(
+            "CRITICAL_DESYNC recycle_submit: broadcast tx %s for wallet %s succeeded but DB update failed; items=%s; error=%s",
+            tx_sig,
+            req.wallet,
+            req.items,
+            exc,
+            exc_info=True,
+        )
 
-    return {"ok": True, "signature": tx_sig, "reward_amount": reward_amount, "total_cards": total_cards}
+    resp_body = {"ok": True, "signature": tx_sig, "reward_amount": reward_amount, "total_cards": total_cards}
+    if confirm_error:
+        resp_body["confirm_warning"] = str(confirm_error)
+    if post_tx_error:
+        resp_body["warning"] = "db_desync"
+        resp_body["error"] = str(post_tx_error)
+    return resp_body
 
 
 @app.get("/marketplace/listings", response_model=List[ListingView])
@@ -3524,6 +3605,44 @@ def marketplace_listings(db: Session = Depends(get_session)):
     Fall back to on-chain listing PDAs so drifted DB status won't hide items.
     Keep this light: no price snapshot aggregation to avoid DB pool exhaustion.
     """
+    def load_asset_meta(asset_id: str) -> Optional[dict]:
+        """Fetch asset metadata from Helius DAS for enrichment when DB rows are missing."""
+        if not auth_settings.helius_rpc_url:
+            return None
+        try:
+            payload = {"jsonrpc": "2.0", "id": f"listing-{asset_id}", "method": "getAsset", "params": {"id": asset_id}}
+            resp = requests.post(auth_settings.helius_rpc_url, json=payload, timeout=10)
+            resp.raise_for_status()
+            return resp.json().get("result")
+        except Exception:
+            return None
+
+    def extract_image(meta: dict, content: dict) -> Optional[str]:
+        candidates = [
+            (content.get("links") or {}).get("image"),
+            meta.get("image") if meta else None,
+            (meta.get("properties") or {}).get("image") if meta else None,
+        ]
+        files_meta = (meta.get("properties") or {}).get("files") if meta else None
+        if files_meta and isinstance(files_meta, list):
+            for f in files_meta:
+                if isinstance(f, dict) and f.get("uri"):
+                    candidates.append(f["uri"])
+                    break
+        files_content = content.get("files")
+        if files_content and isinstance(files_content, list):
+            for f in files_content:
+                if isinstance(f, dict) and f.get("uri"):
+                    candidates.append(f["uri"])
+                    break
+                if isinstance(f, str):
+                    candidates.append(f)
+                    break
+        for cand in candidates:
+            if cand:
+                return cand
+        return None
+
     vault_state = market_vault_state_pda()
     # Listing account discriminator
     listing_disc = hashlib.sha256(b"account:Listing").digest()[:8]
@@ -3563,9 +3682,72 @@ def marketplace_listings(db: Session = Depends(get_session)):
             continue
         seen.add(core_asset)
 
+        meta_row: Optional[MintRecord] = None
         row = db.exec(select(MintRecord).where(MintRecord.asset_id == core_asset)).first()
         card_meta = db.get(CardTemplate, row.template_id) if row and row.template_id else None
         is_fake_flag = True if row is None else bool(getattr(row, "is_fake", False))
+        name = card_meta.card_name if card_meta else None
+        image_url = card_meta.image_url if card_meta else None
+        rarity_val = row.rarity if row else None
+        to_commit = False
+
+        # Enrich from on-chain metadata if DB is missing details (common when escrowed in marketplace vault).
+        if (row is None or not row.template_id or not card_meta or not image_url) and auth_settings.helius_rpc_url:
+            asset_meta = load_asset_meta(core_asset) or {}
+            content = asset_meta.get("content") or {}
+            uri = content.get("json_uri") or (content.get("links") or {}).get("json")
+            tmpl_id = template_id_from_uri(uri or "")
+            meta = content.get("metadata") or {}
+            rarity_attr = None
+            for attr in meta.get("attributes") or []:
+                if (attr.get("trait_type") or "").lower() == "rarity":
+                    rarity_attr = attr.get("value")
+                    break
+            img = extract_image(meta, content)
+            name = name or meta.get("name")
+            rarity_val = rarity_val or rarity_attr
+
+            if row:
+                if tmpl_id and row.template_id != tmpl_id:
+                    row.template_id = tmpl_id
+                    row.is_fake = False
+                    to_commit = True
+                if rarity_attr and row.rarity != rarity_attr:
+                    row.rarity = rarity_attr
+                    to_commit = True
+                if not row.owner:
+                    row.owner = str(listing_data.get("seller"))
+                    to_commit = True
+                if row.status != "listed":
+                    row.status = "listed"
+                    to_commit = True
+                if to_commit:
+                    row.updated_at = time.time()
+                    db.add(row)
+            else:
+                row = MintRecord(
+                    asset_id=core_asset,
+                    template_id=tmpl_id or 0,
+                    rarity=rarity_attr or "unknown",
+                    status="listed",
+                    owner=str(listing_data.get("seller")),
+                    is_fake=not bool(tmpl_id),
+                    updated_at=time.time(),
+                )
+                db.add(row)
+                to_commit = True
+            if tmpl_id and not card_meta:
+                card_meta = db.get(CardTemplate, tmpl_id)
+            if img:
+                image_url = image_url or img
+            is_fake_flag = False if tmpl_id else is_fake_flag
+
+        if to_commit:
+            db.commit()
+            meta_row = row
+        else:
+            meta_row = row
+
         results.append(
             ListingView(
                 core_asset=core_asset,
@@ -3573,10 +3755,10 @@ def marketplace_listings(db: Session = Depends(get_session)):
                 seller=str(listing_data.get("seller")),
                 status=listing_data.get("status") or "active",
                 currency_mint=str(listing_data.get("currency_mint")) if listing_data.get("currency_mint") else None,
-                template_id=row.template_id if row else None,
-                rarity=row.rarity if row else None,
-                name=card_meta.card_name if card_meta else None,
-                image_url=card_meta.image_url if card_meta else None,
+                template_id=meta_row.template_id if meta_row else None,
+                rarity=rarity_val if rarity_val else (meta_row.rarity if meta_row else None),
+                name=name,
+                image_url=image_url,
                 is_fake=is_fake_flag,
                 current_mid=None,
                 high_90d=None,
@@ -3813,6 +3995,30 @@ def marketplace_cancel(req: MarketplaceActionRequest, db: Session = Depends(get_
 
 @app.get("/admin/inventory/rarity")
 def admin_inventory(pack_type: Optional[str] = None, db: Session = Depends(get_session)):
+    def normalize_key(label: str) -> str:
+        return label.replace(" ", "").replace("_", "").lower() if label else ""
+
+    def rarity_aliases(label: str) -> set[str]:
+        if not label:
+            return set()
+        aliases: set[str] = set()
+        raw = label
+        lower = raw.lower()
+        norm = normalize_key(raw)
+        aliases.update({raw, lower, norm})
+        # Camel/Pascal case alias
+        parts = re.split(r"[\\s_]+", raw.strip())
+        if parts:
+            camel = "".join(p.capitalize() for p in parts if p)
+            if camel:
+                aliases.add(camel)
+                # Drop trailing "Rare" variant to match UI keys like SpecialIllustration / MegaHyper.
+                if camel.lower().endswith("rare"):
+                    aliases.add(camel[:-4])
+        if norm.endswith("rare"):
+            aliases.add(norm[:-4])
+        return {a for a in aliases if a}
+
     pack_code = pack_set_code(pack_type)
     stmt = select(MintRecord)
     if pack_code:
@@ -3825,7 +4031,8 @@ def admin_inventory(pack_type: Optional[str] = None, db: Session = Depends(get_s
     rows = db.exec(stmt).all()
     counts: Dict[str, int] = {}
     for row in rows:
-        counts[row.rarity] = counts.get(row.rarity, 0) + 1
+        for key in rarity_aliases(row.rarity):
+            counts[key] = counts.get(key, 0) + 1
     vrows = db.exec(select(VirtualCard)).all()
     for row in vrows:
         tmpl = db.get(CardTemplate, row.template_id) if row.template_id is not None else None
@@ -3837,8 +4044,9 @@ def admin_inventory(pack_type: Optional[str] = None, db: Session = Depends(get_s
                 allowed.add(None)
             if tmpl.set_code not in allowed:
                 continue
-        key = f"virtual_{row.rarity}"
-        counts[key] = counts.get(key, 0) + row.count
+        for key in rarity_aliases(row.rarity):
+            for prefix in ("", "virtual_"):
+                counts[f"{prefix}{key}"] = counts.get(f"{prefix}{key}", 0) + row.count
     return counts
 
 
@@ -4835,10 +5043,10 @@ def admin_inventory_unreserve(req: UnreserveRequest, db: Session = Depends(get_s
 def template_id_from_uri(uri: str) -> Optional[int]:
     if not uri:
         return None
-    match = re.search(r"(\d{3})", uri)
-    if match:
+    matches = re.findall(r"(\d+)", uri)
+    if matches:
         try:
-            return int(match.group(1))
+            return int(matches[-1])
         except ValueError:
             return None
     return None
@@ -4868,6 +5076,11 @@ def admin_inventory_refresh(db: Session = Depends(get_session)):
             existing.owner = str(vault_authority)
             existing.status = "available"
             existing.updated_at = time.time()
+            if tmpl_id and existing.template_id != tmpl_id:
+                existing.template_id = tmpl_id
+            if rarity and existing.rarity != rarity:
+                existing.rarity = rarity
+            existing.is_fake = False
             db.add(existing)
         else:
             db.add(
@@ -4878,6 +5091,7 @@ def admin_inventory_refresh(db: Session = Depends(get_session)):
                     status="available",
                     owner=str(vault_authority),
                     updated_at=time.time(),
+                    is_fake=False,
                 )
             )
         updated.append(asset_id)

@@ -86,14 +86,27 @@ function rarityGlowClass(rarity?: string | null) {
   return map[key] || 'rarity-glow rarity-glow--common';
 }
 
+const metadataHost = process.env.NEXT_PUBLIC_METADATA_URL || 'https://getmochi.fun';
+const legacyHosts = (process.env.NEXT_PUBLIC_LEGACY_METADATA_HOSTS || '')
+  .split(',')
+  .map((h) => h.trim())
+  .filter(Boolean);
+const rewriteLegacyHost = (url: string) => {
+  let out = url;
+  const target = metadataHost.replace(/^https?:\/\//, '');
+  legacyHosts.forEach((host) => {
+    const normalized = host.replace(/^https?:\/\//, '');
+    out = out.replace(normalized, target);
+  });
+  return out;
+};
 const normalizeImage = (src?: string | null) => {
   if (!src) return undefined;
   let url = src;
   if (url.startsWith('ipfs://')) {
     url = url.replace('ipfs://', 'https://ipfs.io/ipfs/');
   }
-   // Legacy metadata was minted on mochims.fun; rewrite to getmochi.fun where we proxy /nft/.
-  url = url.replace('mochims.fun', 'getmochi.fun');
+  url = rewriteLegacyHost(url);
   return url;
 };
 

@@ -1,5 +1,5 @@
 /**
- * Patch minted metadata that still points to mochims.fun by rewriting URLs to getmochi.fun.
+ * Patch minted metadata domains by rewriting URLs to getmochi.fun.
  *
  * Usage:
  *   RPC_URL=https://api.helius.xyz/?api-key=... TS_NODE_TRANSPILE_ONLY=1 npx ts-node -P tsconfig.scripts.json scripts/patch_metadata_domain.ts --collection <collectionPubkey> --out ./patched_metadata
@@ -7,7 +7,7 @@
  * What it does:
  *   - Scans all assets in the given collection via DAS `getAssetsByGroup`.
  *   - For each asset with a json_uri/metadata_uri, fetches the metadata.
- *   - Rewrites any fields containing "mochims.fun" to "getmochi.fun" (image, animation_url, properties.files[].uri, and any nested strings).
+ *   - Rewrites any fields containing the legacy domain to "getmochi.fun" (image, animation_url, properties.files[].uri, and any nested strings).
  *   - Writes the patched JSON to the output directory as <asset_id>.json.
  *
  * You still need to host/upload the patched JSON and images under https://getmochi.fun/nft/...
@@ -54,7 +54,8 @@ async function main() {
         continue;
       }
       const json = await res.json();
-      const patched = rewriteDomains(json, 'mochims.fun', 'getmochi.fun');
+      const fromDomain = process.env.LEGACY_DOMAIN || 'getmochi.fun';
+      const patched = rewriteDomains(json, fromDomain, 'getmochi.fun');
       const outPath = path.join(OUT_DIR, `${asset.id}.json`);
       fs.writeFileSync(outPath, JSON.stringify(patched, null, 2));
       patchedCount++;

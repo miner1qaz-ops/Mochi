@@ -55,14 +55,28 @@ export default function ProfilePage() {
   const [showHoldings, setShowHoldings] = useState(false);
   const [holdingsLoading, setHoldingsLoading] = useState(false);
 
+  const metadataHost = process.env.NEXT_PUBLIC_METADATA_URL || 'https://getmochi.fun';
+  const legacyHosts = (process.env.NEXT_PUBLIC_LEGACY_METADATA_HOSTS || '')
+    .split(',')
+    .map((h) => h.trim())
+    .filter(Boolean);
+  const rewriteLegacyHost = (url: string) => {
+    let out = url;
+    const target = metadataHost.replace(/^https?:\/\//, '');
+    legacyHosts.forEach((host) => {
+      const normalized = host.replace(/^https?:\/\//, '');
+      out = out.replace(normalized, target);
+    });
+    return out;
+  };
+
   const normalizeImage = (src?: string | null) => {
     if (!src) return undefined;
     let url = src;
     if (url.startsWith('ipfs://')) {
       url = url.replace('ipfs://', 'https://ipfs.io/ipfs/');
     }
-    // Legacy metadata was minted on mochims.fun; rewrite to getmochi.fun where we now proxy /nft/.
-    url = url.replace('mochims.fun', 'getmochi.fun');
+    url = rewriteLegacyHost(url);
     return url;
   };
 
@@ -597,21 +611,13 @@ export default function ProfilePage() {
           <div className="grid sm:grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-3">
           {filteredAssets.map((asset) => {
             const name = asset.content?.metadata?.name || 'Core asset';
-            const templateAttr = asset.content?.metadata?.attributes?.find(
-              (attr: any) => (attr.trait_type || '').toLowerCase() === 'template_id'
-            )?.value;
-            const templateId = typeof templateAttr === 'number' ? templateAttr : Number(templateAttr) || asset.template_id;
             const rawImage =
               asset.content?.links?.image ||
               asset.content?.metadata?.image ||
               asset.content?.files?.[0]?.uri ||
               asset.content?.metadata?.properties?.files?.[0]?.uri ||
               asset.content?.json_uri;
-            const fallbackTemplate =
-              templateId && Number.isFinite(templateId)
-                ? `https://assets.tcgdex.net/en/me/me01/${templateId}/high.png`
-                : undefined;
-            const image = assetImages[asset.id] || normalizeImage(rawImage) || fallbackTemplate || '/card_back.png';
+            const image = assetImages[asset.id] || normalizeImage(rawImage) || '/card_back.png';
             const rarityVal =
               asset.content?.metadata?.attributes?.find((attr: any) => (attr.trait_type || '').toLowerCase() === 'rarity')
                 ?.value || '';
@@ -625,7 +631,7 @@ export default function ProfilePage() {
                     className="w-full h-full object-cover"
                     loading="lazy"
                     onError={(e) => {
-                      (e.target as HTMLImageElement).src = fallbackTemplate || '/card_back.png';
+                      (e.target as HTMLImageElement).src = '/card_back.png';
                     }}
                   />
                 </div>

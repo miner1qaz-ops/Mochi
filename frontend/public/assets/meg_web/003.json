@@ -2,14 +2,14 @@
   "name": "Venusaur #003",
   "symbol": "MOCHI",
   "description": "Physical Pokémon card held in the Mochi vault. Not graded. Redeemable via burn.",
-  "image": "https://mochims.fun/img/packs/meg_web/meg_web_003_hires.png",
+  "image": "https://getmochi.fun/img/packs/meg_web/meg_web_003_hires.png",
   "attributes": [
     { "trait_type": "Rarity", "value": "Rare" },
     { "trait_type": "Variant", "value": "Base" }
   ],
   "properties": {
     "files": [
-      { "uri": "https://mochims.fun/img/packs/meg_web/meg_web_003_hires.png", "type": "image/png" }
+      { "uri": "https://getmochi.fun/img/packs/meg_web/meg_web_003_hires.png", "type": "image/png" }
     ],
     "category": "image"
   }
