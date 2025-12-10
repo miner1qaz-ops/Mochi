@@ -28,6 +28,8 @@ export type PackStock = {
   variant?: string | null;
   remaining: number;
   total: number;
+  price?: number | null;
+  price_updated_at?: number | null;
 };
 
 export type VirtualCard = { template_id: number; rarity: string; count: number; name?: string; image_url?: string; is_energy?: boolean };
@@ -42,15 +44,6 @@ export type Listing = {
   name?: string;
   image_url?: string;
   is_fake?: boolean;
-};
-
-export type GarbageListing = {
-  listing: string;
-  vault_state: string;
-  seller: string;
-  core_asset: string;
-  price_lamports?: number;
-  status?: string;
 };
 
 export type SeedSaleState = {
@@ -191,6 +184,18 @@ export type PortfolioSummary = {
   top_holdings: PortfolioTopHolding[];
 };
 
+export type PriceAnalyticsRow = {
+  template_id: number;
+  name: string;
+  set_name?: string | null;
+  rarity?: string | null;
+  image_url?: string | null;
+  current_price?: number | null;
+  change_24h?: number | null;
+  last_updated?: number | null;
+  sparkline?: number[];
+};
+
 export type MarketCardListing = {
   core_asset: string;
   price_lamports: number;
@@ -304,7 +309,7 @@ export async function confirmOpen(
   server_nonce?: string,
 ) {
   const { data } = await api.post('/program/v2/open/confirm', { signature, wallet, rarities, template_ids, server_nonce });
-  return data as { state: string; assets: string[] };
+  return data as { state: string; assets: string[]; reward?: { status?: string; signature?: string; error?: string; amount?: number } };
 }
 
 export async function confirmClaim(signature: string, wallet: string, action: 'claim' | 'sellback' = 'claim') {
@@ -341,16 +346,6 @@ export async function fillListing(core_asset: string, wallet: string) {
 export async function cancelListing(core_asset: string, wallet: string) {
   const { data } = await api.post('/marketplace/cancel/build', { core_asset, wallet });
   return data as { tx_b64: string; tx_v0_b64: string; recent_blockhash: string; instructions: InstructionMeta[] };
-}
-
-export async function fetchGarbageListings() {
-  const { data } = await api.get('/admin/marketplace/garbage');
-  return data as GarbageListing[];
-}
-
-export async function forceCancelGarbage(assets: string[], vault_state?: string) {
-  const { data } = await api.post('/admin/marketplace/force_cancel', { assets, vault_state });
-  return data as { ok: Array<{ asset: string; signature: string }>; errors: Array<{ asset: string; error: string }> };
 }
 
 export async function fetchListings() {
@@ -392,6 +387,11 @@ export async function fetchPricingSparklines(templateIds: number[], points: numb
   const ids = templateIds.join(',');
   const { data } = await api.get('/pricing/sparklines', { params: { template_ids: ids, points } });
   return data as { template_id: number; points: PricingHistoryPoint[] }[];
+}
+
+export async function fetchPriceAnalytics(pack_type?: string): Promise<PriceAnalyticsRow[]> {
+  const { data } = await api.get('/analytics/prices', { params: pack_type ? { pack_type } : undefined });
+  return data as PriceAnalyticsRow[];
 }
 
 export async function fetchPricingStats(wallet: string) {

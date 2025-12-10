@@ -1,7 +1,7 @@
 import base64
 import hashlib
 import os
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from borsh_construct import CStruct, Enum, Option, U16, U32, U64, U8, Vec
 from solders.instruction import AccountMeta, Instruction
@@ -422,8 +422,9 @@ def build_open_pack_v2_ix(
     pack_session: Pubkey,
     vault_authority: Pubkey,
     vault_treasury: Pubkey,
-    mochi_mint: Pubkey,
-    user_mochi_token: Pubkey,
+    reward_mint: Pubkey,
+    reward_vault: Pubkey,
+    user_token_account: Pubkey,
     rare_card_records: List[Pubkey],
     currency: str,
     client_seed_hash: bytes,
@@ -431,23 +432,39 @@ def build_open_pack_v2_ix(
     user_currency_token: Optional[Pubkey] = None,
     vault_currency_token: Optional[Pubkey] = None,
 ) -> Instruction:
-    accounts: List[AccountMeta] = [
-        AccountMeta(pubkey=user, is_signer=True, is_writable=True),
-        AccountMeta(pubkey=vault_state, is_signer=False, is_writable=True),
-        AccountMeta(pubkey=pack_session, is_signer=False, is_writable=True),
-        AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=True),
-        AccountMeta(pubkey=vault_treasury, is_signer=False, is_writable=True),
-        AccountMeta(pubkey=mochi_mint, is_signer=False, is_writable=True),
-        AccountMeta(pubkey=user_mochi_token, is_signer=False, is_writable=True),
-        AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
-        AccountMeta(pubkey=SYS_PROGRAM_ID, is_signer=False, is_writable=False),
+    # Enforce on-chain account order from the deployed program; positional list only.
+    named_accounts: List[Tuple[str, AccountMeta]] = [
+        ("user", AccountMeta(pubkey=user, is_signer=True, is_writable=True)),
+        ("vault_state", AccountMeta(pubkey=vault_state, is_signer=False, is_writable=True)),
+        ("pack_session", AccountMeta(pubkey=pack_session, is_signer=False, is_writable=True)),
+        ("vault_authority", AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=True)),
+        ("vault_treasury", AccountMeta(pubkey=vault_treasury, is_signer=False, is_writable=True)),
+        ("reward_mint", AccountMeta(pubkey=reward_mint, is_signer=False, is_writable=True)),
+        ("reward_vault", AccountMeta(pubkey=reward_vault, is_signer=False, is_writable=True)),
+        ("token_program", AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False)),
+        ("user_token_account", AccountMeta(pubkey=user_token_account, is_signer=False, is_writable=True)),
     ]
-    accounts.extend([AccountMeta(pubkey=cr, is_signer=False, is_writable=True) for cr in rare_card_records])
+    named_accounts.extend(
+        [
+            (f"rare_card_record_{idx}", AccountMeta(pubkey=cr, is_signer=False, is_writable=True))
+            for idx, cr in enumerate(rare_card_records)
+        ]
+    )
     if currency.lower() == "usdc" or currency.lower() == "token":
         if not user_currency_token or not vault_currency_token:
             raise ValueError("Token currency requires token accounts")
-        accounts.append(AccountMeta(pubkey=user_currency_token, is_signer=False, is_writable=True))
-        accounts.append(AccountMeta(pubkey=vault_currency_token, is_signer=False, is_writable=True))
+        named_accounts.append(
+            ("user_currency_token", AccountMeta(pubkey=user_currency_token, is_signer=False, is_writable=True))
+        )
+        named_accounts.append(
+            ("vault_currency_token", AccountMeta(pubkey=vault_currency_token, is_signer=False, is_writable=True))
+        )
+    # System program comes last (after remaining accounts) to match the deployed binary.
+    named_accounts.append(("system_program", AccountMeta(pubkey=SYS_PROGRAM_ID, is_signer=False, is_writable=False)))
+    accounts: List[AccountMeta] = [meta for _, meta in named_accounts]
+    print("DEBUG open_pack_v2 accounts:")
+    for idx, (name, meta) in enumerate(named_accounts):
+        print(f"{idx}: {name} = {meta.pubkey}")
     data = encode_open_pack_v2(currency, client_seed_hash, rare_templates)
     return Instruction(program_id=PROGRAM_ID, data=data, accounts=accounts)
 

@@ -153,6 +153,23 @@ export default function MarketPage() {
 
   const filtered = useMemo(() => cards, [cards]);
 
+  const handleTiltMove = (event: React.MouseEvent<HTMLDivElement>) => {
+    const el = event.currentTarget;
+    const rect = el.getBoundingClientRect();
+    const x = (event.clientX - rect.left) / rect.width;
+    const y = (event.clientY - rect.top) / rect.height;
+    const rotateX = (0.5 - y) * 10;
+    const rotateY = (x - 0.5) * 10;
+    el.style.transform = `perspective(1000px) rotateX(${rotateX}deg) rotateY(${rotateY}deg) scale(1.04)`;
+    el.style.zIndex = '50';
+  };
+
+  const handleTiltLeave = (event: React.MouseEvent<HTMLDivElement>) => {
+    const el = event.currentTarget;
+    el.style.transform = 'perspective(1000px) rotateX(0deg) rotateY(0deg) scale(1)';
+    el.style.zIndex = 'auto';
+  };
+
   return (
     <div className="space-y-6">
       <div className="flex flex-col gap-2">
@@ -254,27 +271,34 @@ export default function MarketPage() {
       <div className="grid grid-cols-2 max-[520px]:grid-cols-1 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-5 gap-3">
         {filtered.map((card) => (
           <div key={`${card.template_id}-${card.name}`} className="h-full">
-            <div className={`card-blur h-full rounded-2xl p-3 border border-white/5 space-y-3 flex flex-col ${rarityGlowClass(card.rarity)}`}>
+            <div className={`card-blur h-full rounded-2xl p-3 border border-white/5 space-y-3 flex flex-col relative ${rarityGlowClass(card.rarity)}`}>
               <Link href={`/market/card/${card.template_id}`} className="space-y-2 block">
-                <div className="relative aspect-[3/4] rounded-xl overflow-hidden border border-white/10 bg-black/30">
-                  {card.image_url ? (
-                    <img
-                      src={card.image_url}
-                      alt={card.name}
-                      className="w-full h-full object-cover"
-                      loading="lazy"
-                    />
-                  ) : (
-                    <div className="w-full h-full flex items-center justify-center text-xs text-white/60">No art</div>
-                  )}
-                  <div className="absolute inset-0 bg-gradient-to-t from-black/70 to-transparent" />
-                  <div className="absolute top-2 left-2 flex gap-2 text-[11px]">
-                    <span className="glass-chip glass-chip--tiny bg-white/10 border-white/20">
-                      {card.listing_count > 0 ? `${card.listing_count} live` : 'No listing'}
-                    </span>
-                    {card.is_fake && (
-                      <span className="glass-chip glass-chip--tiny bg-rose-500/20 border-rose-400/60 text-rose-100">Unverified</span>
+                <div className="relative aspect-[3/4] rounded-xl overflow-visible">
+                  <div
+                    className="relative h-full w-full overflow-hidden rounded-xl border border-white/10 bg-black/30 transition-transform duration-200 ease-out will-change-transform"
+                    style={{ transform: 'perspective(1000px) rotateX(0deg) rotateY(0deg) scale(1)', transformStyle: 'preserve-3d' }}
+                    onMouseMove={handleTiltMove}
+                    onMouseLeave={handleTiltLeave}
+                  >
+                    {card.image_url ? (
+                      <img
+                        src={card.image_url}
+                        alt={card.name}
+                        className="w-full h-full object-cover"
+                        loading="lazy"
+                      />
+                    ) : (
+                      <div className="w-full h-full flex items-center justify-center text-xs text-white/60">No art</div>
                     )}
+                    <div className="absolute inset-0 bg-gradient-to-t from-black/70 to-transparent pointer-events-none" />
+                    <div className="absolute top-2 left-2 flex gap-2 text-[11px] pointer-events-none">
+                      <span className="glass-chip glass-chip--tiny bg-white/10 border-white/20">
+                        {card.listing_count > 0 ? `${card.listing_count} live` : 'No listing'}
+                      </span>
+                      {card.is_fake && (
+                        <span className="glass-chip glass-chip--tiny bg-rose-500/20 border-rose-400/60 text-rose-100">Unverified</span>
+                      )}
+                    </div>
                   </div>
                 </div>
                 <div className="space-y-1">

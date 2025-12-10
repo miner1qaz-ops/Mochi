@@ -36,6 +36,14 @@ def main(csv_path: str):
                 or r.get("image")
                 or r.get("Image")
             )
+            serial_number = (
+                r.get("serial_number")
+                or r.get("card_number")
+                or r.get("cardNumber")
+                or r.get("Number")
+                or r.get("token_id")
+                or r.get("tokenId")
+            )
             template = CardTemplate(
                 template_id=template_id,
                 index=int(idx_raw),
@@ -44,6 +52,7 @@ def main(csv_path: str):
                 variant=r.get("variant"),
                 set_code=r.get("set_code"),
                 set_name=r.get("set_name"),
+                serial_number=serial_number,
                 is_energy=str(r.get("is_energy", "false")).lower() in ["true", "1", "yes"],
                 energy_type=r.get("energy_type"),
                 image_url=image_url,

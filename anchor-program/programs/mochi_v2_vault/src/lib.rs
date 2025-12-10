@@ -103,8 +103,10 @@ mod mochi_v2_vault {
     ) -> Result<()> {
         let admin_key = ctx.accounts.admin.key();
         let vault_key = ctx.accounts.vault_state.key();
-        let (expected_vault_auth, vault_bump) =
-            Pubkey::find_program_address(&[GACHA_VAULT_AUTHORITY_SEED, vault_key.as_ref()], ctx.program_id);
+        let (expected_vault_auth, vault_bump) = Pubkey::find_program_address(
+            &[GACHA_VAULT_AUTHORITY_SEED, vault_key.as_ref()],
+            ctx.program_id,
+        );
 
         // Ensure account is large enough and rent-exempt for the expanded struct.
         let target_len: usize = 8 + VaultState::SIZE;
@@ -204,18 +206,17 @@ mod mochi_v2_vault {
     ) -> Result<()> {
         let admin_key = ctx.accounts.admin.key();
         let vault_key = ctx.accounts.vault_state.key();
-        let (expected_vault_auth, vault_bump) =
-            Pubkey::find_program_address(&[MARKETPLACE_VAULT_AUTHORITY_SEED, vault_key.as_ref()], ctx.program_id);
+        let (expected_vault_auth, vault_bump) = Pubkey::find_program_address(
+            &[MARKETPLACE_VAULT_AUTHORITY_SEED, vault_key.as_ref()],
+            ctx.program_id,
+        );
 
         let target_len: usize = 8 + VaultState::SIZE;
         let rent = Rent::get()?;
         let required_lamports = rent.minimum_balance(target_len);
         let vault_info = ctx.accounts.vault_state.to_account_info();
 
-        require!(
-            vault_info.owner == ctx.program_id,
-            MochiError::Unauthorized
-        );
+        require!(vault_info.owner == ctx.program_id, MochiError::Unauthorized);
 
         if vault_info.lamports() < required_lamports {
             let diff = required_lamports
@@ -432,47 +433,46 @@ mod mochi_v2_vault {
         session.rare_templates = rare_templates;
         session.total_slots = PACK_CARD_COUNT as u8;
         session.bump = ctx.bumps.pack_session;
-        // Optional MOCHI reward mint (requires vault authority to own mint authority).
-        if vault_state.reward_per_pack > 0 {
-            let mochi_mint = vault_state
-                .mochi_mint
-                .ok_or(MochiError::MintMismatch)?;
-            require_keys_eq!(
-                ctx.accounts.mochi_mint.key(),
-                mochi_mint,
-                MochiError::MintMismatch
-            );
+        // Atomic MOCHI reward: transfer from PDA-owned vault, or mint if PDA holds mint authority.
+        let reward_amount = vault_state.reward_per_pack;
+        require!(reward_amount > 0, MochiError::RewardDisabled);
+        let mochi_mint = vault_state.mochi_mint.ok_or(MochiError::MintMismatch)?;
+        require_keys_eq!(
+            ctx.accounts.reward_mint.key(),
+            mochi_mint,
+            MochiError::MintMismatch
+        );
+        require_keys_eq!(
+            ctx.accounts.user_token_account.mint,
+            mochi_mint,
+            MochiError::MintMismatch
+        );
+        require_keys_eq!(
+            ctx.accounts.reward_vault.mint,
+            mochi_mint,
+            MochiError::MintMismatch
+        );
+        require_keys_eq!(
+            ctx.accounts.user_token_account.owner,
+            ctx.accounts.user.key(),
+            MochiError::Unauthorized
+        );
+        let vault_key = vault_state.key();
+        let seeds = &[
+            GACHA_VAULT_AUTHORITY_SEED,
+            vault_key.as_ref(),
+            &[ctx.bumps.vault_authority],
+        ];
+        let signer = &[&seeds[..]];
+        let mut rewarded = false;
+        if ctx.accounts.reward_vault.owner == ctx.accounts.vault_authority.key() {
             require!(
-                ctx.accounts.mochi_mint.mint_authority == COption::Some(ctx.accounts.vault_authority.key()),
-                MochiError::Unauthorized
+                ctx.accounts.reward_vault.amount >= reward_amount,
+                MochiError::InsufficientFunds
             );
-            msg!(
-                "reward mint {} to ATA {} (user {}) bump {}",
-                vault_state.reward_per_pack,
-                ctx.accounts.user_mochi_token.key(),
-                ctx.accounts.user.key(),
-                ctx.bumps.vault_authority
-            );
-            require_keys_eq!(
-                ctx.accounts.user_mochi_token.mint,
-                mochi_mint,
-                MochiError::MintMismatch
-            );
-            require_keys_eq!(
-                ctx.accounts.user_mochi_token.owner,
-                ctx.accounts.user.key(),
-                MochiError::Unauthorized
-            );
-            let vault_key = vault_state.key();
-            let seeds = &[
-                GACHA_VAULT_AUTHORITY_SEED,
-                vault_key.as_ref(),
-                &[ctx.bumps.vault_authority],
-            ];
-            let signer = &[&seeds[..]];
-            let cpi_accounts = MintTo {
-                mint: ctx.accounts.mochi_mint.to_account_info(),
-                to: ctx.accounts.user_mochi_token.to_account_info(),
+            let cpi_accounts = Transfer {
+                from: ctx.accounts.reward_vault.to_account_info(),
+                to: ctx.accounts.user_token_account.to_account_info(),
                 authority: ctx.accounts.vault_authority.to_account_info(),
             };
             let cpi_ctx = CpiContext::new_with_signer(
@@ -480,15 +480,34 @@ mod mochi_v2_vault {
                 cpi_accounts,
                 signer,
             );
-            token::mint_to(cpi_ctx, vault_state.reward_per_pack)?;
-            emit!(RewardMinted {
-                user: ctx.accounts.user.key(),
-                ata: ctx.accounts.user_mochi_token.key(),
-                mint: mochi_mint,
-                amount: vault_state.reward_per_pack,
-            });
-            msg!("reward minted");
+            token::transfer(cpi_ctx, reward_amount)?;
+            rewarded = true;
         }
+        if !rewarded
+            && ctx.accounts.reward_mint.mint_authority
+                == COption::Some(ctx.accounts.vault_authority.key())
+        {
+            let cpi_accounts = MintTo {
+                mint: ctx.accounts.reward_mint.to_account_info(),
+                to: ctx.accounts.user_token_account.to_account_info(),
+                authority: ctx.accounts.vault_authority.to_account_info(),
+            };
+            let cpi_ctx = CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                cpi_accounts,
+                signer,
+            );
+            token::mint_to(cpi_ctx, reward_amount)?;
+            rewarded = true;
+        }
+        require!(rewarded, MochiError::Unauthorized);
+        emit!(RewardMinted {
+            user: ctx.accounts.user.key(),
+            ata: ctx.accounts.user_token_account.key(),
+            mint: mochi_mint,
+            amount: reward_amount,
+        });
+        msg!("reward delivered");
         Ok(())
     }
 
@@ -1797,9 +1816,11 @@ pub struct OpenPackV2<'info> {
     #[account(mut)]
     pub vault_treasury: SystemAccount<'info>,
     #[account(mut)]
-    pub mochi_mint: Account<'info, Mint>,
-    #[account(mut)]
-    pub user_mochi_token: Account<'info, TokenAccount>,
+    pub reward_mint: Account<'info, Mint>,
+    #[account(mut, constraint = reward_vault.owner == vault_authority.key(), constraint = reward_vault.mint == reward_mint.key())]
+    pub reward_vault: Account<'info, TokenAccount>,
+    #[account(mut, constraint = user_token_account.owner == user.key(), constraint = user_token_account.mint == reward_mint.key())]
+    pub user_token_account: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
     /// CHECK: System program
     pub system_program: UncheckedAccount<'info>,
@@ -2485,6 +2506,8 @@ pub enum MochiError {
     SessionNotExpired,
     #[msg("Card not reserved")]
     CardNotReserved,
+    #[msg("Reward disabled")]
+    RewardDisabled,
     #[msg("Asset mismatch")]
     AssetMismatch,
     #[msg("Math overflow")]

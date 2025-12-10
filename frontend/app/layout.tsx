@@ -1,4 +1,5 @@
 import type { Metadata } from 'next';
+import Link from 'next/link';
 import { Space_Grotesk } from 'next/font/google';
 import './globals.css';
 import { WalletProvider } from '../components/WalletProvider';
@@ -46,6 +47,33 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           <main className="mx-auto w-full max-w-6xl lg:max-w-7xl 2xl:max-w-[90rem] px-6 lg:px-8 xl:px-12 py-10 space-y-10">
             {children}
           </main>
+          <footer className="mx-auto w-full max-w-6xl lg:max-w-7xl 2xl:max-w-[90rem] px-6 lg:px-8 xl:px-12 pb-10 pt-6 border-t border-white/5 text-sm text-white/70 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex flex-wrap gap-4">
+              <Link href="/legal/terms" className="underline decoration-white/20 underline-offset-4 hover:text-white">
+                Terms &amp; Conditions
+              </Link>
+              <Link href="/legal/privacy" className="underline decoration-white/20 underline-offset-4 hover:text-white">
+                Privacy Policy
+              </Link>
+              <Link href="/docs/whitepaper" className="underline decoration-white/20 underline-offset-4 hover:text-white">
+                Whitepaper (draft)
+              </Link>
+            </div>
+            <div className="flex flex-wrap items-center gap-4 text-xs sm:text-sm">
+              <a href="mailto:admin@getmochi.fun" className="hover:text-white underline decoration-white/20 underline-offset-4">
+                admin@getmochi.fun
+              </a>
+              <a
+                href="https://x.com/getmochidotfun"
+                target="_blank"
+                rel="noreferrer"
+                className="hover:text-white underline decoration-white/20 underline-offset-4"
+              >
+                X (Twitter)
+              </a>
+              <span className="text-white/50">Discord: coming soon</span>
+            </div>
+          </footer>
         </WalletProvider>
       </body>
     </html>

@@ -102,8 +102,112 @@ const PACK_TEMPLATE_OFFSETS: Record<string, number> = {
   phantasmal_flames: 2000,
 };
 
+const usdFormatter = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 });
+const formatUsd = (value?: number | null) => {
+  if (value === null || value === undefined || Number.isNaN(value)) return null;
+  return usdFormatter.format(value);
+};
+const GOOD_HIT_THRESHOLD = 5;
+const PSA10_MULTIPLIER = 2.5;
+const PSA9_MULTIPLIER = 1.7;
+const estimateGrades = (price?: number | null) => {
+  if (price === null || price === undefined || price <= 0) return null;
+  return {
+    psa10: price * PSA10_MULTIPLIER,
+    psa9: price * PSA9_MULTIPLIER,
+  };
+};
+
 const packThumbClass = 'h-12 w-12 rounded-xl object-contain bg-black/40 p-1';
 const packHeroImageClass = 'h-full w-full max-h-48 object-contain rounded-2xl';
+
+type RarityRate = { rarity: string; percent: number; expected: number };
+type PackOddsConfig = {
+  guaranteed: Record<string, number>;
+  flexOdds: Record<string, number>;
+  reverseOdds: Record<string, number>;
+  rareOdds: Record<string, number>;
+};
+
+const rarityDisplayLabels: Record<string, string> = {
+  Common: 'Common',
+  Uncommon: 'Uncommon',
+  Rare: 'Rare',
+  DoubleRare: 'Double Rare',
+  UltraRare: 'Ultra Rare',
+  IllustrationRare: 'Illustration Rare',
+  SpecialIllustrationRare: 'Special Illustration Rare',
+  MegaHyperRare: 'Mega Hyper Rare',
+  Energy: 'Energy',
+};
+
+const rarityDisplayOrder = [
+  'MegaHyperRare',
+  'SpecialIllustrationRare',
+  'IllustrationRare',
+  'UltraRare',
+  'DoubleRare',
+  'Rare',
+  'Uncommon',
+  'Common',
+  'Energy',
+];
+
+const normalizeRarity = (value?: string | null) => (value || '').replace(/\s+/g, '').toLowerCase();
+const MAINNET_LAUNCH_NOTE = 'Live on mainnet after 12 Dec 2025, 10:00 AM (US time).';
+
+const displayRarityLabel = (value: string) => {
+  const match = rarityDisplayOrder.find((r) => normalizeRarity(r) === normalizeRarity(value)) || value;
+  if (normalizeRarity(match) === 'all') return 'All rarities';
+  return rarityDisplayLabels[match] || value;
+};
+
+const defaultPackOdds: PackOddsConfig = {
+  guaranteed: { Common: 4, Uncommon: 3, Energy: 1 },
+  flexOdds: { Rare: 0.25, Uncommon: 0.35, Common: 0.4 },
+  reverseOdds: {
+    MegaHyperRare: 0.0004,
+    SpecialIllustrationRare: 0.0099,
+    IllustrationRare: 0.1089,
+    UltraRare: 0.035,
+    DoubleRare: 0.08,
+    Rare: 0.15,
+    Uncommon: 0.28,
+    Common: 0.3358,
+  },
+  rareOdds: {
+    MegaHyperRare: 0.000758,
+    SpecialIllustrationRare: 0.008333,
+    IllustrationRare: 0.090909,
+    UltraRare: 0.071429,
+    DoubleRare: 0.166667,
+    Rare: 0.661905,
+  },
+};
+
+const PACK_ODDS_CONFIG: Record<string, PackOddsConfig> = {
+  default: defaultPackOdds,
+  meg_web: defaultPackOdds,
+  phantasmal_flames: defaultPackOdds,
+};
+
+const computeRarityRates = (packId: string): RarityRate[] => {
+  const cfg = PACK_ODDS_CONFIG[packId] || PACK_ODDS_CONFIG.default;
+  const totals: Record<string, number> = {};
+  const bump = (rarity: string, amount: number) => {
+    totals[rarity] = (totals[rarity] || 0) + amount;
+  };
+  Object.entries(cfg.guaranteed).forEach(([rarity, count]) => bump(rarity, count));
+  [cfg.flexOdds, cfg.reverseOdds, cfg.rareOdds].forEach((odds) => {
+    Object.entries(odds).forEach(([rarity, weight]) => bump(rarity, weight));
+  });
+  const totalSlots = Object.values(totals).reduce((sum, val) => sum + val, 0) || 1;
+  return Object.entries(totals).map(([rarity, expected]) => ({
+    rarity,
+    expected,
+    percent: (expected / totalSlots) * 100,
+  }));
+};
 
 type OpeningStep = 'idle' | 'video' | 'animation' | 'reveal';
 
@@ -112,12 +216,22 @@ const FlipModalCard = ({
   frontImage,
   onAdvance,
   faceBack,
+  showHint,
+  onInteract,
 }: {
   backImage: string;
   frontImage: string;
   onAdvance: () => void;
   faceBack: boolean;
+  showHint: boolean;
+  onInteract: () => void;
 }) => {
+  useEffect(() => {
+    if (!frontImage) return;
+    const img = new Image();
+    img.src = frontImage;
+  }, [frontImage]);
+
   return (
     <div style={{ perspective: 1000 }} className="w-full max-w-md mx-auto">
       <motion.div
@@ -138,12 +252,19 @@ const FlipModalCard = ({
         dragMomentum={false}
         dragSnapToOrigin
         whileDrag={{ rotateX: -16, scale: 0.99 }}
-        onClick={onAdvance}
+        onPointerDown={onInteract}
+        onDragStart={onInteract}
+        onClick={() => {
+          onInteract();
+          onAdvance();
+        }}
         onDragEnd={(_, info) => {
           const threshold = 10;
           const velocityThreshold = 120;
           const dist = Math.hypot(info.offset.x, info.offset.y);
-          if (dist > threshold || Math.hypot(info.velocity.x, info.velocity.y) > velocityThreshold) {
+          const directionalSwipe = info.offset.x <= -20 || info.offset.y <= -20;
+          const directionalVelocity = info.velocity.x <= -velocityThreshold || info.velocity.y <= -velocityThreshold;
+          if (directionalSwipe || directionalVelocity || dist > threshold || Math.hypot(info.velocity.x, info.velocity.y) > velocityThreshold) {
             onAdvance();
           }
         }}
@@ -163,6 +284,13 @@ const FlipModalCard = ({
             style={{ display: 'block', width: '100%', height: '100%' }}
             draggable={false}
           />
+          {showHint && faceBack && (
+            <div className="absolute inset-0 flex items-end justify-center pb-4 pointer-events-none">
+              <div className="rounded-full border border-white/20 bg-black/70 px-3 py-1 text-xs text-white/80 shadow-lg shadow-black/40">
+                Swipe left or up to flip
+              </div>
+            </div>
+          )}
         </div>
         <div
           style={{
@@ -215,6 +343,7 @@ export default function GachaPage() {
   const [templatesByPack, setTemplatesByPack] = useState<Record<string, Record<number, { name: string; image: string; rarity: string; variant?: string }>>>({});
   const [revealed, setRevealed] = useState<boolean[]>([]);
   const [modalFaceBack, setModalFaceBack] = useState(true);
+  const [flipHintVisible, setFlipHintVisible] = useState(true);
   const [resumeLoading, setResumeLoading] = useState(false);
   const [openSignature, setOpenSignature] = useState<string | null>(null);
   const [confirmDone, setConfirmDone] = useState(false);
@@ -223,6 +352,7 @@ export default function GachaPage() {
   const [inventoryError, setInventoryError] = useState<string | null>(null);
   const [packStock, setPackStock] = useState<PackStock[] | null>(null);
   const [packStockError, setPackStockError] = useState<string | null>(null);
+  const [stockRarityFilter, setStockRarityFilter] = useState<string>('all');
   const [showOpeningVideo, setShowOpeningVideo] = useState(false);
   const [openingVideoSrc, setOpeningVideoSrc] = useState<string>(packVideoMap.default);
   const [openingStep, setOpeningStep] = useState<OpeningStep>('idle');
@@ -249,6 +379,7 @@ export default function GachaPage() {
     setRevealed([]);
     setRevealIndex(-1);
     setShowOneModal(false);
+    setFlipHintVisible(true);
     setProof(null);
     setClientProofSeed('');
     setCountdown(null);
@@ -264,6 +395,7 @@ export default function GachaPage() {
     const revealTimer = setTimeout(() => {
       setPackStage('reveal');
       setModalFaceBack(true);
+      setFlipHintVisible(true);
       if (revealMode === 'one') {
         setShowOneModal(true);
       }
@@ -281,6 +413,7 @@ export default function GachaPage() {
       setShowOpeningVideo(true);
       setPackStage('idle');
       setModalFaceBack(true);
+      setFlipHintVisible(true);
     },
     [clearOpeningTimers, selectedPack],
   );
@@ -335,6 +468,10 @@ export default function GachaPage() {
     return () => {
       cancelled = true;
     };
+  }, [selectedPack]);
+
+  useEffect(() => {
+    setStockRarityFilter('all');
   }, [selectedPack]);
 
   useEffect(() => {
@@ -581,9 +718,15 @@ export default function GachaPage() {
           throw new Error('Confirm failed – no state returned.');
         }
         setConfirmDone(true);
+        const rewardNote =
+          confirmRes.reward?.status === 'success'
+            ? ' MOCHI reward sent.'
+            : confirmRes.reward?.status === 'failed'
+              ? ` Reward issue: ${confirmRes.reward.error || 'please retry in profile'}.`
+              : '';
         await hydrateSession({ interactive: true, fresh: true, startCinematics: true, packIdForVideo: packChoice });
         setStatusKind('info');
-        setStatusMsg('Pack opened and locked. Reveal, then claim or sell back.');
+        setStatusMsg(`Pack opened and locked. Reveal, then claim or sell back.${rewardNote}`);
       } catch (err) {
         console.error('confirm open error', err);
         setStatusKind('info');
@@ -677,7 +820,8 @@ export default function GachaPage() {
     setSellbackLoading(true);
     try {
       setStatusKind('info');
-      setStatusMsg('Building sell-back transaction…');
+      const estPayout = formatUsd(buybackQuote?.buybackUsd ?? null);
+      setStatusMsg(estPayout ? `Building sell-back (~${estPayout} payout)…` : 'Building sell-back transaction…');
       let userToken: string | undefined;
       let vaultToken: string | undefined;
       if (useUsdc && usdcMint) {
@@ -689,12 +833,12 @@ export default function GachaPage() {
       const res = await sellbackPack(publicKey.toBase58(), userToken, vaultToken);
       const tx = buildV0Tx(publicKey, res.recent_blockhash, res.instructions);
       const signed = signTransaction ? await signTransaction(tx) : tx;
-      setStatusMsg('Submitting sell-back transaction…');
+      setStatusMsg(estPayout ? `Submitting sell-back (~${estPayout})…` : 'Submitting sell-back transaction…');
       const sig = await connection.sendTransaction(signed, { skipPreflight: false, maxRetries: 3 });
       await confirmClaim(sig, publicKey.toBase58(), 'sellback').catch(async () => {
         await api.post('/program/v2/claim/cleanup', { wallet: publicKey.toBase58() });
       });
-      setStatusMsg(`Sell-back tx: ${sig}`);
+      setStatusMsg(`Sell-back tx: ${sig}${estPayout ? ` · est ${estPayout}` : ''}`);
       resetSessionState();
     } catch (e) {
       console.error('sellback error', e);
@@ -728,32 +872,61 @@ export default function GachaPage() {
     }
   };
 
-  const handleTestPurchase = () => {
-    // Local-only pack to exercise the UI without chain calls.
+  const handleTestPurchase = async () => {
+    if (sessionId) {
+      setStatusKind('error');
+      setStatusMsg('Finish or cancel your current pack before running the demo.');
+      return;
+    }
+    const seed = clientSeed || crypto.randomUUID();
     setStatusKind('info');
-    setStatusMsg('Test pack: UI-only, no chain calls.');
-    setTestModeMsg('Demo pack loaded – flip/swipe to test the UI.');
-    const dummySlots: PackSlot[] = Array.from({ length: 11 }).map((_, i) => ({
-      slot_index: i,
-      rarity: ['Common', 'Uncommon', 'Rare', 'UltraRare'][i % 4],
-      template_id: i + 1,
-    }));
-    setSlots(dummySlots);
-    setRevealed(Array(dummySlots.length).fill(false));
-    setRevealIndex(0);
-    setModalFaceBack(true);
-    setShowOneModal(false);
-    setSessionId('test-session');
-    setCountdown(3600);
-    setProof({
-      server_seed_hash: 'test-hash',
-      server_nonce: 'test-nonce',
-      entropy_proof: 'test-entropy',
-    });
-    setClientProofSeed('test-seed');
-    setPackStage('idle');
-    startOpeningCinematics(selectedPack);
+    setStatusMsg('Demo pack: simulating the full reveal without an on-chain signature.');
+    setTestModeMsg(null);
+    clearOpeningTimers();
+    try {
+      const demoWallet = publicKey?.toBase58() || 'demo-wallet';
+      const preview = await previewPack(seed, demoWallet, selectedPack);
+      const lineup = preview.slots || [];
+      if (!lineup.length) {
+        setStatusKind('error');
+        setStatusMsg('Demo pack unavailable – no lineup returned.');
+        return;
+      }
+      setSlots(lineup);
+      setRevealed(Array(lineup.length).fill(false));
+      setRevealIndex(0);
+      setModalFaceBack(true);
+      setShowOneModal(false);
+      setSessionId(null);
+      setCountdown(3600);
+      setProof({
+        server_seed_hash: preview.server_seed_hash,
+        server_nonce: preview.server_nonce,
+        entropy_proof: preview.entropy_proof,
+      });
+      setClientProofSeed(seed);
+      setPackStage('idle');
+      setConfirmDone(false);
+      setOpenSignature(null);
+      setFlipHintVisible(true);
+      startOpeningCinematics(selectedPack);
+      setTestModeMsg('Demo pack ready – same RNG/animation flow, no signature required.');
+    } catch (e) {
+      console.error('demo error', e);
+      setStatusKind('error');
+      setStatusMsg(extractErrorMessage(e));
+    }
   };
+
+  const packPriceMap = useMemo(() => {
+    const map: Record<number, number> = {};
+    (packStock || []).forEach((s) => {
+      if (s.template_id && typeof s.price === 'number' && s.price > 0) {
+        map[s.template_id] = s.price;
+      }
+    });
+    return map;
+  }, [packStock]);
 
   const enrichedSlots = useMemo(() => {
     const templateMap =
@@ -765,24 +938,102 @@ export default function GachaPage() {
         ? `${template.name}${template.variant ? ` (${template.variant})` : ''}`
         : `Template ${slot.template_id ?? 'TBD'}`;
       const isNft = !!slot.is_nft || ['rare','doublerare','ultrarare','illustrationrare','specialillustrationrare','megahyperrare'].includes((slot.rarity || '').replace(/\s+/g,'').toLowerCase());
+      const frontImage = template?.image || '/card_back.png';
+      const cardImage = isRevealed ? frontImage : '/card_back.png';
+      const priceUsd = slot.template_id ? packPriceMap[slot.template_id] : undefined;
+      const gradeEstimate = estimateGrades(priceUsd);
       return {
         ...slot,
         displayName,
-        image: isRevealed ? template?.image || '/card_back.png' : '/card_back.png',
+        cardImage,
+        frontImage,
         revealed: isRevealed,
         is_nft: isNft,
         badge: isNft ? 'NFT' : 'Virtual',
+        flipped: isRevealed,
+        priceUsd: priceUsd ?? null,
+        gradeEstimate,
+        goodHit: (priceUsd ?? 0) >= GOOD_HIT_THRESHOLD,
       };
     });
-  }, [slots, templatesByPack, selectedPack, revealed]);
+  }, [slots, templatesByPack, selectedPack, revealed, packPriceMap]);
 
   const selectedPackInfo = useMemo(
     () => packOptions.find((p) => p.id === selectedPack) || packOptions[0],
     [packOptions, selectedPack]
   );
+  const rarityRates = useMemo(() => computeRarityRates(selectedPack), [selectedPack]);
+  const sanitizedPackStock = useMemo(() => {
+    if (!packStock) return [];
+    return packStock
+      .filter((s) => s.total > 0)
+      .filter((s) => {
+        const name = (s.name || '').toLowerCase();
+        return !name.includes('virtual') && !name.includes('pool');
+      })
+      .filter((s) => normalizeRarity(s.rarity) !== 'energy');
+  }, [packStock]);
+  const orderedRarityRates = useMemo(() => {
+    const mapped = rarityDisplayOrder
+      .map((rarity) => rarityRates.find((r) => normalizeRarity(r.rarity) === normalizeRarity(rarity)))
+      .filter(Boolean) as RarityRate[];
+    const extras = rarityRates.filter(
+      (r) => !rarityDisplayOrder.some((label) => normalizeRarity(label) === normalizeRarity(r.rarity)),
+    );
+    return [...mapped, ...extras];
+  }, [rarityRates]);
+  const ratesByRarity = useMemo(() => {
+    const map: Record<string, { percent: number; expected: number }> = {};
+    orderedRarityRates.forEach((r) => {
+      map[normalizeRarity(r.rarity)] = { percent: r.percent, expected: r.expected };
+    });
+    return map;
+  }, [orderedRarityRates]);
+  const displayedRarities = useMemo(
+    () => [
+      { key: 'all', rarity: 'all', display: 'All rarities' },
+      { key: 'Rare', rarity: 'Rare', display: 'Rare' },
+      { key: 'Double rare', rarity: 'DoubleRare', display: 'Double Rare' },
+      { key: 'Ultra Rare', rarity: 'UltraRare', display: 'Ultra Rare' },
+      { key: 'Illustration rare', rarity: 'IllustrationRare', display: 'Illustration Rare' },
+      { key: 'Special illustration rare', rarity: 'SpecialIllustrationRare', display: 'Special Illustration Rare' },
+      { key: 'Mega Hyper Rare', rarity: 'MegaHyperRare', display: 'Mega Hyper Rare' },
+    ],
+    [],
+  );
+  const filteredStock = useMemo(() => {
+    if (!sanitizedPackStock.length) return [];
+    if (stockRarityFilter.toLowerCase() === 'all') return sanitizedPackStock;
+    const target = normalizeRarity(stockRarityFilter);
+    return sanitizedPackStock.filter((s) => normalizeRarity(s.rarity) === target);
+  }, [sanitizedPackStock, stockRarityFilter]);
+  const buybackQuote = useMemo(() => {
+    if (!slots || slots.length === 0) return null;
+    let totalUsd = 0;
+    slots.forEach((slot) => {
+      const tid = slot.template_id;
+      if (tid && packPriceMap[tid]) {
+        totalUsd += packPriceMap[tid];
+      }
+    });
+    if (totalUsd <= 0) return null;
+    return { totalUsd, buybackUsd: totalUsd * 0.9 };
+  }, [slots, packPriceMap]);
+  const sellbackLabel = useMemo(() => {
+    const formatted = formatUsd(buybackQuote?.buybackUsd ?? null);
+    if (formatted) return `Instant sell-back (${formatted} @90%)`;
+    return 'Instant sell-back (90%)';
+  }, [buybackQuote]);
+  const packValue = useMemo(() => {
+    if (!enrichedSlots.length) return { total: 0, items: [] as typeof enrichedSlots, goodHits: [] as typeof enrichedSlots };
+    const total = enrichedSlots.reduce((sum, slot) => sum + (slot.priceUsd || 0), 0);
+    const goodHits = enrichedSlots.filter((slot) => slot.goodHit && (slot.priceUsd || 0) > 0);
+    return { total, items: enrichedSlots, goodHits };
+  }, [enrichedSlots]);
 
   useEffect(() => {
     setModalFaceBack(true);
+    setFlipHintVisible(true);
   }, [revealIndex]);
 
   const revealCurrent = (idx: number) => {
@@ -798,6 +1049,7 @@ export default function GachaPage() {
     if (!revealed[revealIndex]) {
       revealCurrent(revealIndex);
       setModalFaceBack(false);
+      setFlipHintVisible(false);
       return;
     }
     if (revealIndex < enrichedSlots.length - 1) {
@@ -835,7 +1087,7 @@ export default function GachaPage() {
         </div>
         <div className="flex-1 flex items-center justify-center">
           <img
-            src={slot.image}
+            src={slot.cardImage || slot.frontImage}
             alt={slot.displayName}
             className={`h-full w-full object-contain drop-shadow-lg transition duration-300 ${slot.revealed ? 'opacity-100' : 'opacity-70'}`}
             onError={(e) => {
@@ -843,10 +1095,27 @@ export default function GachaPage() {
             }}
           />
         </div>
-        <div className={`px-2 pb-2 transition-opacity ${i <= revealIndex && slot.revealed ? 'opacity-100' : 'opacity-30'}`}>
-          <p className="text-sm text-white/60">{slot.rarity}</p>
-          <p className="text-lg font-semibold leading-tight">{slot.displayName}</p>
-        </div>
+        {slot.revealed ? (
+          <div className="px-2 pb-2 transition-opacity opacity-100">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-sm text-white/60">{slot.rarity}</p>
+              {slot.goodHit && <span className="text-[10px] px-2 py-1 rounded-full bg-aurora/30 text-white/90 uppercase tracking-wide">Good hit</span>}
+            </div>
+            <p className="text-lg font-semibold leading-tight">{slot.displayName}</p>
+            {formatUsd(slot.priceUsd ?? null) && (
+              <div className="text-xs text-white/80 mt-1">
+                <span className="font-semibold">{formatUsd(slot.priceUsd ?? null)}</span>
+                {slot.gradeEstimate && (
+                  <span className="ml-2 text-white/60">
+                    PSA9 ~{formatUsd(slot.gradeEstimate.psa9)} · PSA10 ~{formatUsd(slot.gradeEstimate.psa10)}
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="px-2 pb-2 h-10 opacity-0" aria-hidden="true" />
+        )}
       </div>
     </motion.div>
   ));
@@ -869,23 +1138,25 @@ export default function GachaPage() {
             exit={{ opacity: 0 }}
           >
             <div className="absolute inset-0 pointer-events-none bg-[radial-gradient(circle_at_20%_20%,rgba(244,114,182,0.18),transparent_35%),radial-gradient(circle_at_80%_0%,rgba(52,211,153,0.12),transparent_35%)]" />
-            <div className="relative h-full w-full">
-              <video
-                key={openingVideoSrc}
-                src={openingVideoSrc}
-                className="absolute inset-0 h-full w-full object-cover"
-                autoPlay
-                muted
-                playsInline
-                onEnded={handleVideoFinished}
-                onError={handleVideoFinished}
-              />
-              <div className="absolute inset-0 bg-gradient-to-b from-black/30 via-black/40 to-black/70" />
-              <div className="relative h-full w-full flex flex-col items-center justify-end pb-10 px-4 gap-4 text-center">
+            <div className="relative h-full w-full flex items-center justify-center">
+              <div className="absolute inset-0 bg-gradient-to-b from-black/30 via-black/45 to-black/80 pointer-events-none" />
+              <div className="relative z-10 flex h-full w-full items-center justify-center px-4">
+                <video
+                  key={openingVideoSrc}
+                  src={openingVideoSrc}
+                  className="max-h-[82vh] w-full max-w-5xl object-contain"
+                  autoPlay
+                  muted
+                  playsInline
+                  onEnded={handleVideoFinished}
+                  onError={handleVideoFinished}
+                />
+              </div>
+              <div className="absolute bottom-8 left-0 right-0 z-20 flex flex-col items-center justify-center px-4 gap-3 text-center">
                 <p className="text-sm text-white/80">Summoning pack… hang tight</p>
                 <button
                   type="button"
-                  className="rounded-xl border border-white/30 bg-black/50 px-5 py-2 text-sm font-semibold text-white shadow-lg shadow-black/30 hover:border-aurora/70"
+                  className="rounded-xl border border-white/30 bg-black/60 px-5 py-2 text-sm font-semibold text-white shadow-lg shadow-black/30 hover:border-aurora/70"
                   onClick={handleVideoFinished}
                 >
                   Skip animation
@@ -904,75 +1175,127 @@ export default function GachaPage() {
         </div>
       )}
       <div className="card-blur rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-white/80">
-        <div className="flex items-center justify-between mb-2">
+        <div className="flex items-center gap-3 mb-2">
           <div className="text-base font-semibold">On-chain stock ({selectedPackInfo.name})</div>
           {inventoryError && <span className="text-xs text-amber-300">{inventoryError}</span>}
         </div>
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 text-xs">
-          {[
-            { key: 'Rare', label: 'Rare' },
-            { key: 'Double rare', label: 'DoubleRare' },
-            { key: 'Ultra Rare', label: 'UltraRare' },
-            { key: 'Illustration rare', label: 'IllustrationRare' },
-            { key: 'Special illustration rare', label: 'SpecialIllustration' },
-            { key: 'Mega Hyper Rare', label: 'MegaHyper' },
-          ].map(({ key, label }) => {
-            const val =
-              inventoryCounts?.[key] ??
-              inventoryCounts?.[key.toLowerCase()] ??
-              inventoryCounts?.[label] ??
-              0;
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2 text-xs">
+          {displayedRarities.map(({ key, rarity, display }) => {
+            const isAll = normalizeRarity(rarity) === 'all';
+            const count = (() => {
+              if (isAll) {
+                return displayedRarities
+                  .filter((r) => normalizeRarity(r.rarity) !== 'all')
+                  .reduce((sum, r) => {
+                    const val =
+                      inventoryCounts?.[r.key] ??
+                      inventoryCounts?.[r.key.toLowerCase()] ??
+                      inventoryCounts?.[r.rarity] ??
+                      0;
+                    return sum + val;
+                  }, 0);
+              }
+              return (
+                inventoryCounts?.[key] ??
+                inventoryCounts?.[key.toLowerCase()] ??
+                inventoryCounts?.[rarity] ??
+                0
+              );
+            })();
+            const rate = isAll
+              ? { percent: 100, expected: orderedRarityRates.reduce((sum, r) => sum + (normalizeRarity(r.rarity) === 'energy' ? 0 : r.expected), 0) }
+              : ratesByRarity[normalizeRarity(rarity)];
+            const isActive = normalizeRarity(stockRarityFilter) === normalizeRarity(rarity);
+            const rateText = (() => {
+              if (!rate) return '—';
+              if (isAll) return `${rate.expected.toFixed(1)} cards / pack`;
+              const packsPer = rate.expected > 0 ? 1 / rate.expected : null;
+              const packsLabel =
+                packsPer === null ? '—' : packsPer < 1.1 ? '~1 pack' : `~${packsPer.toFixed(1)} packs`;
+              return `${rate.percent.toFixed(1)}% · ≈1 in ${packsLabel}`;
+            })();
             return (
-              <div key={key} className="rounded-xl bg-white/5 border border-white/10 p-2 text-center">
-                <div className="text-[11px] text-white/60">{label}</div>
-                <div className="text-lg font-semibold">{inventoryCounts ? val : '—'}</div>
-              </div>
+              <button
+                key={key}
+                type="button"
+                onClick={() => setStockRarityFilter(rarity)}
+                className={`rounded-xl p-3 text-left border transition flex flex-col gap-1 ${
+                  isActive ? 'border-aurora/60 bg-aurora/10 text-white' : 'border-white/10 bg-white/5 text-white/80 hover:border-aurora/40'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <div className="text-[11px] uppercase text-white/60 truncate">{display}</div>
+                  <div className="text-sm font-semibold">{inventoryCounts ? count : '—'}</div>
+                </div>
+                <div className="text-[12px] text-white/70 truncate">{rateText}</div>
+              </button>
             );
           })}
         </div>
         <div className="mt-4">
-          <div className="text-xs uppercase text-white/60 mb-1">Stock list</div>
-          <div className="max-h-60 overflow-y-auto space-y-1 pr-1">
+          <div className="flex items-center justify-between text-xs text-white/60 mb-1 uppercase">
+            <span>Stock list</span>
+            <span className="text-white/50 normal-case">
+              {stockRarityFilter === 'all' ? 'All rarities' : `${displayRarityLabel(stockRarityFilter)} only`}
+            </span>
+          </div>
+          <div className="max-h-60 overflow-y-auto pr-1 grid grid-cols-1 sm:grid-cols-2 gap-2">
             {packStockError && <div className="text-amber-300 text-xs">{packStockError}</div>}
             {!packStock && !packStockError && <div className="text-white/60 text-xs">Loading…</div>}
-            {packStock && packStock.length === 0 && <div className="text-white/60 text-xs">No on-chain supply for this pack yet.</div>}
+            {packStock && filteredStock.length === 0 && (
+              <div className="text-white/60 text-xs">
+                {stockRarityFilter === 'all'
+                  ? 'No on-chain supply for this pack yet.'
+                  : `No ${displayRarityLabel(stockRarityFilter)} cards in stock.`}
+              </div>
+            )}
             {packStock &&
-              packStock
-                .filter((s) => s.total > 0)
-                .sort((a, b) => a.template_id - b.template_id)
-                .map((s) => (
-                  <div key={s.template_id} className="text-xs text-white/80">
-                    {s.name} ({s.rarity}{s.variant ? ` ${s.variant}` : ''}):{' '}
-                    <span className="font-semibold">{s.remaining}</span> / {s.total} remaining
-                  </div>
-                ))}
+              filteredStock
+                .sort((a, b) => (a.template_id || 0) - (b.template_id || 0))
+                .map((s) => {
+                  const priceLabel = formatUsd(s.price ?? null);
+                  return (
+                    <div key={s.template_id ?? `${s.name}-${s.rarity}`} className="text-xs text-white/80">
+                      <span className="font-semibold truncate block">{s.name}</span>
+                      <span className="text-white/60">
+                        {s.rarity}
+                        {s.variant ? ` ${s.variant}` : ''}
+                        <span className="ml-1 text-white/80">
+                          · {s.remaining} remaining{priceLabel ? ` (${priceLabel})` : ''}
+                        </span>
+                      </span>
+                    </div>
+                  );
+                })}
           </div>
         </div>
       </div>
       <div className="card-blur rounded-3xl p-6 border border-white/5 grid lg:grid-cols-[1.1fr,0.9fr] gap-6 items-center">
-        <div className="space-y-3">
-          <div className="flex items-center gap-3">
-            <img src="/mochi_icon.png" alt="Mochi icon" className="h-10 w-10 rounded-full" />
+        <div className="space-y-4">
+          <div className="flex items-start justify-between gap-3">
             <div>
               <p className="text-sm uppercase text-white/60 tracking-[0.2em]">{selectedPackInfo.name}</p>
-              <p className="text-xl font-semibold">11 cards</p>
+              <p className="text-xl font-semibold">Choose your pack</p>
             </div>
+            <div className="rounded-xl border border-white/15 bg-white/5 px-3 py-2 text-xs text-white/70">11 cards</div>
           </div>
           <div className="flex flex-wrap gap-3">
-      {packOptions.map((pack) => (
-        <button
-          key={pack.id}
-          type="button"
-          onClick={() => setSelectedPack(pack.id)}
-          className={`flex items-center gap-3 rounded-2xl border px-3 py-2 ${
-            selectedPack === pack.id ? 'border-aurora/60 bg-aurora/10' : 'border-white/10 bg-white/5'
-          }`}
-        >
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src={pack.image} alt={pack.name} className={packThumbClass} />
-          <div className="text-left">
-            <p className="font-semibold">{pack.name}</p>
-                  <p className="text-xs text-white/60">{pack.priceSol} SOL / {pack.priceUsdc} USDC</p>
+            {packOptions.map((pack) => (
+              <button
+                key={pack.id}
+                type="button"
+                onClick={() => setSelectedPack(pack.id)}
+                className={`flex items-center gap-3 rounded-2xl border px-3 py-2 ${
+                  selectedPack === pack.id ? 'border-aurora/60 bg-aurora/10' : 'border-white/10 bg-white/5'
+                }`}
+              >
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={pack.image} alt={pack.name} className={packThumbClass} />
+                <div className="text-left">
+                  <p className="font-semibold">{pack.name}</p>
+                  <p className="text-xs text-white/60">
+                    {pack.priceSol} SOL / {pack.priceUsdc} USDC
+                  </p>
                 </div>
               </button>
             ))}
@@ -980,11 +1303,16 @@ export default function GachaPage() {
           <div className="flex flex-wrap gap-3">
             <div className="p-3 rounded-xl bg-white/5 border border-white/10 min-w-[160px] flex-1">
               <p className="text-xs uppercase text-white/60">Price</p>
-              <p className="text-lg font-semibold">{selectedPackInfo.priceSol} SOL / {selectedPackInfo.priceUsdc} USDC</p>
+              <p className="text-lg font-semibold">
+                {selectedPackInfo.priceSol} SOL / {selectedPackInfo.priceUsdc} USDC
+              </p>
             </div>
             <div className="p-3 rounded-xl bg-white/5 border border-white/10 min-w-[160px] flex-1">
               <p className="text-xs uppercase text-white/60">Buyback</p>
-              <p className="text-lg font-semibold">90% full-pack</p>
+              <p className="text-lg font-semibold">
+                {buybackQuote ? formatUsd(buybackQuote.buybackUsd) || 'Estimating…' : '90% full-pack'}
+              </p>
+              <p className="text-[11px] text-white/60">90% of cached market value</p>
             </div>
             <div className="p-3 rounded-xl bg-white/5 border border-white/10 min-w-[160px] flex-1">
               <p className="text-xs uppercase text-white/60">Timer</p>
@@ -1018,40 +1346,68 @@ export default function GachaPage() {
         </div>
       </div>
 
-      <div className="flex flex-col md:flex-row gap-3">
-        <input
-          value={clientSeed}
-          onChange={(e) => setClientSeed(e.target.value)}
-          placeholder="Client seed for provably-fair RNG"
-          className="flex-1 px-4 py-3 rounded-xl bg-white/5 border border-white/10"
-        />
-        <div className="flex items-center gap-2 text-sm text-white/70 rounded-xl border border-white/10 bg-white/5 px-3 py-2">
-          <input type="checkbox" checked={useUsdc} onChange={(e) => setUseUsdc(e.target.checked)} />
-          <span>Pay with USDC</span>
+      <div className="space-y-2">
+        <div className="flex flex-wrap items-center gap-2 text-xs text-white/60">
+          <span className="glass-chip glass-chip--tiny">Provably fair</span>
+          <span className="glass-chip glass-chip--tiny border border-aurora/40 bg-aurora/15 text-emerald-100">
+            Test environment – pack purchases are running on devnet.
+          </span>
         </div>
-        <button
-          onClick={handlePreview}
-          className="px-4 py-3 rounded-xl bg-white/10 border border-white/10 w-full md:w-auto"
-        >
-          Preview RNG
-        </button>
-        <button
-          onClick={handleOpen}
-          disabled={!connected || openLoading || !!sessionId}
-          className="px-5 py-3 rounded-xl bg-sakura text-ink font-semibold shadow-glow disabled:opacity-50 disabled:cursor-not-allowed w-full md:w-auto"
-        >
-          {sessionId ? 'Session active' : openLoading ? 'Awaiting wallet…' : 'Buy pack'}
-        </button>
+        <div className="flex flex-col md:flex-row gap-3">
+          <input
+            value={clientSeed}
+            onChange={(e) => setClientSeed(e.target.value)}
+            placeholder="Client seed for provably-fair RNG"
+            className="flex-1 px-4 py-3 rounded-xl bg-white/5 border border-white/10"
+          />
+          <div className="flex items-center gap-2 text-sm text-white/70 rounded-xl border border-white/10 bg-white/5 px-3 py-2">
+            <input type="checkbox" checked={useUsdc} onChange={(e) => setUseUsdc(e.target.checked)} />
+            <span>Pay with USDC</span>
+          </div>
+          <button
+            onClick={handlePreview}
+            className="px-4 py-3 rounded-xl bg-white/10 border border-white/10 w-full md:w-auto"
+          >
+            Preview RNG
+          </button>
+          <div className="relative w-full md:w-auto">
+            <button
+              type="button"
+              onClick={handleOpen}
+              aria-disabled={openLoading || !!sessionId}
+              className="relative w-full overflow-hidden rounded-xl border border-white/15 bg-white/5 px-5 py-3 text-sm font-semibold text-white/70 shadow-[0_0_18px_rgba(0,0,0,0.45)] transition hover:border-white/30 hover:text-white cursor-pointer"
+              title="Production buys go live on mainnet. For now, please test using Demo / Test Pack."
+            >
+              <span className="pointer-events-none absolute inset-0 rounded-xl bg-gradient-to-br from-white/10 via-transparent to-white/5 opacity-50" />
+              <span className="pointer-events-none absolute inset-0 rounded-xl border border-white/10 opacity-60" />
+              <span className="pointer-events-none absolute -left-4 top-1/2 h-px w-[140%] bg-white/20 rotate-3" />
+              <span className="pointer-events-none absolute -right-4 top-1/2 h-px w-[140%] bg-white/15 -rotate-3" />
+              <span className="relative flex items-center justify-center gap-2">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true" className="text-white/60">
+                  <path d="M5 19l14-14M5 5l14 14" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+                </svg>
+                <span>{sessionId ? 'Session active' : openLoading ? 'Awaiting wallet…' : 'Buy pack (mainnet soon)'}</span>
+              </span>
+            </button>
+            <p className="mt-1 text-xs text-white/50">{MAINNET_LAUNCH_NOTE}</p>
+          </div>
+        </div>
       </div>
-      <div className="flex flex-wrap gap-3 items-center">
+      <div className="flex flex-wrap gap-3 items-start">
         <button
           onClick={handleTestPurchase}
-          className="px-4 py-2 rounded-xl bg-white/10 border border-white/10 text-sm w-full sm:w-auto"
+          className="relative overflow-hidden px-4 py-2 rounded-xl bg-gradient-to-r from-aurora/60 via-white/10 to-sakura/60 border border-aurora/40 text-sm font-semibold text-white shadow-[0_0_22px_rgba(99,255,203,0.35)] w-full sm:w-auto"
           type="button"
         >
-          Demo / Test Pack – No Deduction
+          <span className="pointer-events-none absolute inset-0 bg-white/40 opacity-20 blur-xl" />
+          <span className="relative">Demo / Test Pack – No Deduction</span>
         </button>
-        {testModeMsg && <p className="text-sm text-white/60">{testModeMsg}</p>}
+        <div className="flex flex-col gap-1 text-left max-w-xl">
+          <p className="text-sm text-white/70">
+            Please use Demo / Test Pack while we prepare mainnet launch. No SOL/USDC will be deducted.
+          </p>
+          {testModeMsg && <p className="text-sm text-white/60">{testModeMsg}</p>}
+        </div>
       </div>
       {connected && (
         <div className="flex flex-wrap gap-3 items-center">
@@ -1157,14 +1513,29 @@ export default function GachaPage() {
                   <div className="relative">
                     <FlipModalCard
                       backImage="/card_back.png"
-                      frontImage={enrichedSlots[revealIndex].image}
+                      frontImage={enrichedSlots[revealIndex].frontImage || enrichedSlots[revealIndex].cardImage || '/card_back.png'}
                       faceBack={modalFaceBack}
                       onAdvance={swipeAdvanceModal}
+                      showHint={modalFaceBack && flipHintVisible}
+                      onInteract={() => setFlipHintVisible(false)}
                     />
-                    <div className="absolute bottom-2 inset-x-0 p-2 bg-gradient-to-t from-black/70 to-transparent rounded-b-2xl text-center">
-                      <p className="text-xs text-white/70">{enrichedSlots[revealIndex].rarity}</p>
-                      <p className="text-sm font-semibold">{enrichedSlots[revealIndex].displayName}</p>
-                    </div>
+                    {!modalFaceBack && (
+                      <div className="absolute bottom-2 inset-x-0 p-2 bg-gradient-to-t from-black/70 to-transparent rounded-b-2xl text-center">
+                        <p className="text-xs text-white/70">{enrichedSlots[revealIndex].rarity}</p>
+                        <p className="text-sm font-semibold">{enrichedSlots[revealIndex].displayName}</p>
+                        {formatUsd(enrichedSlots[revealIndex].priceUsd ?? null) && (
+                          <p className="text-xs text-white/70">
+                            {formatUsd(enrichedSlots[revealIndex].priceUsd ?? null)}
+                            {enrichedSlots[revealIndex].gradeEstimate && (
+                              <span className="ml-1 text-white/50">
+                                · PSA9 ~{formatUsd(enrichedSlots[revealIndex].gradeEstimate?.psa9)} / PSA10 ~
+                                {formatUsd(enrichedSlots[revealIndex].gradeEstimate?.psa10)}
+                              </span>
+                            )}
+                          </p>
+                        )}
+                      </div>
+                    )}
                   </div>
                   <div className="flex gap-2">
                     <button
@@ -1186,6 +1557,58 @@ export default function GachaPage() {
           </motion.div>
         )}
       </AnimatePresence>
+
+      {packValue.items.length > 0 && (
+        <div className="card-blur rounded-2xl border border-white/10 bg-white/5 p-4 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className="text-xs uppercase text-white/60 tracking-[0.2em]">Pack summary</p>
+              <p className="text-2xl font-semibold text-white">
+                Total value: {formatUsd(packValue.total) || '$0.00'}
+              </p>
+              <p className="text-xs text-white/60">
+                Live market pulls · PSA estimates are heuristic to highlight potential graded upside.
+              </p>
+            </div>
+            <div className="text-right">
+              <p className="text-xs uppercase text-white/60">Good hits</p>
+              <p className="text-lg font-semibold text-white">
+                {packValue.goodHits.length ? `${packValue.goodHits.length} card${packValue.goodHits.length > 1 ? 's' : ''}` : 'None yet'}
+              </p>
+            </div>
+          </div>
+          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+            {packValue.items.map((slot, idx) => {
+              const priceLabel = formatUsd(slot.priceUsd ?? null) || 'Price pending';
+              return (
+                <div key={`${slot.template_id}-${idx}`} className="flex items-center gap-3 rounded-xl border border-white/10 bg-white/10 p-3">
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={slot.frontImage || '/card_back.png'}
+                    alt={slot.displayName}
+                    className="h-14 w-10 object-contain rounded-lg bg-black/40"
+                  />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-[11px] uppercase text-white/60 truncate">{slot.rarity}</p>
+                    <p className="text-sm font-semibold text-white truncate">{slot.displayName}</p>
+                    <p className="text-xs text-white/70 truncate">
+                      {priceLabel}
+                      {slot.gradeEstimate && slot.priceUsd ? (
+                        <span className="ml-1 text-white/50">
+                          · PSA9 ~{formatUsd(slot.gradeEstimate.psa9)} / PSA10 ~{formatUsd(slot.gradeEstimate.psa10)}
+                        </span>
+                      ) : null}
+                    </p>
+                  </div>
+                  {slot.goodHit && (
+                    <span className="text-[11px] px-2 py-1 rounded-full bg-aurora/30 text-white whitespace-nowrap">Good hit</span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {proof && (
         <div className="card-blur rounded-2xl p-4 border border-white/5 text-sm text-white/80 space-y-3">
@@ -1235,7 +1658,7 @@ export default function GachaPage() {
           disabled={!sessionId || sellbackLoading || !confirmDone}
           className="px-5 py-3 rounded-xl border border-white/20 hover:border-sakura text-white disabled:opacity-50 disabled:cursor-not-allowed w-full sm:w-auto"
         >
-          {sellbackLoading ? 'Processing…' : 'Instant sell-back (90%)'}
+          {sellbackLoading ? 'Processing…' : sellbackLabel}
         </button>
         <button
           onClick={handleExpire}

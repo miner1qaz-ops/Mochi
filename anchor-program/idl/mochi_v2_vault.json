@@ -2374,6 +2374,7 @@
         },
         {
           "name": "vault_authority",
+          "writable": true,
           "pda": {
             "seeds": [
               {
@@ -2771,6 +2772,16 @@
           "type": {
             "option": "pubkey"
           }
+        },
+        {
+          "name": "mochi_mint",
+          "type": {
+            "option": "pubkey"
+          }
+        },
+        {
+          "name": "reward_per_pack",
+          "type": "u64"
         }
       ]
     },
@@ -2958,6 +2969,215 @@
       ]
     },
     {
+      "name": "migrate_marketplace_vault",
+      "docs": [
+        "One-time migration to grow the marketplace VaultState PDA to the expanded size."
+      ],
+      "discriminator": [
+        139,
+        177,
+        175,
+        118,
+        232,
+        254,
+        107,
+        46
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "vault_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_authority",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "marketplace_fee_bps",
+          "type": "u16"
+        },
+        {
+          "name": "core_collection",
+          "type": {
+            "option": "pubkey"
+          }
+        },
+        {
+          "name": "usdc_mint",
+          "type": {
+            "option": "pubkey"
+          }
+        },
+        {
+          "name": "mochi_mint",
+          "type": {
+            "option": "pubkey"
+          }
+        }
+      ]
+    },
+    {
+      "name": "migrate_vault_state",
+      "docs": [
+        "One-time migration to grow the VaultState account to the new size that includes MOCHI rewards."
+      ],
+      "discriminator": [
+        102,
+        131,
+        230,
+        150,
+        169,
+        240,
+        189,
+        142
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "vault_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "pack_price_sol",
+          "type": "u64"
+        },
+        {
+          "name": "pack_price_usdc",
+          "type": "u64"
+        },
+        {
+          "name": "buyback_bps",
+          "type": "u16"
+        },
+        {
+          "name": "claim_window_seconds",
+          "type": "i64"
+        },
+        {
+          "name": "marketplace_fee_bps",
+          "type": "u16"
+        },
+        {
+          "name": "usdc_mint",
+          "type": {
+            "option": "pubkey"
+          }
+        },
+        {
+          "name": "mochi_mint",
+          "type": {
+            "option": "pubkey"
+          }
+        },
+        {
+          "name": "reward_per_pack",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "open_pack",
       "docs": [
         "New lightweight open: only Rare+ CardRecords are reserved on-chain (max 3).",
@@ -3076,6 +3296,18 @@
           "docs": [
             "Treasury to receive SOL fees (typically same as vault_authority PDA)"
           ],
+          "writable": true
+        },
+        {
+          "name": "reward_mint",
+          "writable": true
+        },
+        {
+          "name": "reward_vault",
+          "writable": true
+        },
+        {
+          "name": "user_token_account",
           "writable": true
         },
         {
@@ -3609,6 +3841,98 @@
       "args": []
     },
     {
+      "name": "set_reward_config",
+      "docs": [
+        "Admin-configurable MOCHI reward mint + per-pack amount (raw units)."
+      ],
+      "discriminator": [
+        163,
+        34,
+        211,
+        14,
+        25,
+        118,
+        181,
+        233
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true
+        },
+        {
+          "name": "vault_state",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  115,
+                  116,
+                  97,
+                  116,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_authority",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  97,
+                  117,
+                  116,
+                  104,
+                  111,
+                  114,
+                  105,
+                  116,
+                  121
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state"
+              }
+            ]
+          }
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": [
+        {
+          "name": "mochi_mint",
+          "type": "pubkey"
+        },
+        {
+          "name": "reward_per_pack",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "user_reset_session",
       "discriminator": [
         31,
@@ -3786,6 +4110,21 @@
       ]
     }
   ],
+  "events": [
+    {
+      "name": "RewardMinted",
+      "discriminator": [
+        108,
+        6,
+        249,
+        213,
+        90,
+        137,
+        90,
+        233
+      ]
+    }
+  ],
   "errors": [
     {
       "code": 6000,
@@ -3849,51 +4188,56 @@
     },
     {
       "code": 6012,
+      "name": "RewardDisabled",
+      "msg": "Reward disabled"
+    },
+    {
+      "code": 6013,
       "name": "AssetMismatch",
       "msg": "Asset mismatch"
     },
     {
-      "code": 6013,
+      "code": 6014,
       "name": "MathOverflow",
       "msg": "Math overflow"
     },
     {
-      "code": 6014,
+      "code": 6015,
       "name": "MissingTokenAccount",
       "msg": "Missing token account"
     },
     {
-      "code": 6015,
+      "code": 6016,
       "name": "MintMismatch",
       "msg": "Mint mismatch"
     },
     {
-      "code": 6016,
+      "code": 6017,
       "name": "CoreCpiError",
       "msg": "Core CPI error"
     },
     {
-      "code": 6017,
+      "code": 6018,
       "name": "TooManyRareCards",
       "msg": "Too many Rare+ cards provided"
     },
     {
-      "code": 6018,
+      "code": 6019,
       "name": "CardTooCommon",
       "msg": "Card rarity must be Rare or above"
     },
     {
-      "code": 6019,
+      "code": 6020,
       "name": "TemplateMismatch",
       "msg": "Card template mismatch"
     },
     {
-      "code": 6020,
+      "code": 6021,
       "name": "CardKeyMismatch",
       "msg": "Card key mismatch"
     },
     {
-      "code": 6021,
+      "code": 6022,
       "name": "RarityMismatch",
       "msg": "Rarity mismatch"
     }
@@ -4232,6 +4576,30 @@
       }
     },
     {
+      "name": "RewardMinted",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "user",
+            "type": "pubkey"
+          },
+          {
+            "name": "ata",
+            "type": "pubkey"
+          },
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
       "name": "VaultState",
       "type": {
         "kind": "struct",
@@ -4275,6 +4643,16 @@
             "type": {
               "option": "pubkey"
             }
+          },
+          {
+            "name": "mochi_mint",
+            "type": {
+              "option": "pubkey"
+            }
+          },
+          {
+            "name": "reward_per_pack",
+            "type": "u64"
           },
           {
             "name": "vault_authority_bump",

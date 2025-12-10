@@ -145,7 +145,7 @@ a {
 
 .hero-stage {
   position: relative;
-  perspective: 1400px;
+  perspective: 1000px;
   isolation: isolate;
 }
 
@@ -158,6 +158,8 @@ a {
   --rz: 0deg;
   --tx-base: 0px;
   --ty-base: 0px;
+  --tz-base: 0px;
+  --origin-y: 120%;
   --glow-color: rgba(245, 82, 185, 0.35);
   /* Default scale for hero cards */
   --scale: 0.73;
@@ -175,8 +177,8 @@ a {
   position: absolute;
   left: 50%;
   top: 50%;
-  width: 190px;
-  height: 255px;
+  width: 200px;
+  height: 270px;
   transform: translate(-50%, -50%);
 }
 
@@ -204,19 +206,20 @@ a {
 .card-face {
   position: relative;
   height: 100%;
-  padding: 10px;
+  padding: 0;
   border-radius: 18px;
-  background: linear-gradient(150deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.02));
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+  background: transparent;
+  border: none;
+  box-shadow: none;
   transform: translate3d(var(--tx-base), var(--ty-base), 0)
+    translateZ(var(--tz-base))
     translate3d(var(--tx), var(--ty), 0)
     rotateX(var(--rx))
     rotateY(var(--ry))
     rotateZ(var(--rz))
     translateY(var(--lift))
     scale(var(--scale));
-  transform-origin: center;
+  transform-origin: 50% var(--origin-y);
   transition: transform 180ms ease-out, box-shadow 220ms ease-out, border-color 180ms ease-out, background 200ms ease-out;
 }
 
@@ -342,6 +345,20 @@ a {
   --glow-color: rgba(162, 126, 255, 0.45);
 }
 
+.hero-card-img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  border-radius: 18px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45), 0 0 32px var(--glow-color);
+  background: #05070f;
+}
+
+.hero-card img.rarity-glow {
+  border: none;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45), 0 0 32px var(--glow-color);
+}
+
 .hero-text {
   transition: transform 160ms ease, font-size 160ms ease, opacity 160ms ease;
 }
@@ -370,4 +387,26 @@ a {
 .mochi-float {
   animation: mochi-float 8s ease-in-out infinite;
   will-change: transform, filter;
+}
+
+.flow-line {
+  background: linear-gradient(
+    90deg,
+    rgba(33, 212, 253, 0.45),
+    rgba(245, 82, 185, 0.5),
+    rgba(110, 255, 196, 0.45),
+    rgba(33, 212, 253, 0.45)
+  );
+  background-size: 200% 100%;
+  animation: flowline 5s linear infinite;
+  filter: drop-shadow(0 0 12px rgba(33, 212, 253, 0.25));
+}
+
+@keyframes flowline {
+  0% {
+    background-position: 0% 50%;
+  }
+  100% {
+    background-position: -200% 50%;
+  }
 }

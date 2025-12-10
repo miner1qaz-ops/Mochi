@@ -8,6 +8,8 @@ import os
 import random
 import time
 import uuid
+import threading
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 import logging
 
@@ -30,6 +32,7 @@ from solana.rpc.types import TxOpts, MemcmpOpts
 from sqlalchemy import Index, and_, or_, text
 from sqlmodel import Field, Session, SQLModel, create_engine, select, func
 
+from smart_price_scheduler import start_smart_price_scheduler
 from tx_builder import (
     build_admin_force_expire_ix,
     build_admin_force_close_session_ix,
@@ -100,6 +103,13 @@ class Settings(BaseSettings):
     claim_window_seconds: int = 3600
     server_seed: str = os.environ.get("SERVER_SEED", "dev-server-seed")
     database_url: str = "sqlite:///./mochi.db"
+    price_fetch_enabled: bool = True
+    price_fetch_interval_minutes: int = 240
+    legacy_price_fetch_enabled: bool = False
+    pokemon_price_api: Optional[str] = "https://www.pokemonpricetracker.com/api/prices"
+    pokemon_price_api_key: Optional[str] = None
+    pokemon_price_tracker_base: str = "https://www.pokemonpricetracker.com/api/v2"
+    pokemon_price_tracker_api_key: Optional[str] = None
 
     class Config:
         env_file = ".env"
@@ -116,6 +126,7 @@ engine = create_engine(auth_settings.database_url)
 rpc_url = auth_settings.helius_rpc_url or auth_settings.solana_rpc
 sol_client = SolanaClient(rpc_url)
 ADMIN_KEYPAIR: Optional[SoldersKeypair] = None
+PRICE_FETCHER_THREAD: Optional[threading.Thread] = None
 # Standard SPL Associated Token Program ID (same across clusters)
 ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
 SYSVAR_RENT_PUBKEY = Pubkey.from_string("SysvarRent111111111111111111111111111111111")
@@ -130,9 +141,25 @@ class CardTemplate(SQLModel, table=True):
     variant: Optional[str] = None
     set_code: Optional[str] = None
     set_name: Optional[str] = None
+    tcgplayer_id: Optional[str] = Field(default=None, index=True)
+    serial_number: Optional[str] = None
     is_energy: bool = False
     energy_type: Optional[str] = None
     image_url: Optional[str] = None
+    current_price: float = Field(default=0)
+    current_price_updated_at: float = Field(default=0)
+    cached_price: float = Field(default=0)
+    cached_price_updated_at: float = Field(default=0)
+
+
+class CardPriceMapping(SQLModel, table=True):
+    template_id: int = Field(primary_key=True)
+    tcgplayer_id: Optional[str] = Field(default=None, index=True)
+    ppt_id: Optional[str] = Field(default=None, index=True)
+    last_mapped_at: float = Field(default=0)
+    last_price_fetch_at: float = Field(default=0)
+    fetch_attempt_count: int = Field(default=0)
+    last_status: Optional[str] = None
 
 
 class MintRecord(SQLModel, table=True):
@@ -197,9 +224,26 @@ class PriceSnapshot(SQLModel, table=True):
     mid_price: float = Field(default=0)
     low_price: float = Field(default=0)
     high_price: float = Field(default=0)
+    raw_market_price: float = Field(default=0)
+    raw_near_mint_price: float = Field(default=0)
+    psa8_price: float = Field(default=0)
+    psa9_price: float = Field(default=0)
+    psa10_price: float = Field(default=0)
+    last_updated: float = Field(default=0)
+    is_stale: bool = Field(default=False)
+    fetch_attempt_count: int = Field(default=0)
     collected_at: float = Field(default_factory=lambda: time.time())
 
     __table_args__ = (Index("idx_price_snapshot_template_ts", "template_id", "collected_at"),)
+
+
+class PriceHistory(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    card_template_id: int = Field(index=True)
+    price: float = Field(default=0)
+    collected_at: float = Field(default_factory=lambda: time.time())
+
+    __table_args__ = (Index("idx_price_history_template_ts", "card_template_id", "collected_at"),)
 
 
 def ensure_price_snapshot_schema():
@@ -212,14 +256,84 @@ def ensure_price_snapshot_schema():
         except Exception:
             existing_cols = set()
         alters: List[Tuple[str, str]] = []
-        if "market_price" not in existing_cols:
-            alters.append(("ADD COLUMN market_price FLOAT DEFAULT 0", "market_price"))
-        if "direct_low" not in existing_cols:
-            alters.append(("ADD COLUMN direct_low FLOAT DEFAULT 0", "direct_low"))
+        desired_columns = [
+            ("market_price", "ADD COLUMN market_price FLOAT DEFAULT 0"),
+            ("direct_low", "ADD COLUMN direct_low FLOAT DEFAULT 0"),
+            ("raw_market_price", "ADD COLUMN raw_market_price FLOAT DEFAULT 0"),
+            ("raw_near_mint_price", "ADD COLUMN raw_near_mint_price FLOAT DEFAULT 0"),
+            ("psa8_price", "ADD COLUMN psa8_price FLOAT DEFAULT 0"),
+            ("psa9_price", "ADD COLUMN psa9_price FLOAT DEFAULT 0"),
+            ("psa10_price", "ADD COLUMN psa10_price FLOAT DEFAULT 0"),
+            ("last_updated", "ADD COLUMN last_updated REAL DEFAULT 0"),
+            ("is_stale", "ADD COLUMN is_stale BOOLEAN DEFAULT 0"),
+            ("fetch_attempt_count", "ADD COLUMN fetch_attempt_count INTEGER DEFAULT 0"),
+        ]
+        for col_name, clause in desired_columns:
+            if col_name not in existing_cols:
+                alters.append((clause, col_name))
         for clause, col in alters:
             conn.execute(text(f"ALTER TABLE PriceSnapshot {clause}"))
+        try:
+            if "raw_market_price" not in existing_cols:
+                conn.execute(text("UPDATE PriceSnapshot SET raw_market_price = market_price"))
+            if "raw_near_mint_price" not in existing_cols:
+                conn.execute(text("UPDATE PriceSnapshot SET raw_near_mint_price = market_price"))
+            if "last_updated" not in existing_cols:
+                conn.execute(text("UPDATE PriceSnapshot SET last_updated = collected_at"))
+        except Exception:
+            pass
         # ensure composite index for high-frequency inserts/reads
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_price_snapshot_template_ts ON PriceSnapshot (template_id, collected_at DESC)"))
+
+
+def ensure_price_history_schema():
+    """Create supporting index for PriceHistory without destructive migrations."""
+    with engine.begin() as conn:
+        try:
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_price_history_template_ts ON PriceHistory (card_template_id, collected_at DESC)"))
+        except Exception:
+            pass
+
+
+def ensure_card_template_schema():
+    """Add cached pricing + serial metadata without destructive migrations."""
+    with engine.begin() as conn:
+        try:
+            rows = conn.execute(text("PRAGMA table_info('CardTemplate')")).fetchall()
+            existing_cols = {row[1] for row in rows}
+        except Exception:
+            existing_cols = set()
+        alters: List[str] = []
+        if "tcgplayer_id" not in existing_cols:
+            alters.append("ADD COLUMN tcgplayer_id VARCHAR")
+        if "serial_number" not in existing_cols:
+            alters.append("ADD COLUMN serial_number VARCHAR")
+        if "current_price" not in existing_cols:
+            alters.append("ADD COLUMN current_price FLOAT DEFAULT 0")
+        if "current_price_updated_at" not in existing_cols:
+            alters.append("ADD COLUMN current_price_updated_at REAL DEFAULT 0")
+        if "cached_price" not in existing_cols:
+            alters.append("ADD COLUMN cached_price FLOAT DEFAULT 0")
+        if "cached_price_updated_at" not in existing_cols:
+            alters.append("ADD COLUMN cached_price_updated_at REAL DEFAULT 0")
+        for clause in alters:
+            conn.execute(text(f"ALTER TABLE CardTemplate {clause}"))
+        try:
+            # Backfill new price columns from legacy cached values to avoid zeros after migration.
+            if "current_price" not in existing_cols and "cached_price" in existing_cols:
+                conn.execute(text("UPDATE CardTemplate SET current_price = cached_price"))
+            if "current_price_updated_at" not in existing_cols and "cached_price_updated_at" in existing_cols:
+                conn.execute(text("UPDATE CardTemplate SET current_price_updated_at = cached_price_updated_at"))
+        except Exception:
+            pass
+        try:
+            conn.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_cardtemplate_tcgplayer_id ON CardTemplate (tcgplayer_id) WHERE tcgplayer_id IS NOT NULL"
+                )
+            )
+        except Exception:
+            pass
 
 
 def ensure_pack_reward_log_schema():
@@ -243,10 +357,44 @@ def ensure_pack_reward_log_schema():
         )
 
 
+def ensure_card_price_mapping_rows():
+    """Backfill CardPriceMapping rows for existing templates without destructive changes."""
+    with Session(engine) as session:
+        existing = {row.template_id: row for row in session.exec(select(CardPriceMapping)).all()}
+        templates = session.exec(select(CardTemplate)).all()
+        created = 0
+        updated = 0
+        for tmpl in templates:
+            mapping = existing.get(tmpl.template_id)
+            if not mapping:
+                mapping = CardPriceMapping(
+                    template_id=tmpl.template_id,
+                    tcgplayer_id=tmpl.tcgplayer_id,
+                    last_mapped_at=getattr(tmpl, "current_price_updated_at", 0) or getattr(tmpl, "cached_price_updated_at", 0) or 0,
+                    last_price_fetch_at=getattr(tmpl, "current_price_updated_at", 0) or getattr(tmpl, "cached_price_updated_at", 0) or 0,
+                )
+                session.add(mapping)
+                created += 1
+            else:
+                changed = False
+                if not mapping.tcgplayer_id and tmpl.tcgplayer_id:
+                    mapping.tcgplayer_id = tmpl.tcgplayer_id
+                    changed = True
+                if changed:
+                    session.add(mapping)
+                    updated += 1
+        if created or updated:
+            session.commit()
+            logger.info("card_price_mapping_backfill created=%s updated=%s", created, updated)
+
+
 def init_db():
     SQLModel.metadata.create_all(engine)
+    ensure_card_template_schema()
     ensure_price_snapshot_schema()
+    ensure_price_history_schema()
     ensure_pack_reward_log_schema()
+    ensure_card_price_mapping_rows()
 
 
 def get_session():
@@ -332,6 +480,9 @@ RARITY_PRICE_LAMPORTS = {
     "MegaHyperRare": 50_000_000,
     "Energy": 1_000_000,
 }
+
+PRICE_STALE_SECONDS = 4 * 3600
+SELLBACK_RATE = 0.9
 
 # Registry of supported pack sets. template_offset reserves an ID range to avoid collisions.
 PACK_REGISTRY: Dict[str, dict] = {
@@ -634,6 +785,38 @@ class PricingSearchItem(BaseModel):
 class PricingSparkline(BaseModel):
     template_id: int
     points: List[PricingHistoryPoint]
+
+
+class PriceAnalyticsRow(BaseModel):
+    template_id: int
+    name: str
+    set_name: Optional[str] = None
+    rarity: Optional[str] = None
+    image_url: Optional[str] = None
+    current_price: Optional[float] = None
+    change_24h: Optional[float] = None
+    last_updated: Optional[float] = None
+    sparkline: List[float] = []
+
+
+class PackPriceRequest(BaseModel):
+    template_ids: List[int]
+
+
+class PackPriceView(BaseModel):
+    template_id: int
+    name: Optional[str] = None
+    rarity: Optional[str] = None
+    raw_market_price: Optional[float] = None
+    market_price: Optional[float] = None
+    raw_near_mint_price: Optional[float] = None
+    psa8_price: Optional[float] = None
+    psa9_price: Optional[float] = None
+    psa10_price: Optional[float] = None
+    sellback_value: Optional[float] = None
+    last_updated: Optional[float] = None
+    is_stale: bool = True
+    fetch_attempt_count: Optional[int] = None
 
 
 class MarketCardListing(BaseModel):
@@ -1111,6 +1294,16 @@ def fair_value_from_snapshot(snap: PriceSnapshot) -> float:
     return 0.0
 
 
+def is_price_stale(ts: float, now_ts: Optional[float] = None) -> bool:
+    now_val = now_ts or time.time()
+    return ts <= 0 or (now_val - ts) > PRICE_STALE_SECONDS
+
+
+def snapshot_is_stale(snap: PriceSnapshot, now_ts: Optional[float] = None) -> bool:
+    reference_ts = snap.last_updated or snap.collected_at
+    return is_price_stale(float(reference_ts or 0), now_ts=now_ts)
+
+
 def confidence_score_from_snapshot(snap: PriceSnapshot, now_ts: Optional[float] = None) -> str:
     now_val = now_ts or time.time()
     confidence = "high"
@@ -1246,6 +1439,254 @@ def build_portfolio_breakdown(wallet: str, db: Session) -> Tuple[List[PricingPor
     return breakdown, total_value
 
 
+def normalize_text(value: Optional[str]) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip().lower()
+
+
+def normalize_set_name(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    raw = str(value)
+    if ":" in raw:
+        raw = raw.split(":", 1)[1]
+    raw = raw.replace("_", " ")
+    return normalize_text(raw)
+
+
+def normalize_serial(value: Optional[str]) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"[^0-9a-zA-Z]+", "", str(value)).lower()
+
+
+def template_serial_candidates(tmpl: CardTemplate) -> List[str]:
+    candidates: set[str] = set()
+    if tmpl.serial_number:
+        candidates.add(normalize_serial(tmpl.serial_number))
+        if "/" in str(tmpl.serial_number):
+            candidates.add(normalize_serial(str(tmpl.serial_number).split("/")[0]))
+    if getattr(tmpl, "index", None):
+        candidates.add(normalize_serial(f"{tmpl.index:03d}"))
+        candidates.add(normalize_serial(str(tmpl.index)))
+    if getattr(tmpl, "template_id", None):
+        candidates.add(normalize_serial(str(tmpl.template_id)))
+    return [c for c in candidates if c]
+
+
+def extract_price_value(card: dict) -> float:
+    prices = card.get("prices") or {}
+    candidates: List[float] = []
+    if isinstance(prices, dict):
+        for key in ("market", "direct_low", "directLow", "mid", "low", "high", "latestPrice"):
+            try:
+                val = prices.get(key)
+                if val is not None:
+                    candidates.append(float(val))
+            except Exception:
+                pass
+        conds = prices.get("conditions") or {}
+        if isinstance(conds, dict):
+            for cond in conds.values():
+                if isinstance(cond, dict):
+                    try:
+                        cand = cond.get("price") or cond.get("market")
+                        if cand:
+                            candidates.append(float(cand))
+                    except Exception:
+                        continue
+    for key in ("price", "market_price", "display_price"):
+        try:
+            val = card.get(key)
+            if val:
+                candidates.append(float(val))
+        except Exception:
+            continue
+    for cand in candidates:
+        if cand and cand > 0:
+            return float(cand)
+    return 0.0
+
+
+def fetch_pokemon_price_cards() -> Tuple[List[dict], str]:
+    """
+    Fetch card prices from PokemonPriceTracker; fallback to local cache if offline.
+    Returns a tuple of (cards, source).
+    """
+    url = getattr(auth_settings, "pokemon_price_api", "") or ""
+    api_key = (
+        getattr(auth_settings, "pokemon_price_api_key", None)
+        or getattr(auth_settings, "pokemon_price_tracker_api_key", None)
+        or os.environ.get("POKEMON_PRICE_TRACKER_API_KEY")
+        or os.environ.get("POKEMON_PRICE_API_KEY")
+    )
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    if url:
+        try:
+            resp = requests.get(url, timeout=20, headers=headers, params={"limit": 1000})
+            resp.raise_for_status()
+            data = resp.json()
+            cards = None
+            if isinstance(data, dict):
+                cards = data.get("cards") or data.get("data")
+            else:
+                cards = data
+            if isinstance(cards, dict):
+                cards = cards.get("cards") or cards.get("data") or []
+            if isinstance(cards, list):
+                return cards, "api"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("price_fetch_api_failed url=%s error=%s", url, exc, exc_info=True)
+    fallback_path = Path(__file__).resolve().parent.parent / "price_oracle" / "ppt_mega_sets.json"
+    try:
+        with open(fallback_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        cards = data.get("cards") if isinstance(data, dict) else data
+        if isinstance(cards, dict):
+            cards = cards.get("cards", [])
+        if isinstance(cards, list):
+            return cards, "local"
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("price_fetch_fallback_failed path=%s error=%s", fallback_path, exc, exc_info=True)
+    return [], "none"
+
+
+def refresh_price_cache() -> dict:
+    """
+    Refresh cached prices from PokemonPriceTracker into PriceSnapshot + CardTemplate.
+    """
+    cards, source = fetch_pokemon_price_cards()
+    if not cards:
+        logger.warning("price_cache_refresh_no_data source=%s", source)
+        return {"source": source, "matched": 0}
+    now = time.time()
+    matched = 0
+    with Session(engine) as db:
+        templates = db.exec(select(CardTemplate)).all()
+        tmpl_lookup = {t.template_id: t for t in templates}
+        serial_index: Dict[str, int] = {}
+        set_serial_index: Dict[Tuple[str, str], int] = {}
+        name_index: Dict[Tuple[str, str, str], int] = {}
+        fallback_name_index: Dict[Tuple[str, str], int] = {}
+        for tmpl in templates:
+            set_keys = {normalize_set_name(tmpl.set_name), normalize_set_name(tmpl.set_code)}
+            serials = template_serial_candidates(tmpl)
+            name_key = normalize_text(tmpl.card_name)
+            rarity_key = normalized_rarity(tmpl.rarity)
+            for serial in serials:
+                serial_index.setdefault(serial, tmpl.template_id)
+                for sk in set_keys:
+                    if sk:
+                        set_serial_index.setdefault((sk, serial), tmpl.template_id)
+            for sk in set_keys:
+                if sk:
+                    name_index.setdefault((sk, name_key, rarity_key), tmpl.template_id)
+            fallback_name_index.setdefault((name_key, rarity_key), tmpl.template_id)
+        seen: Dict[int, float] = {}
+        for card in cards:
+            price = extract_price_value(card)
+            if price <= 0:
+                continue
+            name_key = normalize_text(card.get("name"))
+            rarity_key = normalized_rarity(card.get("rarity") or "")
+            raw_serial = card.get("cardNumber") or card.get("card_number") or card.get("serial_number") or card.get("number")
+            serials = [normalize_serial(raw_serial)]
+            if isinstance(raw_serial, str) and "/" in raw_serial:
+                serials.append(normalize_serial(raw_serial.split("/")[0]))
+            serials = [s for s in serials if s]
+            set_key = normalize_set_name(card.get("setName") or card.get("set") or card.get("set_name"))
+            template_id = None
+            for ser in serials:
+                if set_key and (set_key, ser) in set_serial_index:
+                    template_id = set_serial_index[(set_key, ser)]
+                    break
+                if ser in serial_index:
+                    template_id = serial_index[ser]
+                    break
+            if not template_id and set_key:
+                template_id = name_index.get((set_key, name_key, rarity_key))
+            if not template_id:
+                template_id = fallback_name_index.get((name_key, rarity_key))
+            tmpl = tmpl_lookup.get(template_id) if template_id else None
+            if not tmpl:
+                continue
+            if template_id in seen and seen[template_id] >= price:
+                continue
+            seen[template_id] = price
+            snap = PriceSnapshot(
+                template_id=template_id,
+                source="pokemonpricetracker",
+                currency="USD",
+                market_price=float(price),
+                direct_low=float(price),
+                mid_price=float(price),
+                low_price=float(price),
+                high_price=float(price),
+                raw_market_price=float(price),
+                raw_near_mint_price=float(price),
+                psa8_price=0.0,
+                psa9_price=0.0,
+                psa10_price=0.0,
+                last_updated=now,
+                is_stale=False,
+                fetch_attempt_count=0,
+                collected_at=now,
+            )
+            tmpl.serial_number = tmpl.serial_number or (raw_serial if raw_serial else None)
+            tcg_id = card.get("tcgPlayerId") or card.get("tcgplayerId") or card.get("tcg_player_id")
+            if tcg_id and not getattr(tmpl, "tcgplayer_id", None):
+                tmpl.tcgplayer_id = str(tcg_id)
+            tmpl.current_price = float(price)
+            tmpl.current_price_updated_at = now
+            tmpl.cached_price = float(price)
+            tmpl.cached_price_updated_at = now
+            db.add(tmpl)
+            mapping_row = db.get(CardPriceMapping, template_id)
+            if not mapping_row:
+                mapping_row = CardPriceMapping(template_id=template_id)
+            if tcg_id:
+                mapping_row.tcgplayer_id = str(tcg_id)
+            if not getattr(mapping_row, "ppt_id", None):
+                ppt_id = card.get("id") or card.get("_id")
+                if ppt_id:
+                    mapping_row.ppt_id = str(ppt_id)
+            mapping_row.last_price_fetch_at = now
+            mapping_row.fetch_attempt_count = mapping_row.fetch_attempt_count or 0
+            if not getattr(mapping_row, "last_mapped_at", None):
+                mapping_row.last_mapped_at = now
+            mapping_row.last_status = "refreshed"
+            db.add(mapping_row)
+            db.add(snap)
+            matched += 1
+        db.commit()
+    logger.info("price_cache_refresh_complete source=%s matched=%s", source, matched)
+    return {"source": source, "matched": matched}
+
+
+def start_price_fetcher():
+    """Spawn a background fetcher thread for cached prices."""
+    global PRICE_FETCHER_THREAD
+    if PRICE_FETCHER_THREAD is not None:
+        return
+    if not getattr(auth_settings, "price_fetch_enabled", True):
+        logger.info("price_fetcher_disabled")
+        return
+    interval_minutes = max(5, int(getattr(auth_settings, "price_fetch_interval_minutes", 15) or 15))
+    interval_seconds = interval_minutes * 60
+
+    def _loop():
+        while True:
+            try:
+                refresh_price_cache()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("price_fetch_loop_failed error=%s", exc, exc_info=True)
+            time.sleep(interval_seconds)
+
+    PRICE_FETCHER_THREAD = threading.Thread(target=_loop, daemon=True)
+    PRICE_FETCHER_THREAD.start()
+
+
 def get_snapshot_as_of(template_id: int, as_of_ts: float, db: Session) -> Optional[PriceSnapshot]:
     stmt = (
         select(PriceSnapshot)
@@ -1308,30 +1749,9 @@ def get_active_listings_by_template(db: Session) -> Dict[int, List[MarketCardLis
 
 @app.post("/pricing/fetch", response_model=dict)
 def pricing_fetch(db: Session = Depends(get_session)):
-    """Mock price fetcher for testing; assigns random USD prices to all CardTemplates."""
-    rng = random.Random(time.time())
-    templates = db.exec(select(CardTemplate)).all()
-    now = time.time()
-    created = 0
-    for tmpl in templates:
-        mid = round(rng.uniform(5, 150), 2)
-        low = round(mid * 0.85, 2)
-        high = round(mid * 1.15, 2)
-        snap = PriceSnapshot(
-            template_id=tmpl.template_id,
-            source="mock_pricing",
-            currency="USD",
-            market_price=mid,
-            direct_low=low,
-            mid_price=mid,
-            low_price=low,
-            high_price=high,
-            collected_at=now,
-        )
-        db.add(snap)
-        created += 1
-    db.commit()
-    return {"ok": True, "snapshots": created, "source": "mock_pricing"}
+    """Trigger an on-demand price refresh (legacy bulk cache path)."""
+    legacy_result = refresh_price_cache()
+    return {"ok": True, "legacy": legacy_result}
 
 
 def load_admin_keypair() -> SoldersKeypair:
@@ -2108,6 +2528,9 @@ def helius_get_assets(owner: str, collection: Optional[str]) -> List[dict]:
 @app.on_event("startup")
 def startup_event():
     init_db()
+    if getattr(auth_settings, "legacy_price_fetch_enabled", False):
+        start_price_fetcher()
+    start_smart_price_scheduler(engine, auth_settings, logger, CardTemplate, PriceHistory, PriceSnapshot, CardPriceMapping)
 
 
 @app.get("/health")
@@ -2392,11 +2815,14 @@ def build_pack_v2(req: PackBuildV2Request, db: Session = Depends(get_session)):
     currency = "Sol" if is_sol else "Token"
     user_token_account = to_pubkey(req.user_token_account) if req.user_token_account else None
     vault_token_account = to_pubkey(req.vault_token_account) if req.vault_token_account else None
+    vault_treasury = treasury_pubkey()
     mochi_mint_str = getattr(auth_settings, "mochi_token_mint", None)
     if not mochi_mint_str:
         raise HTTPException(status_code=500, detail="MOCHI_TOKEN_MINT not configured for rewards")
     mochi_mint = to_pubkey(mochi_mint_str)
     user_mochi_token = derive_ata(to_pubkey(req.wallet), mochi_mint)
+    vault_authority = vault_authority_pda(vault_state)
+    reward_vault = derive_ata(vault_authority, mochi_mint)
 
     # Ensure user MOCHI ATA exists; prepend create ix if missing.
     instructions: List[Instruction] = []
@@ -2421,15 +2847,37 @@ def build_pack_v2(req: PackBuildV2Request, db: Session = Depends(get_session)):
                 ata=user_mochi_token,
             )
         )
+    # Ensure reward vault ATA exists (owned by vault_authority PDA) to fund CPI transfer.
+    try:
+        reward_info = sol_client.get_account_info(reward_vault)
+        if reward_info.value is None:
+            instructions.append(
+                build_create_ata_ix(
+                    payer=to_pubkey(req.wallet),
+                    owner=vault_authority,
+                    mint=mochi_mint,
+                    ata=reward_vault,
+                )
+            )
+    except Exception:
+        instructions.append(
+            build_create_ata_ix(
+                payer=to_pubkey(req.wallet),
+                owner=vault_authority,
+                mint=mochi_mint,
+                ata=reward_vault,
+            )
+        )
 
     open_ix = build_open_pack_v2_ix(
         user=to_pubkey(req.wallet),
         vault_state=vault_state,
         pack_session=pack_session,
-        vault_authority=vault_authority_pda(vault_state),
-        vault_treasury=treasury_pubkey(),
-        mochi_mint=mochi_mint,
-        user_mochi_token=user_mochi_token,
+        vault_authority=vault_authority,
+        vault_treasury=vault_treasury,
+        reward_mint=mochi_mint,
+        reward_vault=reward_vault,
+        user_token_account=user_mochi_token,
         rare_card_records=rare_card_records,
         currency=currency,
         client_seed_hash=client_seed_hash,
@@ -2437,6 +2885,20 @@ def build_pack_v2(req: PackBuildV2Request, db: Session = Depends(get_session)):
         user_currency_token=user_token_account,
         vault_currency_token=vault_token_account,
     )
+    base_accounts = [
+        to_pubkey(req.wallet),
+        vault_state,
+        pack_session,
+        vault_authority,
+        vault_treasury,
+        mochi_mint,
+        reward_vault,
+        TOKEN_PROGRAM_ID,
+        user_mochi_token,
+    ]
+    open_bases = [meta.pubkey for meta in open_ix.accounts[: len(base_accounts)]]
+    if open_bases != base_accounts or open_ix.accounts[-1].pubkey != SYS_PROGRAM_ID:
+        raise HTTPException(status_code=500, detail="open_pack_v2 account order mismatch; token program/system slots incorrect")
     compute_ix = set_compute_unit_limit(units=350_000)
     instructions.extend([compute_ix, open_ix])
     blockhash = get_latest_blockhash()
@@ -2810,11 +3272,8 @@ def confirm_open_v2(req: ConfirmOpenRequest, db: Session = Depends(get_session))
     # Add low-tier virtuals on open (only if we have a usable lineup).
     if rarities and template_ids:
         mutate_virtual_cards(wallet, low_tier_virtual_items(rarities, template_ids), db, direction=1)
-    try:
-        reward = maybe_spawn_pack_reward(wallet, reward_session_id, db)
-    except Exception as exc:  # noqa: BLE001
-        reward = {"status": "failed", "error": str(exc)}
-    return {"state": on_state, "assets": rare_assets, "reward": reward}
+    # Reward is now handled atomically on-chain inside the open_pack instruction.
+    return {"state": on_state, "assets": rare_assets, "reward": {"status": "on_chain"}}
 
 
 @app.post("/program/claim/confirm")
@@ -3309,7 +3768,7 @@ def get_pending_session_v2(wallet: str, db: Session = Depends(get_session)):
 
 @app.get("/profile/{wallet}/virtual", response_model=List[VirtualCardView])
 def profile_virtual(wallet: str, db: Session = Depends(get_session)):
-    stmt = select(VirtualCard).where(VirtualCard.wallet == wallet)
+    stmt = select(VirtualCard).where(VirtualCard.wallet == wallet, VirtualCard.count > 0)
     rows = db.exec(stmt).all()
     result: List[VirtualCardView] = []
     for row in rows:
@@ -3768,52 +4227,6 @@ def marketplace_listings(db: Session = Depends(get_session)):
     return results
 
 
-@app.get("/admin/marketplace/garbage")
-def admin_garbage_listings():
-    """
-    Surface listing PDAs that are pointing at the wrong vault_state so we can clean them up.
-    Only returns entries whose vault_state != the canonical vault_state_pda().
-    """
-    canonical = market_vault_state_pda()
-    listing_disc = hashlib.sha256(b"account:Listing").digest()[:8]
-    memcmp = MemcmpOpts(offset=0, bytes=listing_disc)
-    try:
-        resp = sol_client.get_program_accounts(
-            PROGRAM_ID,
-            encoding="base64",
-            filters=[memcmp],
-        )
-        accounts = resp.value or []
-    except Exception:
-        accounts = []
-
-    garbage: List[dict] = []
-    for acc in accounts:
-        info = acc.account
-        if not info or info.owner != PROGRAM_ID:
-            continue
-        listing_data = None
-        try:
-            listing_data = parse_listing_account(bytes(info.data))
-        except Exception:
-            listing_data = None
-        if not listing_data:
-            continue
-        if str(listing_data.get("vault_state")) == str(canonical):
-            continue
-        garbage.append(
-            {
-                "listing": str(acc.pubkey),
-                "vault_state": str(listing_data.get("vault_state")),
-                "seller": str(listing_data.get("seller")),
-                "core_asset": str(listing_data.get("core_asset")),
-                "price_lamports": listing_data.get("price_lamports"),
-                "status": listing_data.get("status"),
-            }
-        )
-    return garbage
-
-
 @app.post("/marketplace/list/build", response_model=TxResponse)
 def marketplace_list(req: ListRequest, db: Session = Depends(get_session)):
     vault_state = market_vault_state_pda()
@@ -4075,6 +4488,17 @@ def admin_inventory_pack_stock(pack_type: str, db: Session = Depends(get_session
         return []
     tmpl_ids = list(tmpl_lookup.keys())
     recs = db.exec(select(MintRecord).where(MintRecord.template_id.in_(tmpl_ids))).all()
+    price_cache: Dict[int, Tuple[float, float]] = {}
+    for tmpl_id, tmpl in tmpl_lookup.items():
+        price_val = float(getattr(tmpl, "current_price", 0) or getattr(tmpl, "cached_price", 0) or 0)
+        updated_at = float(getattr(tmpl, "current_price_updated_at", 0) or getattr(tmpl, "cached_price_updated_at", 0) or 0)
+        if price_val <= 0:
+            pv = compute_price_view(tmpl_id, db)
+            if pv:
+                price_val = float(pv.get("display_price", 0) or 0)
+                latest = pv.get("latest")
+                updated_at = float(getattr(latest, "collected_at", updated_at) or updated_at)
+        price_cache[tmpl_id] = (price_val, updated_at)
     stock: Dict[int, Dict[str, object]] = {}
     for rec in recs:
         tmpl_id = rec.template_id
@@ -4089,6 +4513,8 @@ def admin_inventory_pack_stock(pack_type: str, db: Session = Depends(get_session
                 "variant": tmpl_lookup[tmpl_id].variant,
                 "remaining": 0,
                 "total": 0,
+                "price": price_cache.get(tmpl_id, (0, 0))[0],
+                "price_updated_at": price_cache.get(tmpl_id, (0, 0))[1],
             },
         )
         entry["total"] = int(entry.get("total", 0)) + 1
@@ -4105,6 +4531,8 @@ def admin_inventory_pack_stock(pack_type: str, db: Session = Depends(get_session
                 "variant": tmpl.variant,
                 "remaining": 0,
                 "total": 0,
+                "price": price_cache.get(tmpl_id, (0, 0))[0],
+                "price_updated_at": price_cache.get(tmpl_id, (0, 0))[1],
             },
         )
     # Return sorted by template_id for determinism.
@@ -4220,6 +4648,100 @@ def pricing_sets(db: Session = Depends(get_session)):
     return ordered
 
 
+@app.post("/pricing/pack_prices", response_model=List[PackPriceView])
+def pricing_pack_prices(payload: PackPriceRequest, db: Session = Depends(get_session)):
+    if not payload.template_ids:
+        return []
+    ordered_ids: List[int] = []
+    seen: set[int] = set()
+    for tid in payload.template_ids:
+        try:
+            tid_val = int(tid)
+        except Exception:
+            continue
+        if tid_val in seen:
+            continue
+        seen.add(tid_val)
+        ordered_ids.append(tid_val)
+    if not ordered_ids:
+        return []
+    mappings: Dict[int, CardPriceMapping] = {}
+    try:
+        mappings = {
+            m.template_id: m
+            for m in db.exec(select(CardPriceMapping).where(CardPriceMapping.template_id.in_(ordered_ids))).all()
+        }
+    except Exception:
+        mappings = {}
+    results: List[PackPriceView] = []
+    now_ts = time.time()
+    for tid in ordered_ids:
+        tmpl = db.get(CardTemplate, tid)
+        snap = get_latest_price_snapshot(tid, db)
+        mapping = mappings.get(tid)
+        market_price = None
+        raw_market_price = None
+        raw_near_mint_price = None
+        psa8 = psa9 = psa10 = None
+        fetch_attempts = mapping.fetch_attempt_count if mapping else None
+        last_updated = 0.0
+        stale_flag = True
+        if snap:
+            market_price = float(snap.market_price or 0)
+            raw_market_price = float(snap.raw_market_price or market_price or 0)
+            raw_near_mint_price = float(snap.raw_near_mint_price or 0)
+            psa8 = float(snap.psa8_price or 0) or None
+            psa9 = float(snap.psa9_price or 0) or None
+            psa10 = float(snap.psa10_price or 0) or None
+            fetch_attempts = getattr(snap, "fetch_attempt_count", fetch_attempts)
+            last_updated = float(snap.last_updated or snap.collected_at or 0)
+            stale_flag = snapshot_is_stale(snap, now_ts=now_ts)
+        else:
+            if tmpl:
+                raw_market_price = float(
+                    getattr(tmpl, "current_price", 0) or getattr(tmpl, "cached_price", 0) or 0
+                )
+                market_price = raw_market_price
+                last_updated = float(
+                    getattr(tmpl, "current_price_updated_at", 0) or getattr(tmpl, "cached_price_updated_at", 0) or 0
+                )
+            stale_flag = is_price_stale(last_updated, now_ts=now_ts) if last_updated else True
+        if mapping:
+            fetch_attempts = fetch_attempts if fetch_attempts is not None else mapping.fetch_attempt_count
+            if mapping.last_price_fetch_at and mapping.last_price_fetch_at > last_updated:
+                last_updated = float(mapping.last_price_fetch_at)
+                stale_flag = is_price_stale(last_updated, now_ts=now_ts)
+        if market_price is None or market_price <= 0:
+            market_price = raw_market_price
+        if (raw_market_price is None or raw_market_price <= 0) and market_price is not None:
+            raw_market_price = market_price
+        rarity_val = tmpl.rarity if tmpl else None
+        sell_source = raw_market_price if raw_market_price and raw_market_price > 0 else market_price
+        if rarity_val and not rarity_is_rare_plus(rarity_val) and market_price and market_price > (sell_source or 0):
+            sell_source = market_price
+        sellback_value = round(sell_source * SELLBACK_RATE, 4) if sell_source and sell_source > 0 else None
+        if rarity_val and not rarity_is_rare_plus(rarity_val):
+            psa8 = psa9 = psa10 = None
+        results.append(
+            PackPriceView(
+                template_id=tid,
+                name=tmpl.card_name if tmpl else None,
+                rarity=rarity_val,
+                raw_market_price=raw_market_price,
+                market_price=market_price,
+                raw_near_mint_price=raw_near_mint_price,
+                psa8_price=psa8,
+                psa9_price=psa9,
+                psa10_price=psa10,
+                sellback_value=sellback_value,
+                last_updated=last_updated if last_updated else None,
+                is_stale=bool(stale_flag),
+                fetch_attempt_count=fetch_attempts,
+            )
+        )
+    return results
+
+
 @app.get("/pricing/card/{template_id}", response_model=PricingCardResponse)
 def pricing_card(template_id: int, db: Session = Depends(get_session)):
     pv = compute_price_view(template_id, db)
@@ -4273,6 +4795,59 @@ def pricing_sparklines(template_ids: str, points: int = 30, db: Session = Depend
     return items
 
 
+@app.get("/analytics/prices", response_model=List[PriceAnalyticsRow])
+def analytics_prices(pack_type: Optional[str] = None, db: Session = Depends(get_session)):
+    pack_code = pack_set_code(pack_type) if pack_type else None
+    stmt = select(CardTemplate)
+    if pack_code:
+        stmt = stmt.where(
+            or_(
+                CardTemplate.set_code == pack_code,
+                and_(pack_code == "meg_web", CardTemplate.set_code.is_(None)),
+            )
+        )
+    templates = db.exec(stmt).all()
+    results: List[PriceAnalyticsRow] = []
+    for tmpl in templates:
+        hist_rows = (
+            db.exec(
+                select(PriceHistory)
+                .where(PriceHistory.card_template_id == tmpl.template_id)
+                .order_by(PriceHistory.collected_at.desc())
+                .limit(30)
+            ).all()
+            or []
+        )
+        change_24h = price_change_from_history_rows(hist_rows, 24.0)
+        sparkline = history_sparkline_from_rows(hist_rows, limit=12)
+        last_updated = float(hist_rows[0].collected_at) if hist_rows else float(getattr(tmpl, "current_price_updated_at", 0) or 0)
+        if not sparkline:
+            snapshot_points = fetch_history_points(tmpl.template_id, db, limit=12)
+            sparkline = [
+                float(p.fair_value or p.mid_price or p.low_price or p.high_price or p.mid_price or 0)
+                for p in reversed(snapshot_points)
+            ]
+            if change_24h is None and snapshot_points:
+                change_24h = pct_change_over_window(snapshot_points, 24.0)
+            if not last_updated and snapshot_points:
+                last_updated = float(snapshot_points[0].collected_at)
+        current_price = float(getattr(tmpl, "current_price", 0) or getattr(tmpl, "cached_price", 0) or 0)
+        results.append(
+            PriceAnalyticsRow(
+                template_id=tmpl.template_id,
+                name=tmpl.card_name,
+                set_name=tmpl.set_name,
+                rarity=tmpl.rarity,
+                image_url=tmpl.image_url,
+                current_price=current_price if current_price > 0 else None,
+                change_24h=change_24h,
+                last_updated=last_updated or None,
+                sparkline=sparkline,
+            )
+        )
+    return results
+
+
 def pct_change_over_window(points: List[PricingHistoryPoint], window_hours: float) -> Optional[float]:
     if not points:
         return None
@@ -4291,6 +4866,31 @@ def pct_change_over_window(points: List[PricingHistoryPoint], window_hours: floa
     if not base or base.fair_value == 0:
         return None
     return ((latest.fair_value - base.fair_value) / base.fair_value) * 100.0
+
+
+def price_change_from_history_rows(rows: List[PriceHistory], window_hours: float) -> Optional[float]:
+    if not rows:
+        return None
+    sorted_rows = sorted(rows, key=lambda r: r.collected_at, reverse=True)
+    latest = sorted_rows[0]
+    cutoff = time.time() - window_hours * 3600
+    base = None
+    for row in sorted_rows:
+        if row.collected_at <= cutoff:
+            base = row
+            break
+    if not base:
+        base = sorted_rows[-1]
+    if not base or base.price == 0:
+        return None
+    return ((float(latest.price) - float(base.price)) / float(base.price)) * 100.0
+
+
+def history_sparkline_from_rows(rows: List[PriceHistory], limit: int = 12) -> List[float]:
+    if not rows:
+        return []
+    sorted_rows = sorted(rows, key=lambda r: r.collected_at)
+    return [float(r.price) for r in sorted_rows[-limit:]]
 
 
 @app.get("/pricing/portfolio", response_model=PricingPortfolioResponse)
