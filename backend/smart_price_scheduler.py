@@ -3,7 +3,8 @@ Price scheduler that respects PokemonPriceTracker limits while prioritizing fres
 
 - Runs a capped cycle every 4 hours (6/day) under 60 req/min and <20k req/day.
 - Prioritizes unmapped/no-price cards, then stale (>4h) cards with rare+ first.
-- Low-tier cards use raw market price with a small floor to avoid near-zero prices; rare+ include PSA data.
+- Only fetches rare+ templates; low tiers are static and must not hit PPT.
+- Optional PSA/eBay fields can be enabled via env (see `PRICE_ORACLE_RUNBOOK.md`).
 """
 
 import os
@@ -20,8 +21,12 @@ MAX_CALLS_PER_MINUTE = 50
 CYCLE_SECONDS = 4 * 3600
 CYCLE_REQUEST_BUDGET = 3200
 STALE_AFTER_SECONDS = 4 * 3600
-LOW_TIER_FLOOR = 0.10
 _SCHEDULER_THREAD: Optional[threading.Thread] = None
+
+
+def _include_ebay_enabled() -> bool:
+    flag = str(os.environ.get("PPT_INCLUDE_EBAY", "") or "").strip().lower()
+    return flag in {"1", "true", "yes", "y"}
 
 
 def _api_key(settings) -> Optional[str]:
@@ -84,56 +89,70 @@ def _parse_timestamp(value: Optional[str]) -> Optional[float]:
 def _extract_price(card: dict, variant: Optional[str] = None) -> float:
     target_variant = _normalize_variant(variant)
     prices = card.get("prices") or {}
-    candidates: List[float] = []
-    if isinstance(prices, dict) and target_variant:
-        variants = prices.get("variants") or {}
-        if isinstance(variants, dict):
-            for key, var in variants.items():
-                if not isinstance(var, dict):
-                    continue
-                key_norm = _normalize_variant(key)
-                if key_norm and key_norm == target_variant:
-                    for price_key in ("market", "mid", "price"):
-                        try:
-                            val = var.get(price_key)
-                            if val is not None:
-                                candidates.append(float(val))
-                        except Exception:
-                            continue
-                    conditions = var.get("conditions") if isinstance(var, dict) else {}
-                    if isinstance(conditions, dict):
-                        for cond in conditions.values():
-                            if not isinstance(cond, dict):
-                                continue
-                            for price_key in ("price", "market"):
-                                try:
-                                    val = cond.get(price_key)
-                                    if val is not None:
-                                        candidates.append(float(val))
-                                except Exception:
-                                    continue
-                    break
-    if isinstance(prices, dict):
-        for key in ("market", "marketPrice", "direct_low", "directLow", "mid"):
+    if not isinstance(prices, dict):
+        return 0.0
+
+    def _first_positive(candidates: List[Optional[float]]) -> Optional[float]:
+        for cand in candidates:
             try:
-                val = prices.get(key)
-                if val is not None:
-                    candidates.append(float(val))
+                if cand is not None and float(cand) > 0:
+                    return float(cand)
             except Exception:
                 continue
-        variants = prices.get("variants") or {}
-        if isinstance(variants, dict):
-            for var in variants.values():
-                if not isinstance(var, dict):
+        return None
+
+    def _extract_from_variant_entry(entry: dict) -> float:
+        # Prefer market-like fields; do not "max across variants" (variant ambiguity is unsafe).
+        preferred = _first_positive([entry.get("market"), entry.get("mid"), entry.get("price")])
+        if preferred is not None:
+            return preferred
+        conds = entry.get("conditions")
+        if isinstance(conds, dict):
+            for cond in conds.values():
+                if not isinstance(cond, dict):
                     continue
-                for key in ("market", "mid", "price"):
-                    try:
-                        val = var.get(key)
-                        if val is not None:
-                            candidates.append(float(val))
-                    except Exception:
-                        continue
-    return max(candidates) if candidates else 0.0
+                preferred = _first_positive([cond.get("market"), cond.get("price")])
+                if preferred is not None:
+                    return preferred
+        return 0.0
+
+    variants = prices.get("variants") or {}
+    if target_variant:
+        if isinstance(variants, dict):
+            for key, var in variants.items():
+                if _normalize_variant(key) == target_variant and isinstance(var, dict):
+                    return _extract_from_variant_entry(var)
+        # If a finish was requested but isn't present, do not guess.
+        return 0.0
+
+    # No variant requested: prefer top-level prices (if present).
+    preferred = _first_positive(
+        [
+            prices.get("market"),
+            prices.get("marketPrice"),
+            prices.get("direct_low"),
+            prices.get("directLow"),
+            prices.get("mid"),
+            prices.get("price"),
+        ]
+    )
+    if preferred is not None:
+        return preferred
+
+    # If no top-level price exists, use an unambiguous variant only.
+    if isinstance(variants, dict) and variants:
+        normal_entry = None
+        for key, var in variants.items():
+            if _normalize_variant(key) == "normal" and isinstance(var, dict):
+                normal_entry = var
+                break
+        if normal_entry is not None:
+            return _extract_from_variant_entry(normal_entry)
+        if len(variants) == 1:
+            only = next(iter(variants.values()))
+            if isinstance(only, dict):
+                return _extract_from_variant_entry(only)
+    return 0.0
 
 
 def _extract_near_mint(prices: dict) -> float:
@@ -308,6 +327,7 @@ def start_smart_price_scheduler(
             calls_made = 0
             minute_state = {"start": time.time(), "count": 0}
             last_call = 0.0
+            include_ebay = _include_ebay_enabled()
             try:
                 with Session(engine) as session:
                     mapping_lookup: Dict[int, object] = {}
@@ -320,8 +340,20 @@ def start_smart_price_scheduler(
                             select(PriceSnapshot.template_id, func.max(PriceSnapshot.collected_at)).group_by(PriceSnapshot.template_id)
                         ).all()
                         latest_snap_ts = {tid: ts for tid, ts in snap_rows if tid is not None}
+                    now = time.time()
                     templates = session.exec(select(CardTemplate)).all()
-                    candidates = [t for t in templates if _stable_tcg_id(t, mapping_lookup.get(t.template_id))]
+                    candidates = []
+                    for t in templates:
+                        mapping = mapping_lookup.get(t.template_id)
+                        if not _is_rare_plus(getattr(t, "rarity", "")):
+                            continue
+                        if not _stable_tcg_id(t, mapping):
+                            continue
+                        last_ts = _last_price_timestamp(t, mapping, latest_snap_ts)
+                        has_price = (getattr(t, "current_price", 0) or getattr(t, "cached_price", 0) or 0) > 0
+                        stale = last_ts <= 0 or (now - last_ts) > STALE_AFTER_SECONDS
+                        if not has_price or stale:
+                            candidates.append(t)
                     candidates.sort(key=lambda t: _priority_key(t, mapping_lookup.get(t.template_id), latest_snap_ts))
                     if not candidates:
                         time.sleep(CYCLE_SECONDS)
@@ -336,7 +368,6 @@ def start_smart_price_scheduler(
                         tcg_id = _stable_tcg_id(tmpl, mapping)
                         if not tcg_id:
                             continue
-                        include_ebay = _is_rare_plus(getattr(tmpl, "rarity", ""))
                         last_call, minute_state = _respect_rate_limits(last_call, minute_state)
                         card_obj = _fetch_card_by_id(tcg_id, settings, logger, include_ebay)
                         now_ts = time.time()
@@ -363,11 +394,6 @@ def start_smart_price_scheduler(
                         last_updated = price_fields["last_updated_ts"] or now_ts
                         adjusted_market = raw_market
                         adjusted_near_mint = raw_near_mint
-                        if not include_ebay:
-                            if adjusted_market and adjusted_market < LOW_TIER_FLOOR:
-                                adjusted_market = LOW_TIER_FLOOR
-                            if adjusted_near_mint and adjusted_near_mint < LOW_TIER_FLOOR:
-                                adjusted_near_mint = LOW_TIER_FLOOR
                         if adjusted_market <= 0 and adjusted_near_mint > 0:
                             adjusted_market = adjusted_near_mint
                         if adjusted_market <= 0:

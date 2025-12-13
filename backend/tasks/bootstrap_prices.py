@@ -63,6 +63,11 @@ BOOTSTRAP_MAX_CALLS_PER_MINUTE = 50
 # Extra per-call delay to keep bootstrap very slow (~10 req/min max).
 BOOTSTRAP_MIN_DELAY_SECONDS = 6.0
 
+# Static price defaults (used when we intentionally avoid fetching for low tiers).
+STATIC_PRICE_COMMON = 0.05
+STATIC_PRICE_UNCOMMON = 0.07
+STATIC_PRICE_ENERGY = 0.05
+
 # Map normalization helpers (aligned with scripts/map_prices.py)
 RARITY_NORMALIZATION = {
     "double rare": "doublerare",
@@ -71,6 +76,27 @@ RARITY_NORMALIZATION = {
     "illustration rare": "illustrationrare",
     "special illustration rare": "specialillustrationrare",
     "mega hyper rare": "megahyperrare",
+}
+
+# Hints for PPT set search/filtering. Keep set_id values in sync with PPT /sets.
+PPT_SET_HINTS: Dict[str, dict] = {
+    # Phantasmal Flames (ME02)
+    "phantasmal_flames": {
+        "set_name": "ME02: Phantasmal Flames",
+        "set_query": "ME02: Phantasmal Flames",
+        "set_id": "690368ee113266e35b29f628",
+    },
+    # Mega Evolution (ME01)
+    "meg_web": {
+        "set_name": "ME01: Mega Evolution",
+        "set_query": "ME01: Mega Evolution",
+        "set_id": "68cc2d9c7d3e6e7d391a6716",
+    },
+    "mega_evolutions": {
+        "set_name": "ME01: Mega Evolution",
+        "set_query": "ME01: Mega Evolution",
+        "set_id": "68cc2d9c7d3e6e7d391a6716",
+    },
 }
 
 
@@ -111,6 +137,21 @@ def rarity_filter_value(value: Optional[str]) -> Optional[str]:
     return spaced or None
 
 
+def normalized_variant(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    base = normalize_text(value).replace(" ", "").replace("_", "").replace("-", "")
+    if not base:
+        return None
+    if base in {"reverseholo", "reverseholofoil", "reverse"}:
+        return "reverse_holo"
+    if base in {"holo", "holofoil", "foil"}:
+        return "holo"
+    if base in {"normal", "nonholo", "nonholofoil", "base"}:
+        return "normal"
+    return base
+
+
 def derive_base_id(tmpl: CardTemplate) -> Optional[int]:
     if not getattr(tmpl, "set_code", None):
         return None
@@ -133,19 +174,39 @@ def derive_base_id(tmpl: CardTemplate) -> Optional[int]:
 def primary_serial_token(tmpl: CardTemplate) -> Optional[str]:
     if getattr(tmpl, "serial_number", None):
         return str(tmpl.serial_number)
-    base_id = derive_base_id(tmpl)
-    if base_id:
-        return str(base_id)
     return None
 
 
+def set_hint_for_template(tmpl: CardTemplate) -> Dict[str, Optional[str]]:
+    code = getattr(tmpl, "set_code", None) or ""
+    hint = PPT_SET_HINTS.get(code, {})
+    # Fall back to set_name / set_code when no hint is known.
+    set_label = hint.get("set_name") or getattr(tmpl, "set_name", None) or getattr(tmpl, "set_code", None)
+    return {
+        "set_label": set_label,
+        "set_query": hint.get("set_query"),
+        "set_id": hint.get("set_id"),
+    }
+
+
 def build_search_term(tmpl: CardTemplate) -> str:
-    collection = normalize_text(tmpl.set_name or tmpl.set_code)
+    hint = set_hint_for_template(tmpl)
     serial = primary_serial_token(tmpl)
     name = tmpl.card_name or ""
-    if not collection or not serial or not name:
+    if not serial or not name:
         return ""
-    term = " ".join([collection, serial, name]).strip()
+    serial_token = str(serial)
+    # PPT searches are happier with the numeric portion of the card number when a set filter is provided.
+    if (hint.get("set_id") or hint.get("set_query")) and "/" in serial_token:
+        serial_token = serial_token.split("/")[0]
+    parts = [serial_token, str(name)]
+    # Include set name in the search term only when we don't already pass setId.
+    if not hint.get("set_id"):
+        collection = normalize_text(hint.get("set_label"))
+        if not collection:
+            return ""
+        parts.insert(0, collection)
+    term = " ".join(parts).strip()
     term = re.sub(r"[^0-9A-Za-z :'/\\-]+", " ", term)
     return re.sub(r"\s+", " ", term).strip()
 
@@ -153,6 +214,7 @@ def build_search_term(tmpl: CardTemplate) -> str:
 def fetch_candidates(
     query: str,
     rarity_filter: Optional[str],
+    set_hint: Optional[Dict[str, Optional[str]]],
     last_call: float,
     minute_state: Dict[str, float],
     counters: Dict[str, int],
@@ -160,6 +222,11 @@ def fetch_candidates(
     params = {"search": query}
     if rarity_filter:
         params["rarity"] = rarity_filter
+    if set_hint:
+        if set_hint.get("set_id"):
+            params["setId"] = set_hint["set_id"]
+        elif set_hint.get("set_query"):
+            params["set"] = set_hint["set_query"]
     last_call, minute_state = _respect_rate_limits(last_call, minute_state)
     time.sleep(BOOTSTRAP_MIN_DELAY_SECONDS)
     headers = {"Accept": "application/json"}
@@ -211,6 +278,7 @@ def choose_best_match(tmpl: CardTemplate, cards: List[dict]) -> Optional[dict]:
     target_set = normalize_set_name(tmpl.set_name or tmpl.set_code)
     target_rarity = normalized_rarity(tmpl.rarity)
     target_serials = serial_candidates(getattr(tmpl, "serial_number", None))
+    target_variant = normalized_variant(getattr(tmpl, "variant", None))
     base_id = derive_base_id(tmpl)
     if base_id:
         target_serials.append(f"{base_id:03d}")
@@ -241,6 +309,43 @@ def choose_best_match(tmpl: CardTemplate, cards: List[dict]) -> Optional[dict]:
             continue
         if target_serials and card_serials and not any(s in card_serials for s in target_serials):
             continue
+        if target_variant:
+            prices = card.get("prices") or {}
+            variants = prices.get("variants") if isinstance(prices, dict) else None
+            has_variant = False
+            if isinstance(variants, dict):
+                for key, var in variants.items():
+                    if normalized_variant(key) != target_variant:
+                        continue
+                    if not isinstance(var, dict):
+                        continue
+                    for price_key in ("market", "mid", "price"):
+                        try:
+                            if float(var.get(price_key) or 0) > 0:
+                                has_variant = True
+                                break
+                        except Exception:
+                            continue
+                    if has_variant:
+                        break
+                    conds = var.get("conditions")
+                    if isinstance(conds, dict):
+                        for cond in conds.values():
+                            if not isinstance(cond, dict):
+                                continue
+                            for price_key in ("price", "market"):
+                                try:
+                                    if float(cond.get(price_key) or 0) > 0:
+                                        has_variant = True
+                                        break
+                                except Exception:
+                                    continue
+                            if has_variant:
+                                break
+                    if has_variant:
+                        break
+            if not has_variant:
+                continue
         score = 0
         if target_set and set_norm and target_set == set_norm:
             score += 4
@@ -262,6 +367,62 @@ def latest_snapshot_exists(session: Session, template_id: int) -> bool:
     return snap is not None
 
 
+def include_ebay_enabled() -> bool:
+    flag = str(os.environ.get("PPT_INCLUDE_EBAY", "") or "").strip().lower()
+    return flag in {"1", "true", "yes", "y"}
+
+
+def static_price_for_template(tmpl: CardTemplate) -> Optional[float]:
+    """
+    Returns a static price to apply without hitting PPT for low-tier cards.
+    Energies: $0.05. Commons: $0.05. Uncommons: $0.07.
+    """
+    rarity_norm = normalized_rarity(getattr(tmpl, "rarity", ""))
+    if getattr(tmpl, "is_energy", False) or rarity_norm == "energy":
+        return STATIC_PRICE_ENERGY
+    if rarity_norm == "common":
+        return STATIC_PRICE_COMMON
+    if rarity_norm == "uncommon":
+        return STATIC_PRICE_UNCOMMON
+    return None
+
+
+def apply_static_price(session: Session, tmpl: CardTemplate, price: float, mapping: Optional[CardPriceMapping]) -> None:
+    now_ts = time.time()
+    tmpl.current_price = float(price)
+    tmpl.current_price_updated_at = now_ts
+    tmpl.cached_price = float(price)
+    tmpl.cached_price_updated_at = now_ts
+    session.add(tmpl)
+    session.add(PriceHistory(card_template_id=tmpl.template_id, price=float(price), collected_at=now_ts))
+    session.add(
+        PriceSnapshot(
+            template_id=tmpl.template_id,
+            source="static",
+            currency="USD",
+            market_price=float(price),
+            direct_low=float(price),
+            mid_price=float(price),
+            low_price=float(price),
+            high_price=float(price),
+            raw_market_price=float(price),
+            raw_near_mint_price=float(price),
+            psa8_price=0.0,
+            psa9_price=0.0,
+            psa10_price=0.0,
+            last_updated=now_ts,
+            is_stale=False,
+            fetch_attempt_count=int(getattr(mapping, "fetch_attempt_count", 0)) if mapping else 0,
+            collected_at=now_ts,
+        )
+    )
+    if mapping:
+        mapping.last_status = "static"
+        mapping.last_price_fetch_at = now_ts
+        session.add(mapping)
+    session.commit()
+
+
 def process_template(
     session: Session,
     tmpl: CardTemplate,
@@ -279,6 +440,16 @@ def process_template(
     priced = False
     failure_reason: Optional[str] = None
     abort_flag = False
+
+    static_price = static_price_for_template(tmpl)
+    if static_price is not None:
+        apply_static_price(session, tmpl, static_price, mapping)
+        return mapped, True, last_call, minute_state, failure_reason, abort_flag
+
+    # Oracle-safe guardrail: if a template is missing its serial/collector number, do not map or price it.
+    if not primary_serial_token(tmpl):
+        return mapped, priced, last_call, minute_state, "missing-set-or-serial", abort_flag
+
     tcg_id = mapping.tcgplayer_id if mapping and mapping.tcgplayer_id else tmpl.tcgplayer_id
     # Map if missing.
     if not tcg_id:
@@ -289,7 +460,14 @@ def process_template(
             return mapped, priced, last_call, minute_state, "budget-exceeded", abort_flag
         rarity_filter = rarity_filter_value(tmpl.rarity)
         try:
-            cards, last_call, minute_state, abort_flag = fetch_candidates(term, rarity_filter, last_call, minute_state, counters)
+            cards, last_call, minute_state, abort_flag = fetch_candidates(
+                term,
+                rarity_filter,
+                set_hint_for_template(tmpl),
+                last_call,
+                minute_state,
+                counters,
+            )
             if abort_flag:
                 return mapped, priced, last_call, minute_state, "aborted", True
         except Exception as exc:  # noqa: BLE001
@@ -318,7 +496,7 @@ def process_template(
         return mapped, priced, last_call, minute_state, failure_reason, abort_flag
     if request_counter["count"] + 1 > BOOTSTRAP_REQUEST_BUDGET:
         return mapped, priced, last_call, minute_state, "budget-exceeded", abort_flag
-    include_ebay = _is_rare_plus(getattr(tmpl, "rarity", ""))
+    include_ebay = include_ebay_enabled() and _is_rare_plus(getattr(tmpl, "rarity", ""))
     last_call, minute_state = _respect_rate_limits(last_call, minute_state)
     time.sleep(BOOTSTRAP_MIN_DELAY_SECONDS)
     card_obj = _fetch_card_by_id(tcg_id, auth_settings, None, include_ebay)
@@ -344,8 +522,6 @@ def process_template(
     raw_market = price_fields["raw_market_price"]
     raw_near_mint = price_fields["raw_near_mint_price"]
     adjusted_market = raw_market
-    if not include_ebay and adjusted_market and adjusted_market < 0.10:
-        adjusted_market = 0.10
     if adjusted_market <= 0 and raw_near_mint > 0:
         adjusted_market = raw_near_mint
     if adjusted_market <= 0:

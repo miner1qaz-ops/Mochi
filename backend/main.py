@@ -1665,12 +1665,16 @@ def refresh_price_cache() -> dict:
 
 
 def start_price_fetcher():
-    """Spawn a background fetcher thread for cached prices."""
+    """Spawn a background fetcher thread for cached prices (legacy; disabled by default)."""
     global PRICE_FETCHER_THREAD
     if PRICE_FETCHER_THREAD is not None:
         return
     if not getattr(auth_settings, "price_fetch_enabled", True):
         logger.info("price_fetcher_disabled")
+        return
+    allow_legacy = str(os.environ.get("ALLOW_LEGACY_PPT_BULK_FETCH", "") or "").strip().lower() in {"1", "true", "yes", "y"}
+    if not allow_legacy:
+        logger.info("legacy_price_fetcher_blocked allow_env=ALLOW_LEGACY_PPT_BULK_FETCH")
         return
     interval_minutes = max(5, int(getattr(auth_settings, "price_fetch_interval_minutes", 15) or 15))
     interval_seconds = interval_minutes * 60
@@ -1749,7 +1753,13 @@ def get_active_listings_by_template(db: Session) -> Dict[int, List[MarketCardLis
 
 @app.post("/pricing/fetch", response_model=dict)
 def pricing_fetch(db: Session = Depends(get_session)):
-    """Trigger an on-demand price refresh (legacy bulk cache path)."""
+    """Trigger an on-demand price refresh (legacy bulk cache path; disabled by default)."""
+    allow_legacy = str(os.environ.get("ALLOW_LEGACY_PPT_BULK_FETCH", "") or "").strip().lower() in {"1", "true", "yes", "y"}
+    if not getattr(auth_settings, "legacy_price_fetch_enabled", False) or not allow_legacy:
+        raise HTTPException(
+            status_code=410,
+            detail="Deprecated price fetch path disabled. Use the price-oracle bootstrap/scheduler runbook instead.",
+        )
     legacy_result = refresh_price_cache()
     return {"ok": True, "legacy": legacy_result}
 
@@ -1833,7 +1843,14 @@ def _template_query_for_rarity(rarity: str):
             "",
         )
     )
-    return select(CardTemplate).where(normalized_column == norm_value)
+    # Pack safety guardrail: never select templates missing a serial/collector number.
+    # This hard-excludes placeholder templates even if their rarity string matches a slot.
+    return (
+        select(CardTemplate)
+        .where(normalized_column == norm_value)
+        .where(CardTemplate.serial_number.is_not(None))
+        .where(func.length(func.trim(CardTemplate.serial_number)) > 0)
+    )
 
 
 def pick_template_ids(
@@ -2064,6 +2081,7 @@ def choose_rare_assets_only_for_pack(
     pack_type: Optional[str] = None,
 ) -> tuple[List[int], List[int], List[str]]:
     pack_code = pack_set_code(pack_type) or detect_pack_type_from_templates(template_ids, db)
+    vault_state = vault_state_pda()
     rare_indices: List[int] = []
     rare_templates: List[int] = []
     rare_assets: List[str] = []
@@ -2115,13 +2133,37 @@ def choose_rare_assets_only_for_pack(
         record = None
         for cand in candidates:
             try:
-                to_pubkey(cand.asset_id)
-            except Exception:
+                asset_pk = to_pubkey(cand.asset_id)
+            except Exception:  # noqa: BLE001
+                continue
+            # On-chain source of truth: only use CardRecords that exist, are owned by the program,
+            # and are currently Available (not Reserved/UserOwned/etc). This prevents returning txs
+            # that will deterministically fail on-chain with CardNotAvailable/TemplateMismatch.
+            try:
+                cr = card_record_pda(vault_state, asset_pk)
+                cr_resp = sol_client.get_account_info(cr)
+                if cr_resp.value is None or cr_resp.value.data is None:
+                    continue
+                if str(cr_resp.value.owner) != str(PROGRAM_ID):
+                    continue
+                cr_info = parse_card_record_account(bytes(cr_resp.value.data))
+                if not cr_info:
+                    continue
+                if cr_info.get("status") != 0:
+                    continue
+                if not rarity_is_rare_plus(cr_info.get("rarity", "")):
+                    continue
+                if int(cr_info.get("template_id", -1)) != int(tmpl):
+                    continue
+            except Exception:  # noqa: BLE001
                 continue
             record = cand
             break
         if record is None:
-            raise HTTPException(status_code=400, detail=f"No available asset for template {tmpl} (rare slot {idx})")
+            raise HTTPException(
+                status_code=400,
+                detail=f"No on-chain available CardRecord for template {tmpl} (rare slot {idx})",
+            )
         rare_templates.append(tmpl)
         rare_assets.append(record.asset_id)
     return rare_indices, rare_templates, rare_assets
@@ -2271,13 +2313,21 @@ def parse_vault_state_account(data: bytes) -> Optional[dict]:
     offset += 2
 
     def _read_option(buf: bytes, idx: int) -> tuple[Optional[Pubkey], int]:
+        """
+        Anchor/Borsh Option<Pubkey> is encoded as 1-byte tag and, only when
+        present, the 32-byte key.
+        """
+        if idx >= len(buf):
+            return None, idx
         flag = buf[idx]
         idx += 1
-        pk = None
         if flag == 1:
+            if idx + 32 > len(buf):
+                return None, idx
             pk = Pubkey.from_bytes(buf[idx : idx + 32])
-        idx += 32
-        return pk, idx
+            idx += 32
+            return pk, idx
+        return None, idx
 
     core_collection, offset = _read_option(data, offset)
     usdc_mint, offset = _read_option(data, offset)
@@ -2762,6 +2812,13 @@ def build_pack_v2(req: PackBuildV2Request, db: Session = Depends(get_session)):
     # surfacing a seeds error later in the transaction simulation.
     try:
         vault_info = sol_client.get_account_info(vault_state)
+        if vault_info.value is None or vault_info.value.data is None:
+            raise HTTPException(status_code=500, detail=f"vault_state missing on-chain: {vault_state}")
+        if str(vault_info.value.owner) != str(PROGRAM_ID):
+            raise HTTPException(
+                status_code=500,
+                detail=f"vault_state owned by wrong program: {vault_state} owner={vault_info.value.owner} expected={PROGRAM_ID}",
+            )
         parsed_vault = (
             parse_vault_state_account(bytes(vault_info.value.data)) if vault_info.value and vault_info.value.data else None
         )
@@ -2779,6 +2836,11 @@ def build_pack_v2(req: PackBuildV2Request, db: Session = Depends(get_session)):
     try:
         if pda_exists(pack_session):
             resp = sol_client.get_account_info(pack_session)
+            if resp.value is not None and str(resp.value.owner) != str(PROGRAM_ID):
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"pack_session_v2 owned by wrong program: {pack_session} owner={resp.value.owner} expected={PROGRAM_ID}",
+                )
             info = parse_pack_session_v2_account(bytes(resp.value.data)) if resp.value and resp.value.data else None
             if info and info.get("state") == "pending":
                 raise HTTPException(
@@ -2797,15 +2859,32 @@ def build_pack_v2(req: PackBuildV2Request, db: Session = Depends(get_session)):
     )
     rare_card_records = [card_record_pda(vault_state, to_pubkey(asset)) for asset in rare_assets]
     try:
-        for cr in rare_card_records:
+        for idx, cr in enumerate(rare_card_records):
             resp = sol_client.get_account_info(cr)
             if resp.value is None or resp.value.data is None:
                 raise HTTPException(status_code=400, detail=f"CardRecord PDA missing on-chain: {cr}")
+            if str(resp.value.owner) != str(PROGRAM_ID):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"CardRecord PDA owned by wrong program: {cr} owner={resp.value.owner} expected={PROGRAM_ID}",
+                )
             info = parse_card_record_account(bytes(resp.value.data))
             if not info:
                 raise HTTPException(status_code=400, detail=f"CardRecord unreadable on-chain: {cr}")
+            if str(info.get("vault_state")) != str(vault_state):
+                raise HTTPException(status_code=400, detail=f"CardRecord vault_state mismatch: {cr}")
+            if info.get("status") != 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"CardRecord not available on-chain: {cr} status={info.get('status')}",
+                )
             if not rarity_is_rare_plus(info.get("rarity", "")):
                 raise HTTPException(status_code=400, detail=f"CardRecord rarity too low for pack: {info.get('rarity')}")
+            if idx < len(rare_templates) and int(info.get("template_id", -1)) != int(rare_templates[idx]):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"CardRecord template mismatch: {cr} on_chain={info.get('template_id')} expected={rare_templates[idx]}",
+                )
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -2885,20 +2964,47 @@ def build_pack_v2(req: PackBuildV2Request, db: Session = Depends(get_session)):
         user_currency_token=user_token_account,
         vault_currency_token=vault_token_account,
     )
-    base_accounts = [
-        to_pubkey(req.wallet),
-        vault_state,
-        pack_session,
-        vault_authority,
-        vault_treasury,
-        mochi_mint,
-        reward_vault,
-        TOKEN_PROGRAM_ID,
-        user_mochi_token,
+    expected_accounts: List[Tuple[str, Pubkey]] = [
+        ("user", to_pubkey(req.wallet)),
+        ("vault_state", vault_state),
+        ("pack_session", pack_session),
+        ("vault_authority", vault_authority),
+        ("vault_treasury", vault_treasury),
+        ("reward_mint", mochi_mint),
+        ("user_token_account", user_mochi_token),
+        ("token_program", TOKEN_PROGRAM_ID),
+        ("reward_vault", reward_vault),
     ]
-    open_bases = [meta.pubkey for meta in open_ix.accounts[: len(base_accounts)]]
-    if open_bases != base_accounts or open_ix.accounts[-1].pubkey != SYS_PROGRAM_ID:
-        raise HTTPException(status_code=500, detail="open_pack_v2 account order mismatch; token program/system slots incorrect")
+    expected_accounts.extend(
+        [(f"rare_card_record_{idx}", cr) for idx, cr in enumerate(rare_card_records)]
+    )
+    if not is_sol:
+        if user_token_account is None or vault_token_account is None:
+            raise HTTPException(status_code=500, detail="Internal error: missing token accounts for token currency")
+        expected_accounts.extend(
+            [
+                ("user_currency_token", user_token_account),
+                ("vault_currency_token", vault_token_account),
+            ]
+        )
+    expected_accounts.append(("system_program", SYS_PROGRAM_ID))
+
+    actual_accounts = [meta.pubkey for meta in open_ix.accounts]
+    expected_pubkeys = [pk for _, pk in expected_accounts]
+    if actual_accounts != expected_pubkeys:
+        expected_index_map = {name: idx for idx, (name, _) in enumerate(expected_accounts)}
+        lines = [
+            "open_pack_v2 account order mismatch (refusing to return unsigned tx):",
+            f"expected_index_map={expected_index_map}",
+            "accounts (index:name expected -> actual):",
+        ]
+        max_len = max(len(expected_pubkeys), len(actual_accounts))
+        for idx in range(max_len):
+            exp_name = expected_accounts[idx][0] if idx < len(expected_accounts) else "<none>"
+            exp_pk = expected_pubkeys[idx] if idx < len(expected_pubkeys) else "<none>"
+            act_pk = actual_accounts[idx] if idx < len(actual_accounts) else "<missing>"
+            lines.append(f"{idx}:{exp_name} {exp_pk} -> {act_pk}")
+        raise HTTPException(status_code=500, detail="\\n".join(lines))
     compute_ix = set_compute_unit_limit(units=350_000)
     instructions.extend([compute_ix, open_ix])
     blockhash = get_latest_blockhash()

@@ -5,7 +5,7 @@
 - Backend: FastAPI 0.111 with SQLModel + SQLite (default `mochi.db`), Pydantic v2, Requests; Solana stack via `solders`, `solana`, `anchorpy`; Borsh-based tx builder.
 - On-chain: Anchor program `mochi_v2_vault` (devnet ID `Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx`), Metaplex Core CPI, SPL Token/ATA programs. Seed-sale program `2mt9FhkfhrkC5RL29MVPfMGVzpFR3eupGCMqKVYssiue`.
 - Data: Card templates from CSVs in `frontend/public/data/`; NFT metadata served from `https://getmochi.fun/nft/...` (and `getmochi.fun`), mirrored in `nft_pipeline` outputs.
-- Pricing: tcgplayer ids mapped via `scripts/map_prices.py` (rarity/serial aware, uses serial/card index to avoid cross-rarity name collisions; offline fallback JSON in `price_oracle/ppt_mega_sets.json` with Common/Uncommon clamped to $0.10 when mapped in offline mode); primary updater `backend/smart_price_scheduler.py` (dynamic cadence under 60 req/min) with legacy snapshot refresher `start_price_fetcher`/`refresh_price_cache`; API doc (OpenAPI) at repo root `Pokemon_price_tracker_doc.json`.
+- Pricing: canonical docs are `docs/TEMPLATE_STANDARD.md` (mainnet card identity) + `PRICE_ORACLE_RUNBOOK.md` (oracle runbook). `docs/HANDOFF_PRICE_ORACLE.md` is temporary status/tracking; archive after mainnet cutover.
 
 ## Environment Variables (runtime-critical)
 - Backend (`backend/.env`): `SOLANA_RPC`, `HELIUS_RPC_URL`, `ADMIN_ADDRESS`, `PLATFORM_WALLET`, `TREASURY_WALLET`, `CORE_COLLECTION_ADDRESS`, `USDC_MINT`, `SERVER_SEED`, `DATABASE_URL`, `ADMIN_KEYPAIR_PATH`, `MOCHI_TOKEN_MINT`, `MOCHI_TOKEN_DECIMALS`, `MOCHI_PACK_REWARD`, `RECYCLE_RATE`, `PROGRAM_ID`, `SEED_SALE_PROGRAM_ID`, `POKEMON_PRICE_TRACKER_API_KEY` (bearer for price cache).
@@ -29,10 +29,10 @@
 
 ## Active Bugs / Known Gaps
 - PokemonPriceTracker endpoint currently returns card metadata but no price fields (200 OK with bearer key). Pricing falls back to cached snapshots/local bundle when the API yields zero priced cards.
-- Pack purchase (open_pack_v2) still failing on devnet; token minting/reward transfer path is not yet succeeding—see Dec 10 note below.
+- Pack open (`open_pack` / log `Instruction: OpenPack`) still failing on devnet: fixed `InvalidProgramId (3008)` and `AccountOwnedByWrongProgram (3007)` by aligning backend account ordering + preflight guards; current failure is `MochiError::Unauthorized (6000)` after SOL transfer, with no Tokenkeg CPI logs (reward transfer/mint not reached).
 
 ## Recent Changes (high signal)
-- Dec 10: Hardened backend open_pack_v2 account ordering to match IDL (token_program fixed at slot 8), added DEBUG BUILDER log, restarted backend/frontend after rebuild; pack purchase still blocked pending reward minting flow fix.
+- Dec 12: Pack open builder now enforces the deployed devnet account layout: `user, vault_state, pack_session, vault_authority, vault_treasury, mochi_mint, user_mochi_token, token_program, reward_vault, [rare CardRecords...], system_program`. Also fixed VaultState Option<Pubkey> parsing (prevent cursor drift corrupting `mochi_mint`).
 - Dec 9: On-chain reward refactor — Anchor `open_pack` CPIs to SPL Token with reward mint/vault/user ATA accounts; IDL regenerated; backend builders now derive reward_vault/user ATAs.
 - Dec 9: Reward vault ATA funded with 50,000 MOCHI on devnet to back pack rewards.
 - Dec 9: Price oracle key rotated (`POKEMON_PRICE_TRACKER_API_KEY`); bearer auth added to fetcher + debug probe (API currently returns no price fields).

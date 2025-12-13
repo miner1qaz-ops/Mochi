@@ -20,6 +20,13 @@ Replace the mock spider mode with a real Playwright/Scrapy implementation inside
 """
 import os
 import sys
+
+_allow_legacy = str(os.environ.get("ALLOW_LEGACY_PRICE_SCRIPTS", "") or "").strip().lower() in {"1", "true", "yes", "y"}
+if not _allow_legacy:
+    print("Refusing to run legacy price spider. Use the canonical oracle flow in `PRICE_ORACLE_RUNBOOK.md`.")
+    print("To override: set ALLOW_LEGACY_PRICE_SCRIPTS=true")
+    sys.exit(2)
+
 import json
 import time
 from datetime import datetime
@@ -27,9 +34,9 @@ import difflib
 import subprocess
 from decimal import Decimal
 from typing import List
-from playwright.sync_api import sync_playwright
 import requests
 from urllib.parse import urlencode
+from playwright.sync_api import sync_playwright
 
 from sqlmodel import Session, select
 from sqlalchemy.exc import SQLAlchemyError

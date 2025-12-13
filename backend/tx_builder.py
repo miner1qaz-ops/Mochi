@@ -440,9 +440,9 @@ def build_open_pack_v2_ix(
         ("vault_authority", AccountMeta(pubkey=vault_authority, is_signer=False, is_writable=True)),
         ("vault_treasury", AccountMeta(pubkey=vault_treasury, is_signer=False, is_writable=True)),
         ("reward_mint", AccountMeta(pubkey=reward_mint, is_signer=False, is_writable=True)),
-        ("reward_vault", AccountMeta(pubkey=reward_vault, is_signer=False, is_writable=True)),
-        ("token_program", AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False)),
         ("user_token_account", AccountMeta(pubkey=user_token_account, is_signer=False, is_writable=True)),
+        ("token_program", AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False)),
+        ("reward_vault", AccountMeta(pubkey=reward_vault, is_signer=False, is_writable=True)),
     ]
     named_accounts.extend(
         [
@@ -462,9 +462,6 @@ def build_open_pack_v2_ix(
     # System program comes last (after remaining accounts) to match the deployed binary.
     named_accounts.append(("system_program", AccountMeta(pubkey=SYS_PROGRAM_ID, is_signer=False, is_writable=False)))
     accounts: List[AccountMeta] = [meta for _, meta in named_accounts]
-    print("DEBUG open_pack_v2 accounts:")
-    for idx, (name, meta) in enumerate(named_accounts):
-        print(f"{idx}: {name} = {meta.pubkey}")
     data = encode_open_pack_v2(currency, client_seed_hash, rare_templates)
     return Instruction(program_id=PROGRAM_ID, data=data, accounts=accounts)
 

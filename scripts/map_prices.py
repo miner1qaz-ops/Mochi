@@ -9,6 +9,10 @@ Map existing CardTemplate rows to PokemonPriceTracker tcgPlayerId values using s
 
 This script is idempotent: it will skip rows that already have tcgplayer_id unless --force is provided.
 Respectful rate limiting is applied between lookups.
+
+DEPRECATED (do not run by default):
+- Canonical flow is `backend/tasks/bootstrap_prices.py` + `backend/smart_price_scheduler.py` (see `PRICE_ORACLE_RUNBOOK.md`).
+- This legacy mapper does not use canonical template identity (`docs/TEMPLATE_STANDARD.md`) and can burn credits if searches return many candidates.
 """
 
 import argparse
@@ -28,6 +32,13 @@ if ROOT not in sys.path:
     sys.path.append(ROOT)
 
 from backend.main import PACK_REGISTRY, CardPriceMapping, CardTemplate, engine, init_db  # noqa: E402
+
+
+_allow_legacy = str(os.environ.get("ALLOW_LEGACY_PPT_SCRIPTS", "") or "").strip().lower() in {"1", "true", "yes", "y"}
+if not _allow_legacy:
+    print("Refusing to run deprecated script. Use `backend/tasks/bootstrap_prices.py` (see `PRICE_ORACLE_RUNBOOK.md`).")
+    print("To override: set ALLOW_LEGACY_PPT_SCRIPTS=true")
+    sys.exit(2)
 
 
 API_BASE = os.environ.get("POKEMON_PRICE_TRACKER_BASE_URL", "https://www.pokemonpricetracker.com/api/v2")
