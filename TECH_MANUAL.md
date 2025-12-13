@@ -23,6 +23,7 @@
 - Metadata/Images:
   - CRITICAL: All metadata must be served from `https://getmochi.fun` (set via env; do not use legacy domains).
   - Profile must fall back to local pack art if metadata URLs fail.
+  - Asset display pipeline (incl. gacha/open-pack): `docs/ASSET_IMAGE_PIPELINE.md`.
 
 ## Solana Program (Anchor: `mochi_v2_vault`)
 - Program ID: `Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx`.

@@ -1,0 +1,44 @@
+{
+  "name": "Blowtorch #2117",
+  "description": "phantasmal_flames template 117/094",
+  "image": "https://getmochi.fun/img/phantasmal_flames/2117.jpg",
+  "category": "image",
+  "attributes": [
+    {
+      "trait_type": "template_id",
+      "value": 2117
+    },
+    {
+      "trait_type": "set_code",
+      "value": "phantasmal_flames"
+    },
+    {
+      "trait_type": "collector_number",
+      "value": "117/094"
+    },
+    {
+      "trait_type": "rarity_norm",
+      "value": "ultra_rare"
+    },
+    {
+      "trait_type": "finish",
+      "value": "holo"
+    },
+    {
+      "trait_type": "printing_flags",
+      "value": "-"
+    },
+    {
+      "trait_type": "language_tag",
+      "value": "en"
+    }
+  ],
+  "properties": {
+    "files": [
+      {
+        "uri": "https://getmochi.fun/img/phantasmal_flames/2117.jpg",
+        "type": "image/jpeg"
+      }
+    ]
+  }
+}

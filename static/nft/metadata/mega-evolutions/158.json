@@ -1,0 +1,44 @@
+{
+  "name": "Mega Manectric ex #158",
+  "description": "meg_web template 158",
+  "image": "https://getmochi.fun/img/mega-evolutions/158.jpg",
+  "category": "image",
+  "attributes": [
+    {
+      "trait_type": "template_id",
+      "value": 158
+    },
+    {
+      "trait_type": "set_code",
+      "value": "meg_web"
+    },
+    {
+      "trait_type": "collector_number",
+      "value": "158"
+    },
+    {
+      "trait_type": "rarity_norm",
+      "value": "ultra_rare"
+    },
+    {
+      "trait_type": "finish",
+      "value": "non_holo"
+    },
+    {
+      "trait_type": "printing_flags",
+      "value": "-"
+    },
+    {
+      "trait_type": "language_tag",
+      "value": "en"
+    }
+  ],
+  "properties": {
+    "files": [
+      {
+        "uri": "https://getmochi.fun/img/mega-evolutions/158.jpg",
+        "type": "image/jpeg"
+      }
+    ]
+  }
+}

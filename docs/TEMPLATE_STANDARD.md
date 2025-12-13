@@ -160,6 +160,11 @@ Examples:
 
 ---
 
+## Derived artifacts (templates → assets)
+- Given `(set_code, template_id)`, the canonical image URL is `https://getmochi.fun/img/{set_code_or_slug}/{template_id}.jpg`.
+- Given `(set_code, template_id)`, the canonical metadata URL is `https://getmochi.fun/nft/metadata/{set_code_or_slug}/{template_id}.json`.
+- Resolver order, fallbacks, and hosting details live in `docs/ASSET_IMAGE_PIPELINE.md`.
+
 ## 1.9 Examples (required edge cases)
 
 Same name across two sets:
@@ -345,4 +350,3 @@ Before enabling minting for a set:
 - 0 templates missing `finish`
 - 0 templates missing collector number normalization
 - oracle mappings verified for set+collector+rarity+finish
-

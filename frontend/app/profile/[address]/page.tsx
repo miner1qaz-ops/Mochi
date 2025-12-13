@@ -22,6 +22,7 @@ import {
 import { deriveAta } from '../../../lib/ata';
 import { buildV0Tx } from '../../../lib/tx';
 import RedeemPhysicalModal, { RedemptionAsset } from './RedeemPhysicalModal';
+import { resolveCardArt, resolveCardArtSync } from '../../../lib/resolveCardArt';
 
 const PACK_TEMPLATE_OFFSETS: Record<string, number> = {
   meg_web: 0,
@@ -59,30 +60,34 @@ export default function ProfilePage() {
   const [templateImages, setTemplateImages] = useState<Record<number, { image: string; name?: string; rarity?: string }>>({});
   const [showRedemptionModal, setShowRedemptionModal] = useState(false);
 
-  const metadataHost = process.env.NEXT_PUBLIC_METADATA_URL || 'https://getmochi.fun';
-  const legacyHosts = (process.env.NEXT_PUBLIC_LEGACY_METADATA_HOSTS || '')
-    .split(',')
-    .map((h) => h.trim())
-    .filter(Boolean);
-  const rewriteLegacyHost = useCallback((url: string) => {
-    let out = url;
-    const target = metadataHost.replace(/^https?:\/\//, '');
-    legacyHosts.forEach((host) => {
-      const normalized = host.replace(/^https?:\/\//, '');
-      out = out.replace(normalized, target);
-    });
-    return out;
-  }, [legacyHosts, metadataHost]);
+  const guessPackFromTemplate = useCallback((templateId?: number | null) => {
+    if (!templateId) return null;
+    if (templateId >= PACK_TEMPLATE_OFFSETS['phantasmal_flames']) return 'phantasmal_flames';
+    return 'meg_web';
+  }, []);
 
-  const normalizeImage = useCallback((src?: string | null) => {
-    if (!src) return undefined;
-    let url = src;
-    if (url.startsWith('ipfs://')) {
-      url = url.replace('ipfs://', 'https://ipfs.io/ipfs/');
-    }
-    url = rewriteLegacyHost(url);
-    return url;
-  }, [rewriteLegacyHost]);
+  const resolveImageSync = useCallback(
+    (templateId?: number | null, imageUrl?: string | null, templateImageUrl?: string | null) =>
+      resolveCardArtSync({
+        packType: guessPackFromTemplate(templateId),
+        setCode: guessPackFromTemplate(templateId),
+        templateId: templateId ?? null,
+        imageUrl: imageUrl ?? null,
+        templateImageUrl: templateImageUrl ?? null,
+      }) || undefined,
+    [guessPackFromTemplate]
+  );
+
+  const resolveImage = useCallback(
+    async (templateId?: number | null, imageUrl?: string | null) =>
+      resolveCardArt({
+        packType: guessPackFromTemplate(templateId),
+        setCode: guessPackFromTemplate(templateId),
+        templateId: templateId ?? null,
+        imageUrl: imageUrl ?? null,
+      }),
+    [guessPackFromTemplate]
+  );
 
   const formatName = (name?: string | null, templateId?: number | null) => {
     if (!templateId) return name || '';
@@ -129,32 +134,14 @@ export default function ProfilePage() {
     const missing = assets.filter((a) => !hasInlineImage(a));
     if (!missing.length) return;
     missing.forEach(async (a) => {
-      const candidates = [
-        a.content?.json_uri,
-        a.content?.metadata_uri,
-        a.content?.uri,
-      ]
-        .map((u: string | undefined) => normalizeImage(u))
-        .filter(Boolean) as string[];
-      for (const uri of candidates) {
-        try {
-          const res = await fetch(uri, { cache: 'no-store' });
-          if (!res.ok) continue;
-          const meta = await res.json();
-          const img =
-            normalizeImage(meta?.image) ||
-            normalizeImage(meta?.properties?.image) ||
-            normalizeImage(meta?.properties?.files?.[0]?.uri);
-          if (img) {
-            setAssetImages((prev) => (prev[a.id] ? prev : { ...prev, [a.id]: img }));
-            break;
-          }
-        } catch {
-          /* ignore and try next candidate */
-        }
+      const templateId = getTemplateIdFromAsset(a);
+      const inline = a.content?.links?.image || a.content?.metadata?.image;
+      const img = await resolveImage(templateId, inline);
+      if (img) {
+        setAssetImages((prev) => (prev[a.id] ? prev : { ...prev, [a.id]: img }));
       }
     });
-  }, [assets, normalizeImage]);
+  }, [assets, hasInlineImage, resolveImage]);
 
   const rarityGlowClass = (rarity?: string | null) => {
     if (!rarity) return 'rarity-glow rarity-glow--common';
@@ -195,7 +182,8 @@ export default function ProfilePage() {
                 : imageCell
                 ? `/img/${imageCell}`
                 : undefined;
-            templateMap[id] = { name, rarity, image: normalizedImage || '/card_back.png' };
+            const resolvedImage = resolveImageSync(id, undefined, normalizedImage || undefined) || '/card_back.png';
+            templateMap[id] = { name, rarity, image: resolvedImage };
           }
         }
 
@@ -211,9 +199,7 @@ export default function ProfilePage() {
             const baseIdRaw = Number(serial?.split('/')?.[0] ?? idx + 1);
             const baseId = Number.isFinite(baseIdRaw) ? baseIdRaw : idx + 1;
             const templateId = (PACK_TEMPLATE_OFFSETS['phantasmal_flames'] || 0) + baseId;
-            const serialSlug = (serial?.split('/')?.[0] || `${baseId}`).padStart(3, '0');
-            const nameSlug = (name || `card-${idx + 1}`).replace(/[^A-Za-z0-9]+/g, '_');
-            const image = `/img/phantasmal_flames/${serialSlug}-${nameSlug}.jpg`;
+            const image = resolveImageSync(templateId) || '/card_back.png';
             templateMap[templateId] = { name: name || `Card ${templateId}`, rarity: rarity || printType, image };
           });
         }
@@ -322,7 +308,10 @@ export default function ProfilePage() {
         asset.content?.metadata?.data?.image ||
         asset.content?.files?.[0]?.uri ||
         asset.content?.metadata?.properties?.files?.[0]?.uri;
-      const fallbackImage = assetImages[asset.id] || normalizeImage(rawImage) || '/card_back.png';
+      const fallbackImage =
+        assetImages[asset.id] ||
+        resolveImageSync(templateId, rawImage || null, templateInfo?.image || null) ||
+        '/card_back.png';
       const rarityVal =
         asset.content?.metadata?.attributes?.find((attr: any) => (attr.trait_type || '').toLowerCase() === 'rarity')
           ?.value || templateInfo?.rarity || '';
@@ -333,7 +322,7 @@ export default function ProfilePage() {
         image: templateInfo?.image || fallbackImage,
       };
     });
-  }, [assets, assetImages, templateImages, normalizeImage]);
+  }, [assets, assetImages, templateImages, resolveImageSync]);
 
   const totalVirtual = visibleVirtualCards.reduce((sum, v) => sum + v.count, 0);
   const totalNfts = filteredAssets.length;
@@ -737,7 +726,10 @@ export default function ProfilePage() {
             const templateId = getTemplateIdFromAsset(asset);
             const templateInfo = templateId ? templateImages[templateId] : undefined;
             const localImage = templateInfo?.image;
-            const fallbackImage = assetImages[asset.id] || normalizeImage(rawImage) || '/card_back.png';
+            const fallbackImage =
+              assetImages[asset.id] ||
+              resolveImageSync(templateId, rawImage || null, localImage || null) ||
+              '/card_back.png';
             const image = localImage || fallbackImage;
             const cardDetails = (
               <>
@@ -833,6 +825,8 @@ export default function ProfilePage() {
         <div className="grid sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
           {filteredListings.map((item) => {
             const isClickable = !!item.template_id;
+            const packHint = guessPackFromTemplate(item.template_id);
+            const imgSrc = resolveImageSync(item.template_id ?? null, item.image_url ?? null) || '/card_back.png';
             return (
               <div
                 key={item.core_asset}
@@ -854,7 +848,7 @@ export default function ProfilePage() {
                       >
                         {/* eslint-disable-next-line @next/next/no-img-element */}
                         <img
-                          src={normalizeImage(item.image_url) || '/card_back.png'}
+                          src={imgSrc}
                           alt={item.name || item.core_asset}
                           className="w-full h-full object-cover"
                           loading="lazy"
@@ -886,7 +880,7 @@ export default function ProfilePage() {
                       >
                         {/* eslint-disable-next-line @next/next/no-img-element */}
                         <img
-                          src={normalizeImage(item.image_url) || '/card_back.png'}
+                          src={imgSrc}
                           alt={item.name || item.core_asset}
                           className="w-full h-full object-cover"
                           loading="lazy"
@@ -953,7 +947,7 @@ export default function ProfilePage() {
                 <div className="w-16 h-20 rounded-lg overflow-hidden border border-white/10 bg-black/50 flex-shrink-0">
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img
-                    src={normalizeImage(vc.image_url) || '/card_back.png'}
+                    src={resolveImageSync(vc.template_id, vc.image_url || null) || '/card_back.png'}
                     alt={vc.name || `Card ${vc.template_id}`}
                     className="w-full h-full object-cover"
                     loading="lazy"

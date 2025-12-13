@@ -1,0 +1,44 @@
+{
+  "name": "Empoleon ex #2070",
+  "description": "phantasmal_flames template 070/094",
+  "image": "https://getmochi.fun/img/phantasmal_flames/2070.jpg",
+  "category": "image",
+  "attributes": [
+    {
+      "trait_type": "template_id",
+      "value": 2070
+    },
+    {
+      "trait_type": "set_code",
+      "value": "phantasmal_flames"
+    },
+    {
+      "trait_type": "collector_number",
+      "value": "070/094"
+    },
+    {
+      "trait_type": "rarity_norm",
+      "value": "double_rare"
+    },
+    {
+      "trait_type": "finish",
+      "value": "holo"
+    },
+    {
+      "trait_type": "printing_flags",
+      "value": "-"
+    },
+    {
+      "trait_type": "language_tag",
+      "value": "en"
+    }
+  ],
+  "properties": {
+    "files": [
+      {
+        "uri": "https://getmochi.fun/img/phantasmal_flames/2070.jpg",
+        "type": "image/jpeg"
+      }
+    ]
+  }
+}

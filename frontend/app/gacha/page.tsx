@@ -21,6 +21,7 @@ import {
 } from '../../lib/api';
 import { buildV0Tx } from '../../lib/tx';
 import { deriveAta } from '../../lib/ata';
+import { resolveCardArtSync } from '../../lib/resolveCardArt';
 import { useConnection } from '@solana/wallet-adapter-react';
 import { PublicKey } from '@solana/web3.js';
 import type { AxiosError } from 'axios';
@@ -154,6 +155,10 @@ const rarityDisplayOrder = [
 ];
 
 const normalizeRarity = (value?: string | null) => (value || '').replace(/\s+/g, '').toLowerCase();
+const rarityIsNft = (rarity?: string | null) =>
+  ['rare', 'doublerare', 'ultrarare', 'illustrationrare', 'specialillustrationrare', 'megahyperrare'].includes(
+    normalizeRarity(rarity),
+  );
 const MAINNET_LAUNCH_NOTE = 'Live on mainnet after 12 Dec 2025, 10:00 AM (US time).';
 
 const displayRarityLabel = (value: string) => {
@@ -210,6 +215,17 @@ const computeRarityRates = (packId: string): RarityRate[] => {
 };
 
 type OpeningStep = 'idle' | 'video' | 'animation' | 'reveal';
+
+const attachCoreAssetsToLineup = (lineup: PackSlot[], assetIds?: string[] | null) => {
+  if (!assetIds?.length) return lineup;
+  let cursor = 0;
+  return lineup.map((slot) => {
+    const isNft = !!slot.is_nft || rarityIsNft(slot.rarity);
+    if (!isNft) return slot;
+    const coreAsset = assetIds[cursor++];
+    return coreAsset ? { ...slot, core_asset: coreAsset } : slot;
+  });
+};
 
 const FlipModalCard = ({
   backImage,
@@ -489,8 +505,14 @@ export default function GachaPage() {
           const [num, name, rarity, _variant, image] = line.split(',');
           const id = Number(num);
           if (!mapMeg[id]) {
-            const normalizedImage = image?.startsWith('http') ? image : image?.startsWith('/') ? image : `/img/${image}`;
-            mapMeg[id] = { name, image: normalizedImage || '/card_back.png', rarity };
+            const resolvedImage =
+              resolveCardArtSync({
+                packType: 'meg_web',
+                setCode: 'meg_web',
+                templateId: id,
+                templateImageUrl: image,
+              }) || '/card_back.png';
+            mapMeg[id] = { name, image: resolvedImage, rarity };
           }
         }
         packs['meg_web'] = mapMeg;
@@ -509,10 +531,18 @@ export default function GachaPage() {
             const baseIdRaw = Number(serial?.split('/')?.[0] ?? idx + 1);
             const baseId = Number.isFinite(baseIdRaw) ? baseIdRaw : idx + 1;
             const templateId = (PACK_TEMPLATE_OFFSETS['phantasmal_flames'] || 0) + baseId;
-            const serialSlug = (serial?.split('/')?.[0] || `${baseId}`).padStart(3, '0');
-            const nameSlug = (name || `card-${idx + 1}`).replace(/[^A-Za-z0-9]+/g, '_');
-            const image = `/img/phantasmal_flames/${serialSlug}-${nameSlug}.jpg`;
-            mapPfl[templateId] = { name: name || `Card ${templateId}`, image, rarity: rarity || 'Common', variant: printType };
+            const image =
+              resolveCardArtSync({
+                packType: 'phantasmal_flames',
+                setCode: 'phantasmal_flames',
+                templateId,
+              }) || '/card_back.png';
+            mapPfl[templateId] = {
+              name: name || `Card ${templateId}`,
+              image,
+              rarity: rarity || 'Common',
+              variant: printType,
+            };
           });
           packs['phantasmal_flames'] = mapPfl;
         }
@@ -543,9 +573,10 @@ export default function GachaPage() {
           setSelectedPack(pending.pack_type);
         }
         setSessionId(pending.session_id);
-        setSlots(pending.lineup);
-        setRevealed(Array(pending.lineup.length).fill(fresh ? false : true));
-        setRevealIndex(fresh ? 0 : pending.lineup.length - 1);
+        const hydratedLineup = attachCoreAssetsToLineup(pending.lineup, pending.asset_ids);
+        setSlots(hydratedLineup);
+        setRevealed(Array(hydratedLineup.length).fill(fresh ? false : true));
+        setRevealIndex(fresh ? 0 : hydratedLineup.length - 1);
         setModalFaceBack(fresh ? true : false);
         setShowOneModal(false);
         setPackStage(fresh ? 'idle' : 'reveal');
@@ -719,7 +750,9 @@ export default function GachaPage() {
         }
         setConfirmDone(true);
         const rewardNote =
-          confirmRes.reward?.status === 'success'
+          confirmRes.reward?.status === 'on_chain'
+            ? ' MOCHI reward delivered on-chain.'
+            : confirmRes.reward?.status === 'success'
             ? ' MOCHI reward sent.'
             : confirmRes.reward?.status === 'failed'
               ? ` Reward issue: ${confirmRes.reward.error || 'please retry in profile'}.`
@@ -731,18 +764,19 @@ export default function GachaPage() {
         console.error('confirm open error', err);
         setStatusKind('info');
         setStatusMsg('Finalizing pack on-chain… this can take a few seconds. Auto-resuming.');
-        try {
-          const pending = await waitForSession();
-          if (!pending) {
-            throw err;
-          }
-          setSessionId(pending.session_id);
-          setSlots(pending.lineup);
-          setRevealed(Array(pending.lineup.length).fill(false));
-          setRevealIndex(0);
-          setModalFaceBack(true);
-          setShowOneModal(false);
-          setPackStage('idle');
+          try {
+            const pending = await waitForSession();
+            if (!pending) {
+              throw err;
+            }
+            setSessionId(pending.session_id);
+            const hydratedLineup = attachCoreAssetsToLineup(pending.lineup, pending.asset_ids);
+            setSlots(hydratedLineup);
+            setRevealed(Array(hydratedLineup.length).fill(false));
+            setRevealIndex(0);
+            setModalFaceBack(true);
+            setShowOneModal(false);
+            setPackStage('idle');
           setCountdown(pending.countdown_seconds);
           const fair = pending.provably_fair || {};
           setProof({
@@ -937,8 +971,16 @@ export default function GachaPage() {
       const displayName = template
         ? `${template.name}${template.variant ? ` (${template.variant})` : ''}`
         : `Template ${slot.template_id ?? 'TBD'}`;
-      const isNft = !!slot.is_nft || ['rare','doublerare','ultrarare','illustrationrare','specialillustrationrare','megahyperrare'].includes((slot.rarity || '').replace(/\s+/g,'').toLowerCase());
-      const frontImage = template?.image || '/card_back.png';
+      const isNft = !!slot.is_nft || rarityIsNft(slot.rarity);
+      const directImageUrl = slot.image_url ?? slot.image ?? null;
+      const frontImage =
+        resolveCardArtSync({
+          packType: selectedPack,
+          setCode: slot.set_code || selectedPack,
+          templateId: slot.template_id ?? null,
+          imageUrl: directImageUrl,
+          templateImageUrl: template?.image ?? null,
+        }) || '/card_back.png';
       const cardImage = isRevealed ? frontImage : '/card_back.png';
       const priceUsd = slot.template_id ? packPriceMap[slot.template_id] : undefined;
       const gradeEstimate = estimateGrades(priceUsd);

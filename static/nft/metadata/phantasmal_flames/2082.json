@@ -1,0 +1,44 @@
+{
+  "name": "Linoone #2082",
+  "description": "phantasmal_flames template 082/094",
+  "image": "https://getmochi.fun/img/phantasmal_flames/2082.jpg",
+  "category": "image",
+  "attributes": [
+    {
+      "trait_type": "template_id",
+      "value": 2082
+    },
+    {
+      "trait_type": "set_code",
+      "value": "phantasmal_flames"
+    },
+    {
+      "trait_type": "collector_number",
+      "value": "082/094"
+    },
+    {
+      "trait_type": "rarity_norm",
+      "value": "uncommon"
+    },
+    {
+      "trait_type": "finish",
+      "value": "holo"
+    },
+    {
+      "trait_type": "printing_flags",
+      "value": "-"
+    },
+    {
+      "trait_type": "language_tag",
+      "value": "en"
+    }
+  ],
+  "properties": {
+    "files": [
+      {
+        "uri": "https://getmochi.fun/img/phantasmal_flames/2082.jpg",
+        "type": "image/jpeg"
+      }
+    ]
+  }
+}

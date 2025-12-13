@@ -8,7 +8,17 @@ const API_BASE =
 
 export const api = axios.create({ baseURL: API_BASE });
 
-export type PackSlot = { slot_index: number; rarity: string; template_id?: number | null; is_nft?: boolean };
+export type PackSlot = {
+  slot_index: number;
+  rarity: string;
+  template_id?: number | null;
+  is_nft?: boolean;
+  template_key?: string | null;
+  image_url?: string | null;
+  image?: string | null;
+  core_asset?: string | null;
+  set_code?: string | null;
+};
 export type InstructionMeta = { program_id: string; keys: { pubkey: string; is_signer: boolean; is_writable: boolean }[]; data: string };
 export type PendingSession = {
   session_id: string;
@@ -237,7 +247,7 @@ export type MarketCardDetail = {
 };
 
 export async function previewPack(client_seed: string, wallet: string, pack_type: string = 'meg_web') {
-  const { data } = await api.post('/program/open/preview', { client_seed, wallet, pack_type });
+  const { data } = await api.post('/program/v2/open/preview', { client_seed, wallet, pack_type });
   return data as { server_seed_hash: string; server_nonce: string; entropy_proof: string; slots: PackSlot[]; pack_type?: string };
 }
 

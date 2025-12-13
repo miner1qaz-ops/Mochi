@@ -1,0 +1,44 @@
+{
+  "name": "Mega Gardevoir ex #187",
+  "description": "meg_web template 187",
+  "image": "https://getmochi.fun/img/mega-evolutions/187.jpg",
+  "category": "image",
+  "attributes": [
+    {
+      "trait_type": "template_id",
+      "value": 187
+    },
+    {
+      "trait_type": "set_code",
+      "value": "meg_web"
+    },
+    {
+      "trait_type": "collector_number",
+      "value": "187"
+    },
+    {
+      "trait_type": "rarity_norm",
+      "value": "hyper_rare"
+    },
+    {
+      "trait_type": "finish",
+      "value": "non_holo"
+    },
+    {
+      "trait_type": "printing_flags",
+      "value": "-"
+    },
+    {
+      "trait_type": "language_tag",
+      "value": "en"
+    }
+  ],
+  "properties": {
+    "files": [
+      {
+        "uri": "https://getmochi.fun/img/mega-evolutions/187.jpg",
+        "type": "image/jpeg"
+      }
+    ]
+  }
+}

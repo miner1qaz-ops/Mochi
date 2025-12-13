@@ -14,6 +14,7 @@ import {
   SeedSaleState,
 } from '../lib/api';
 import { buildV0Tx } from '../lib/tx';
+import { resolveCardArtSync } from '../lib/resolveCardArt';
 
 type HeroCard = {
   id: string;
@@ -157,30 +158,12 @@ const API_BASE =
   process.env.NEXT_PUBLIC_BACKEND_URL && process.env.NEXT_PUBLIC_BACKEND_URL !== ''
     ? process.env.NEXT_PUBLIC_BACKEND_URL
     : '/api';
-  const metadataHost = process.env.NEXT_PUBLIC_METADATA_URL || 'https://getmochi.fun';
-  const legacyHosts = (process.env.NEXT_PUBLIC_LEGACY_METADATA_HOSTS || '')
-    .split(',')
-    .map((h) => h.trim())
-    .filter(Boolean);
-  const rewriteLegacyHost = (url: string) => {
-    let out = url;
-    const target = metadataHost.replace(/^https?:\/\//, '');
-    legacyHosts.forEach((host) => {
-      const normalized = host.replace(/^https?:\/\//, '');
-      out = out.replace(normalized, target);
-    });
-    return out;
-  };
 
-  const normalizeImage = (src?: string | null) => {
-    if (!src) return undefined;
-    let url = src;
-    if (url.startsWith('ipfs://')) {
-      url = url.replace('ipfs://', 'https://ipfs.io/ipfs/');
-    }
-    url = rewriteLegacyHost(url);
-    return url;
-  };
+const guessPackFromTemplate = (templateId?: number | null) => {
+  if (!templateId) return null;
+  if (templateId >= 2000) return 'phantasmal_flames';
+  return 'meg_web';
+};
 
 const displayName = (name?: string | null, templateId?: number | null, fallback?: string) => {
   if (templateId && name && !name.includes('#')) return `${name} #${templateId}`;
@@ -1180,13 +1163,14 @@ export default function HomePage() {
             };
           }
 
+          const packHint = guessPackFromTemplate(listing.template_id);
           const image =
-            normalizeImage(
-              listing.image_url ||
-                (listing.template_id
-                  ? `https://assets.tcgdex.net/en/me/me01/${listing.template_id}/high.png`
-                  : undefined)
-            ) || '/card_back.png';
+            resolveCardArtSync({
+              packType: packHint,
+              setCode: packHint,
+              templateId: listing.template_id ?? null,
+              imageUrl: listing.image_url ?? null,
+            }) || '/card_back.png';
 
           return {
             id: listing.core_asset,

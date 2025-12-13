@@ -15,7 +15,7 @@ import logging
 
 import requests
 from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 import re
@@ -77,6 +77,9 @@ from tx_builder import (
     build_system_transfer_ix,
 )
 
+DEFAULT_ASSET_BASE_URL = "https://getmochi.fun"
+DEFAULT_STATIC_ASSET_ROOT = Path(__file__).resolve().parents[1] / "static"
+
 
 class Settings(BaseSettings):
     solana_rpc: str = "https://api.devnet.solana.com"
@@ -110,6 +113,8 @@ class Settings(BaseSettings):
     pokemon_price_api_key: Optional[str] = None
     pokemon_price_tracker_base: str = "https://www.pokemonpricetracker.com/api/v2"
     pokemon_price_tracker_api_key: Optional[str] = None
+    asset_base_url: str = DEFAULT_ASSET_BASE_URL
+    static_asset_root: str = str(DEFAULT_STATIC_ASSET_ROOT)
 
     class Config:
         env_file = ".env"
@@ -119,6 +124,8 @@ class Settings(BaseSettings):
 auth_settings = Settings()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mochi")
+STATIC_ASSET_ROOT = Path(getattr(auth_settings, "static_asset_root", DEFAULT_STATIC_ASSET_ROOT)).resolve()
+ASSET_BASE_URL = (getattr(auth_settings, "asset_base_url", DEFAULT_ASSET_BASE_URL) or DEFAULT_ASSET_BASE_URL).rstrip("/")
 
 
 engine = create_engine(auth_settings.database_url)
@@ -512,6 +519,24 @@ PACK_REGISTRY: Dict[str, dict] = {
 
 # Cache for loaded CSV metadata (keyed by pack id).
 _PACK_META: Dict[str, Dict[str, dict]] = {}
+_PACK_BOUNDS: Dict[str, Tuple[int, int]] = {}
+
+SET_SLUG_OVERRIDES = {
+    "meg_web": "mega-evolutions",
+    "mega_evolutions": "mega-evolutions",
+    "mega-evolutions": "mega-evolutions",
+}
+
+
+def safe_template_str(template_id: int) -> str:
+    return str(template_id).zfill(3) if template_id < 1000 else str(template_id)
+
+
+def canonical_set_slug(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    normalized = value.strip().lower().replace(" ", "-")
+    return SET_SLUG_OVERRIDES.get(normalized, normalized)
 
 
 def get_pack_config(pack_type: str) -> dict:
@@ -567,6 +592,64 @@ def load_pack_data(pack_id: str) -> Dict[str, dict]:
     return meta
 
 
+def pack_template_bounds(pack_id: str) -> Optional[Tuple[int, int]]:
+    if pack_id in _PACK_BOUNDS:
+        return _PACK_BOUNDS[pack_id]
+    cfg = PACK_REGISTRY.get(pack_id)
+    if not cfg:
+        return None
+    offset = int(cfg.get("template_offset", 0) or 0)
+    meta = load_pack_data(pack_id)
+    max_base = 0
+    for key in meta.keys():
+        try:
+            max_base = max(max_base, int(str(key).split("/")[0]))
+        except Exception:
+            continue
+    if pack_id in {"meg_web", "mega_evolutions"}:
+        max_base = max(max_base, 196)
+    if max_base <= 0:
+        return None
+    bounds = (offset + 1, offset + max_base)
+    _PACK_BOUNDS[pack_id] = bounds
+    return bounds
+
+
+def guess_set_slug_from_template_id(template_id: int) -> Optional[str]:
+    for pack_id, cfg in PACK_REGISTRY.items():
+        bounds = pack_template_bounds(pack_id)
+        if bounds and bounds[0] <= template_id <= bounds[1]:
+            return canonical_set_slug(cfg.get("set_code") or pack_id)
+    return None
+
+
+def canonical_image_url(template_id: Optional[int], set_code: Optional[str] = None, pack_type: Optional[str] = None) -> Optional[str]:
+    if template_id is None:
+        return None
+    slug = canonical_set_slug(set_code or pack_type) or guess_set_slug_from_template_id(template_id)
+    if not slug:
+        return None
+    return f"{ASSET_BASE_URL}/img/{slug}/{safe_template_str(template_id)}.jpg"
+
+
+def canonical_metadata_url(template_id: Optional[int], set_code: Optional[str] = None, pack_type: Optional[str] = None) -> Optional[str]:
+    if template_id is None:
+        return None
+    slug = canonical_set_slug(set_code or pack_type) or guess_set_slug_from_template_id(template_id)
+    if not slug:
+        return None
+    return f"{ASSET_BASE_URL}/nft/metadata/{slug}/{safe_template_str(template_id)}.json"
+
+
+def resolved_image_url(template_id: Optional[int], tmpl: Optional["CardTemplate"] = None, pack_type: Optional[str] = None) -> Optional[str]:
+    url = canonical_image_url(template_id, tmpl.set_code if tmpl else None, pack_type)
+    if url:
+        return url
+    if tmpl and tmpl.image_url:
+        return tmpl.image_url
+    return None
+
+
 def detect_pack_type_from_templates(template_ids: Sequence[Optional[int]], db: Session) -> str:
     for tmpl_id in template_ids:
         if tmpl_id is None:
@@ -592,6 +675,8 @@ class PackSlot(BaseModel):
     rarity: str
     template_id: Optional[int]
     is_nft: bool = False
+    image_url: Optional[str] = None
+    set_code: Optional[str] = None
 
 
 class PackPreviewResponse(BaseModel):
@@ -1419,7 +1504,7 @@ def build_portfolio_breakdown(wallet: str, db: Session) -> Tuple[List[PricingPor
                 fair_value=fair_value,
                 confidence_score=confidence,
                 total_value_usd=value,
-                image_url=tmpl.image_url if tmpl else None,
+                image_url=resolved_image_url(template_id, tmpl),
             )
         )
 
@@ -2783,7 +2868,15 @@ def preview_pack(req: PackPreviewRequest, db: Session = Depends(get_session)):
     rarities = slot_rarities(rng)
     template_ids = pick_template_ids(rng, rarities, db, pack_type=req.pack_type)
     slots = [
-        PackSlot(slot_index=i, rarity=rarity, template_id=template_ids[i]) for i, rarity in enumerate(rarities)
+        PackSlot(
+            slot_index=i,
+            rarity=rarity,
+            template_id=template_ids[i],
+            is_nft=rarity_is_rare_plus(rarity),
+            image_url=canonical_image_url(template_ids[i], pack_type=req.pack_type),
+            set_code=pack_set_code(req.pack_type),
+        )
+        for i, rarity in enumerate(rarities)
     ]
     return PackPreviewResponse(
         server_seed_hash=SERVER_SEED_HASH,
@@ -3021,6 +3114,8 @@ def build_pack_v2(req: PackBuildV2Request, db: Session = Depends(get_session)):
                 rarity=rarity,
                 template_id=template_ids[idx],
                 is_nft=idx in rare_set,
+                image_url=canonical_image_url(template_ids[idx], pack_type=req.pack_type),
+                set_code=pack_set_code(req.pack_type),
             )
         )
 
@@ -3721,55 +3816,64 @@ def profile(wallet: str):
 
 # ----------- Metadata bridge (getmochi.fun) -----------
 _ENERGY_IMAGES: Dict[str, str] = {
-    "189": "https://getmochi.fun/img/meg_web/energy_grass.png",
-    "190": "https://getmochi.fun/img/meg_web/energy_fire.png",
-    "191": "https://getmochi.fun/img/meg_web/energy_water.png",
-    "192": "https://getmochi.fun/img/meg_web/energy_lightning.png",
-    "193": "https://getmochi.fun/img/meg_web/energy_psychic.png",
-    "194": "https://getmochi.fun/img/meg_web/energy_fighting.png",
-    "195": "https://getmochi.fun/img/meg_web/energy_darkness.png",
-    "196": "https://getmochi.fun/img/meg_web/energy_metal.png",
+    str(tid): canonical_image_url(tid, set_code="meg_web") or ""
+    for tid in range(189, 197)
 }
 
 
 @app.get("/nft/metadata/mega-evolutions/{token_id}.json")
 def mega_metadata(token_id: str):
+    token_raw = str(token_id).strip()
+    tid_int: Optional[int] = None
+    try:
+        tid_int = int(token_raw)
+    except Exception:
+        tid_int = None
+    tid = safe_template_str(tid_int) if tid_int is not None else token_raw
+    static_path = STATIC_ASSET_ROOT / "nft" / "metadata" / "mega-evolutions" / f"{tid}.json"
+    if static_path.exists():
+        return FileResponse(static_path)
     meta = load_pack_data("mega_evolutions")
-    tid = token_id.zfill(3)
     row = meta.get(tid, {})
-    is_energy = int(tid) >= 189
-    image = row.get("image_url")
+    is_energy = False
+    try:
+        is_energy = tid_int is not None and tid_int >= 189
+    except Exception:
+        is_energy = False
+    image = canonical_image_url(tid_int, set_code="meg_web") or row.get("image_url")
     if is_energy:
         image = _ENERGY_IMAGES.get(tid, image)
     if not image:
         # If still missing, fall back to card back
-        image = f"https://getmochi.fun/card_back.png"
+        image = f"{ASSET_BASE_URL}/card_back.png"
     name = row.get("name") or ("Energy" if is_energy else f"Card #{tid}")
     rarity = (row.get("rarity") or ("Energy" if is_energy else "")).title()
-    description = row.get("description") or ("Energy" if is_energy else "Mochi Mega Evolutions")
+    description = "Mochi Mega Evolutions"
+    collector_num = row.get("token_id") or row.get("Number") or tid
     attributes = [
-        {"trait_type": "template_id", "value": int(tid)},
+        {"trait_type": "template_id", "value": tid_int or tid},
+        {"trait_type": "set_code", "value": "meg_web"},
+        {"trait_type": "collector_number", "value": collector_num},
+        {"trait_type": "rarity_norm", "value": (row.get("rarity") or "energy").replace(" ", "_").lower()},
+        {"trait_type": "finish", "value": "non_holo"},
+        {"trait_type": "printing_flags", "value": "-"},
+        {"trait_type": "language_tag", "value": "en"},
     ]
-    if rarity:
-        attributes.append({"trait_type": "rarity", "value": rarity})
-    if row.get("types"):
-        attributes.append({"trait_type": "types", "value": row["types"]})
-    if row.get("category"):
-        attributes.append({"trait_type": "category", "value": row["category"]})
-    meta = {
+    meta_json = {
         "name": name,
         "symbol": "MOCHI",
         "description": description,
         "image": image,
+        "category": "image",
         "attributes": attributes,
         "properties": {
             "files": [
-                {"uri": image, "type": "image/png"},
+                {"uri": image, "type": "image/jpeg"},
             ],
         },
         "collection": {"name": row.get("set_name", "Mega Evolution"), "family": "Mochi"},
     }
-    return JSONResponse(meta)
+    return JSONResponse(meta_json)
 
 @app.get("/program/v2/session/pending", response_model=PendingSessionResponse)
 def get_pending_session_v2(wallet: str, db: Session = Depends(get_session)):
@@ -3822,6 +3926,8 @@ def get_pending_session_v2(wallet: str, db: Session = Depends(get_session)):
                 rarity=rarity,
                 template_id=tmpl_id,
                 is_nft=is_nft,
+                image_url=canonical_image_url(tmpl_id, pack_type=pack_type),
+                set_code=pack_set_code(pack_type),
             )
         )
 
@@ -3885,7 +3991,7 @@ def profile_virtual(wallet: str, db: Session = Depends(get_session)):
                 rarity=row.rarity,
                 count=row.count,
                 name=tmpl.card_name if tmpl else None,
-                image_url=tmpl.image_url if tmpl else None,
+                image_url=resolved_image_url(row.template_id, tmpl),
                 is_energy=tmpl.is_energy if tmpl else None,
             )
         )
@@ -4252,7 +4358,7 @@ def marketplace_listings(db: Session = Depends(get_session)):
         card_meta = db.get(CardTemplate, row.template_id) if row and row.template_id else None
         is_fake_flag = True if row is None else bool(getattr(row, "is_fake", False))
         name = card_meta.card_name if card_meta else None
-        image_url = card_meta.image_url if card_meta else None
+        image_url = resolved_image_url(row.template_id if row else None, card_meta)
         rarity_val = row.rarity if row else None
         to_commit = False
 
@@ -4313,6 +4419,8 @@ def marketplace_listings(db: Session = Depends(get_session)):
         else:
             meta_row = row
 
+        canonical_img = resolved_image_url(meta_row.template_id if meta_row else None, card_meta) or image_url
+
         results.append(
             ListingView(
                 core_asset=core_asset,
@@ -4323,7 +4431,7 @@ def marketplace_listings(db: Session = Depends(get_session)):
                 template_id=meta_row.template_id if meta_row else None,
                 rarity=rarity_val if rarity_val else (meta_row.rarity if meta_row else None),
                 name=name,
-                image_url=image_url,
+                image_url=canonical_img,
                 is_fake=is_fake_flag,
                 current_mid=None,
                 high_90d=None,
@@ -4675,7 +4783,7 @@ def pricing_search(q: str, limit: int = 20, db: Session = Depends(get_session)):
                 name=tmpl.card_name,
                 set_name=tmpl.set_name,
                 rarity=tmpl.rarity,
-                image_url=tmpl.image_url,
+                image_url=resolved_image_url(tmpl.template_id, tmpl),
                 mid_price=float(snap.mid_price),
                 low_price=float(snap.low_price),
                 high_price=float(snap.high_price),
@@ -4717,7 +4825,7 @@ def pricing_set(set_name: str, limit: int = 200, db: Session = Depends(get_sessi
                 name=tmpl.card_name,
                 set_name=tmpl.set_name,
                 rarity=tmpl.rarity,
-                image_url=tmpl.image_url,
+                image_url=resolved_image_url(tmpl.template_id, tmpl),
                 mid_price=float(snap.mid_price),
                 low_price=float(snap.low_price),
                 high_price=float(snap.high_price),
@@ -4944,7 +5052,7 @@ def analytics_prices(pack_type: Optional[str] = None, db: Session = Depends(get_
                 name=tmpl.card_name,
                 set_name=tmpl.set_name,
                 rarity=tmpl.rarity,
-                image_url=tmpl.image_url,
+                image_url=resolved_image_url(tmpl.template_id, tmpl),
                 current_price=current_price if current_price > 0 else None,
                 change_24h=change_24h,
                 last_updated=last_updated or None,
@@ -5145,7 +5253,7 @@ def market_cards(
                 name=tmpl.card_name,
                 set_name=tmpl.set_name,
                 rarity=tmpl.rarity,
-                image_url=tmpl.image_url,
+                image_url=resolved_image_url(tmpl.template_id, tmpl),
                 fair_price=fair_price,
                 lowest_listing=lowest_listing,
                 listing_count=len(listings),
@@ -5202,7 +5310,7 @@ def market_card_detail(
         name=tmpl.card_name if tmpl else "Unverified asset",
         set_name=tmpl.set_name if tmpl else "Unknown",
         rarity=tmpl.rarity if tmpl else "Unknown",
-        image_url=tmpl.image_url if tmpl else None,
+        image_url=resolved_image_url(template_id, tmpl),
         fair_price=fair_price,
         confidence=confidence,
         change_24h=change_24h,
@@ -5637,7 +5745,7 @@ def admin_inventory_assets(db: Session = Depends(get_session)):
         tmpl = db.get(CardTemplate, row.template_id)
         if tmpl:
             name = tmpl.card_name
-            image_url = tmpl.image_url
+            image_url = resolved_image_url(row.template_id, tmpl)
         result.append(
             AssetView(
                 asset_id=row.asset_id,

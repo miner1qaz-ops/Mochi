@@ -1,0 +1,44 @@
+{
+  "name": "Ludicolo #2095",
+  "description": "phantasmal_flames template 095/094",
+  "image": "https://getmochi.fun/img/phantasmal_flames/2095.jpg",
+  "category": "image",
+  "attributes": [
+    {
+      "trait_type": "template_id",
+      "value": 2095
+    },
+    {
+      "trait_type": "set_code",
+      "value": "phantasmal_flames"
+    },
+    {
+      "trait_type": "collector_number",
+      "value": "095/094"
+    },
+    {
+      "trait_type": "rarity_norm",
+      "value": "illustration_rare"
+    },
+    {
+      "trait_type": "finish",
+      "value": "holo"
+    },
+    {
+      "trait_type": "printing_flags",
+      "value": "-"
+    },
+    {
+      "trait_type": "language_tag",
+      "value": "en"
+    }
+  ],
+  "properties": {
+    "files": [
+      {
+        "uri": "https://getmochi.fun/img/phantasmal_flames/2095.jpg",
+        "type": "image/jpeg"
+      }
+    ]
+  }
+}

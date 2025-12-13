@@ -1,0 +1,44 @@
+{
+  "name": "Yamper #2099",
+  "description": "phantasmal_flames template 099/094",
+  "image": "https://getmochi.fun/img/phantasmal_flames/2099.jpg",
+  "category": "image",
+  "attributes": [
+    {
+      "trait_type": "template_id",
+      "value": 2099
+    },
+    {
+      "trait_type": "set_code",
+      "value": "phantasmal_flames"
+    },
+    {
+      "trait_type": "collector_number",
+      "value": "099/094"
+    },
+    {
+      "trait_type": "rarity_norm",
+      "value": "illustration_rare"
+    },
+    {
+      "trait_type": "finish",
+      "value": "holo"
+    },
+    {
+      "trait_type": "printing_flags",
+      "value": "-"
+    },
+    {
+      "trait_type": "language_tag",
+      "value": "en"
+    }
+  ],
+  "properties": {
+    "files": [
+      {
+        "uri": "https://getmochi.fun/img/phantasmal_flames/2099.jpg",
+        "type": "image/jpeg"
+      }
+    ]
+  }
+}

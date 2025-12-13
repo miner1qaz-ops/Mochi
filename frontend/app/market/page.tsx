@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { fetchListings, fetchMarketCards, fetchPricingSets, type Listing, type MarketCardSummary } from '../../lib/api';
+import { resolveCardArtSync } from '../../lib/resolveCardArt';
 
 const formatUsd = (v?: number | null) =>
   v || v === 0 ? `$${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '—';
@@ -55,12 +56,20 @@ export default function MarketPage() {
     return Object.entries(byTemplate).map(([tid, info]) => {
       const tmplId = Number(tid);
       const sample = info.sample;
+      const packHint = tmplId >= 2000 ? 'phantasmal_flames' : 'meg_web';
+      const resolvedImage =
+        resolveCardArtSync({
+          packType: packHint,
+          setCode: packHint,
+          templateId: tmplId,
+          imageUrl: sample.image_url ?? null,
+        }) || undefined;
       return {
         template_id: tmplId,
         name: sample.name || `Card #${tmplId}`,
         set_name: undefined,
         rarity: sample.rarity || undefined,
-        image_url: sample.image_url || undefined,
+        image_url: resolvedImage,
         fair_price: null,
         lowest_listing: info.lowest || null,
         listing_count: info.count,
@@ -269,9 +278,18 @@ export default function MarketPage() {
       )}
 
       <div className="grid grid-cols-2 max-[520px]:grid-cols-1 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-5 gap-3">
-        {filtered.map((card) => (
-          <div key={`${card.template_id}-${card.name}`} className="h-full">
-            <div className={`card-blur h-full rounded-2xl p-3 border border-white/5 space-y-3 flex flex-col relative ${rarityGlowClass(card.rarity)}`}>
+        {filtered.map((card) => {
+          const packHint = card.template_id && card.template_id >= 2000 ? 'phantasmal_flames' : 'meg_web';
+          const imageSrc =
+            resolveCardArtSync({
+              packType: packHint,
+              setCode: packHint,
+              templateId: card.template_id ?? null,
+              imageUrl: card.image_url ?? null,
+            }) || '/card_back.png';
+          return (
+            <div key={`${card.template_id}-${card.name}`} className="h-full">
+              <div className={`card-blur h-full rounded-2xl p-3 border border-white/5 space-y-3 flex flex-col relative ${rarityGlowClass(card.rarity)}`}>
               <Link href={`/market/card/${card.template_id}`} className="space-y-2 block">
                 <div className="relative aspect-[3/4] rounded-xl overflow-visible">
                   <div
@@ -280,16 +298,12 @@ export default function MarketPage() {
                     onMouseMove={handleTiltMove}
                     onMouseLeave={handleTiltLeave}
                   >
-                    {card.image_url ? (
-                      <img
-                        src={card.image_url}
-                        alt={card.name}
-                        className="w-full h-full object-cover"
-                        loading="lazy"
-                      />
-                    ) : (
-                      <div className="w-full h-full flex items-center justify-center text-xs text-white/60">No art</div>
-                    )}
+                    <img
+                      src={imageSrc}
+                      alt={card.name}
+                      className="w-full h-full object-cover"
+                      loading="lazy"
+                    />
                     <div className="absolute inset-0 bg-gradient-to-t from-black/70 to-transparent pointer-events-none" />
                     <div className="absolute top-2 left-2 flex gap-2 text-[11px] pointer-events-none">
                       <span className="glass-chip glass-chip--tiny bg-white/10 border-white/20">
@@ -317,27 +331,28 @@ export default function MarketPage() {
                   </div>
                 </div>
               </Link>
-              <div className="mt-auto flex items-center gap-2 text-sm">
-                <div className="flex-1 rounded-xl bg-white/5 border border-white/10 px-3 py-2">
-                  <p className="text-[11px] text-white/60">{card.listing_count > 0 ? 'Lowest listing' : 'Fair price'}</p>
-                  <p className="font-semibold text-white">
-                    {card.listing_count > 0 ? formatSol(card.lowest_listing ?? undefined) : formatUsd(card.fair_price ?? undefined)}
-                  </p>
+                <div className="mt-auto flex items-center gap-2 text-sm">
+                  <div className="flex-1 rounded-xl bg-white/5 border border-white/10 px-3 py-2">
+                    <p className="text-[11px] text-white/60">{card.listing_count > 0 ? 'Lowest listing' : 'Fair price'}</p>
+                    <p className="font-semibold text-white">
+                      {card.listing_count > 0 ? formatSol(card.lowest_listing ?? undefined) : formatUsd(card.fair_price ?? undefined)}
+                    </p>
+                  </div>
+                  <Link
+                    href={`/market/card/${card.template_id}`}
+                    className={`px-3 py-2 rounded-xl font-semibold text-center flex-1 ${
+                      card.listing_count > 0
+                        ? 'bg-aurora text-ink hover:brightness-110'
+                        : 'bg-white/10 border border-white/20 text-white hover:border-aurora/50'
+                    }`}
+                  >
+                    {card.listing_count > 0 ? 'Buy' : 'View'}
+                  </Link>
                 </div>
-                <Link
-                  href={`/market/card/${card.template_id}`}
-                  className={`px-3 py-2 rounded-xl font-semibold text-center flex-1 ${
-                    card.listing_count > 0
-                      ? 'bg-aurora text-ink hover:brightness-110'
-                      : 'bg-white/10 border border-white/20 text-white hover:border-aurora/50'
-                  }`}
-                >
-                  {card.listing_count > 0 ? 'Buy' : 'View'}
-                </Link>
               </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
         {!loading && hasSearched && !filtered.length && <div className="text-white/60 text-sm">No cards found.</div>}
       </div>
     </div>

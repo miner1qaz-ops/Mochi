@@ -1,7 +1,7 @@
 # PROJECT_CONTEXT
 
 ## Tech Stack
-- Frontend: Next.js 14 (App Router) + React 18, TypeScript, TailwindCSS 3, Framer Motion, Solana wallet adapter, Phaser mini-games. Image strategy: Profile & Pack Reveal prioritize local static art under `/public/img/` derived from CSV templates; on-chain metadata URLs are fallbacks only.
+- Frontend: Next.js 14 (App Router) + React 18, TypeScript, TailwindCSS 3, Framer Motion, Solana wallet adapter, Phaser mini-games. Image strategy: Profile & Pack Reveal prioritize deterministic `/img/{set}/{template_id}.jpg` art hosted on getmochi.fun; metadata JSON is a fallback only. See `docs/ASSET_IMAGE_PIPELINE.md` for the canonical resolver order (incl. gacha/open-pack).
 - Backend: FastAPI 0.111 with SQLModel + SQLite (default `mochi.db`), Pydantic v2, Requests; Solana stack via `solders`, `solana`, `anchorpy`; Borsh-based tx builder.
 - On-chain: Anchor program `mochi_v2_vault` (devnet ID `Gc7u33eCs81jPcfzgX4nh6xsiEtRYuZUyHKFjmf5asfx`), Metaplex Core CPI, SPL Token/ATA programs. Seed-sale program `2mt9FhkfhrkC5RL29MVPfMGVzpFR3eupGCMqKVYssiue`.
 - Data: Card templates from CSVs in `frontend/public/data/`; NFT metadata served from `https://getmochi.fun/nft/...` (and `getmochi.fun`), mirrored in `nft_pipeline` outputs.

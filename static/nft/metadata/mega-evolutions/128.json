@@ -1,0 +1,44 @@
+{
+  "name": "Strange Timepiece #128",
+  "description": "meg_web template 128",
+  "image": "https://getmochi.fun/img/mega-evolutions/128.jpg",
+  "category": "image",
+  "attributes": [
+    {
+      "trait_type": "template_id",
+      "value": 128
+    },
+    {
+      "trait_type": "set_code",
+      "value": "meg_web"
+    },
+    {
+      "trait_type": "collector_number",
+      "value": "128"
+    },
+    {
+      "trait_type": "rarity_norm",
+      "value": "uncommon"
+    },
+    {
+      "trait_type": "finish",
+      "value": "non_holo"
+    },
+    {
+      "trait_type": "printing_flags",
+      "value": "-"
+    },
+    {
+      "trait_type": "language_tag",
+      "value": "en"
+    }
+  ],
+  "properties": {
+    "files": [
+      {
+        "uri": "https://getmochi.fun/img/mega-evolutions/128.jpg",
+        "type": "image/jpeg"
+      }
+    ]
+  }
+}

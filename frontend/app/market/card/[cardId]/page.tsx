@@ -11,6 +11,7 @@ import {
 } from '../../../../lib/api';
 import { useWallet, useConnection } from '@solana/wallet-adapter-react';
 import { buildV0Tx } from '../../../../lib/tx';
+import { resolveCardArtSync } from '../../../../lib/resolveCardArt';
 
 const formatUsd = (v?: number | null) =>
   v || v === 0 ? `$${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '—';
@@ -200,6 +201,14 @@ export default function CardMarketPage() {
   const hasHistory = historyFiltered.length > 0;
   const showListForm = canList;
   const hasLeftColumn = hasListings || showListForm;
+  const packHint = card.template_id && card.template_id >= 2000 ? 'phantasmal_flames' : 'meg_web';
+  const imageSrc =
+    resolveCardArtSync({
+      packType: packHint,
+      setCode: packHint,
+      templateId: card.template_id ?? null,
+      imageUrl: card.image_url ?? null,
+    }) || '/card_back.png';
 
   return (
     <div className="space-y-8">
@@ -207,17 +216,11 @@ export default function CardMarketPage() {
       <div className="rounded-2xl border border-white/10 bg-gradient-to-br from-black/50 via-black/40 to-slate-900/40 p-6 space-y-6">
         <div className="grid lg:grid-cols-[320px,1fr] gap-6">
           <div className="rounded-2xl bg-black/30 border border-white/10 p-3 flex flex-col items-center">
-            {card.image_url ? (
-              <img
-                src={card.image_url}
-                alt={card.name}
-                className="w-full max-w-[280px] rounded-xl border border-white/10 bg-white/5 object-contain"
-              />
-            ) : (
-              <div className="h-[360px] w-full rounded-xl bg-black/30 border border-white/10 flex items-center justify-center text-xs text-white/50">
-                No art
-              </div>
-            )}
+            <img
+              src={imageSrc}
+              alt={card.name}
+              className="w-full max-w-[280px] rounded-xl border border-white/10 bg-white/5 object-contain"
+            />
             <div className="mt-3 w-full text-sm text-white/60 flex items-center justify-between">
               <span>{card.set_name || 'Unknown set'}</span>
               <span>{card.rarity || '—'}</span>

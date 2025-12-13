@@ -8,6 +8,7 @@ import { useConnection } from '@solana/wallet-adapter-react';
 import { buildV0Tx } from '../../lib/tx';
 import { deriveAta } from '../../lib/ata';
 import { LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js';
+import { resolveCardArtSync } from '../../lib/resolveCardArt';
 
 const programIdFromEnv = process.env.NEXT_PUBLIC_PROGRAM_ID;
 if (!programIdFromEnv) {
@@ -86,28 +87,10 @@ function rarityGlowClass(rarity?: string | null) {
   return map[key] || 'rarity-glow rarity-glow--common';
 }
 
-const metadataHost = process.env.NEXT_PUBLIC_METADATA_URL || 'https://getmochi.fun';
-const legacyHosts = (process.env.NEXT_PUBLIC_LEGACY_METADATA_HOSTS || '')
-  .split(',')
-  .map((h) => h.trim())
-  .filter(Boolean);
-const rewriteLegacyHost = (url: string) => {
-  let out = url;
-  const target = metadataHost.replace(/^https?:\/\//, '');
-  legacyHosts.forEach((host) => {
-    const normalized = host.replace(/^https?:\/\//, '');
-    out = out.replace(normalized, target);
-  });
-  return out;
-};
-const normalizeImage = (src?: string | null) => {
-  if (!src) return undefined;
-  let url = src;
-  if (url.startsWith('ipfs://')) {
-    url = url.replace('ipfs://', 'https://ipfs.io/ipfs/');
-  }
-  url = rewriteLegacyHost(url);
-  return url;
+const guessPackFromTemplate = (templateId?: number | null) => {
+  if (!templateId) return null;
+  if (templateId >= 2000) return 'phantasmal_flames';
+  return 'meg_web';
 };
 
 const displayName = (name?: string | null, templateId?: number | null, fallback?: string) => {
@@ -461,11 +444,14 @@ export default function MarketplacePage() {
             const rarityClass = rarityBadge(listing.rarity || undefined);
             const isSeller = publicKey && listing.seller && publicKey.toBase58() === listing.seller;
             const isFake = !!listing.is_fake;
-            const imgSrc = isFake
-              ? normalizeImage(listing.image_url) || '/card_back.png'
-              : normalizeImage(listing.image_url) ||
-                (listing.template_id ? `https://assets.tcgdex.net/en/me/me01/${listing.template_id}/high.png` : undefined) ||
-                '/card_back.png';
+            const packHint = guessPackFromTemplate(listing.template_id);
+            const imgSrc =
+              resolveCardArtSync({
+                packType: packHint,
+                setCode: packHint,
+                templateId: listing.template_id ?? null,
+                imageUrl: listing.image_url ?? null,
+              }) || '/card_back.png';
             const nameLabel = displayName(listing.name, listing.template_id, listing.core_asset);
             return (
               <TiltCard key={listing.core_asset}>

@@ -1,0 +1,44 @@
+{
+  "name": "Xerneas #064",
+  "description": "meg_web template 064",
+  "image": "https://getmochi.fun/img/mega-evolutions/064.jpg",
+  "category": "image",
+  "attributes": [
+    {
+      "trait_type": "template_id",
+      "value": 64
+    },
+    {
+      "trait_type": "set_code",
+      "value": "meg_web"
+    },
+    {
+      "trait_type": "collector_number",
+      "value": "064"
+    },
+    {
+      "trait_type": "rarity_norm",
+      "value": "rare"
+    },
+    {
+      "trait_type": "finish",
+      "value": "non_holo"
+    },
+    {
+      "trait_type": "printing_flags",
+      "value": "-"
+    },
+    {
+      "trait_type": "language_tag",
+      "value": "en"
+    }
+  ],
+  "properties": {
+    "files": [
+      {
+        "uri": "https://getmochi.fun/img/mega-evolutions/064.jpg",
+        "type": "image/jpeg"
+      }
+    ]
+  }
+}
